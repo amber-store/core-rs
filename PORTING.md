@@ -1,8 +1,8 @@
 # Porting contract (Go → Rust)
 
 This crate is a port of `github.com/jobs-build/amber-store-core` (Go), pinned
-at commit `2d22eef35a3151b854b2beb0a1cb6029ad6ced88` (the merge of PR #3,
-which back-ported the bug fixes from draganm/amber-store#12). The Go sources
+at commit `9f3c60ea3306f1b53509006dc45048878a75fd2f` (the merge of PR #4,
+the pre-encoded record write path and `Reader.Records`). The Go sources
 are the normative reference wherever this document or `architecture/` is
 silent; a local checkout lives at `/Users/dragan/jobs-build/amber-store-core`.
 
@@ -161,7 +161,9 @@ error classification (`Corrupt` vs `Malformed`), 256 MiB `slen` cap on the
 stream reader, magic `AMBERPK\x03`, `tagEnd = 0x00`, explicit rejection of
 versions 1 and 2. Writer streams records then the end marker; reader is an
 iterator that validates each record fully (including key canonicality) but
-not payload hashes.
+not payload hashes, or (`records`) hands each validated record over
+undecoded with its parsed header — the read-side counterpart of
+`add_record`.
 
 ### `packstore` (Go: `packstore/`, all files)
 
@@ -170,9 +172,12 @@ segment append + recovery tail-scan (`recover.go`), sealing with footer
 (`footer.go` — already-specified layouts; fanout on the **last** key byte),
 sealed-segment mmap reads (`memmap2`, bounds-checked, no CRC on hot path),
 `has`/`get`/`getRecord`/`storedSize`/`locate`, options (`WithSegmentSize`,
-`WithSync`), `missing.go` (filter-then-index), `verify.go` (scrub), and
+`WithSync`), `missing.go` (filter-then-index), `verify.go` (scrub),
 `parallel.go` (bounded worker pool, `seenSet` dedup, BLAKE3 verification
-before commit, stats). Match fsync/rename durability discipline. Concurrency:
+before commit, stats), and `prepare.go` (an `Object` offered as a
+pre-encoded `record` instead of `data`: parsed, key-checked, appended
+verbatim, decoded and rehashed under `verify`; `append_record` shares the
+check). Match fsync/rename durability discipline. Concurrency:
 scoped threads + channels; observable semantics (dedup, stats, error-stops)
 must match Go.
 

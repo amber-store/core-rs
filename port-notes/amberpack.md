@@ -144,3 +144,23 @@ matched in every case.
   so the "bomb stops at ulen" behavior needed no code change — only the
   ulen bound itself was missing. The ported bomb test pins the existing
   behavior.
+
+## Go PR #4 backport (2026-09-06)
+
+- `Reader.Records()` → `Reader::records(self) -> Records<R>`, an iterator
+  over `Result<RawRecord, Error>`; `RawRecord { record: Record, bytes:
+  Vec<u8> }` stands in for Go's embedded-`Record` struct (`raw.record.key`
+  for Go's promoted `raw.Key`). The decoding iterator (Go's `All`) is built
+  on the same `next_record` step, exactly as Go rebuilt `All` on `Records`;
+  both drive one fused state machine, so each yields at most one error and
+  then `None`.
+- `records` consumes the `Reader`: Go's "must be called at most once per
+  Reader" is the type system's job here. The stream position is shared, so
+  records already yielded through the decoding iterator are not re-read.
+- Error classes and texts are the decoding iterator's (all `Malformed`, the
+  corrupt-record text embedded), since the two share every check up to the
+  decode. Tests ported from `pack_test.go`: the round trip (each record's
+  bytes byte-equal to `encode_record`'s, the libzstd-compressed one
+  included; re-added through `add_record` and decoded back), the truncated
+  stream, the CRC mismatch; plus a fused-after-error pin mirroring the
+  decoding iterator's.

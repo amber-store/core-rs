@@ -843,7 +843,13 @@ impl Shared {
             return;
         }
         let rd = amberpack::Reader::new(f); // positioned at the body
-        let seq = rd.map(|r| r.map(|(key, data)| packstore::Object { key, data }));
+        let seq = rd.map(|r| {
+            r.map(|(key, data)| packstore::Object {
+                key,
+                data,
+                record: None,
+            })
+        });
         let (_, res) = self.store.write_parallel(
             seq,
             WriteOpts {

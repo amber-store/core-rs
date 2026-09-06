@@ -15,8 +15,10 @@
 //! packstore writes on disk; a wire pack is just those records framed by a
 //! magic and an explicit end marker, so a truncated stream is detected rather
 //! than read as a clean EOF. The [`Reader`] validates framing, CRC, and key
-//! canonicality and decodes each payload; it does NOT verify the payload hash —
-//! that happens in the storage path (packstore's parallel write with Verify).
+//! canonicality and decodes each payload (its `Iterator` impl, Go's `All`), or
+//! hands the validated records over undecoded ([`Reader::records`]); it does
+//! NOT verify the payload hash — that happens in the storage path (packstore's
+//! parallel write with Verify).
 //!
 //! Versions 1 and 2 (`AMBERPK\x01` / `AMBERPK\x02`) were the older uncompressed
 //! and whole-stream-zstd stream formats; they are no longer produced and are
@@ -280,6 +282,17 @@ impl<W: Write> Writer<W> {
     }
 }
 
+/// One record of a pack as it was read: its parsed header and its complete
+/// bytes, header and stored payload, exactly as [`encode_record`] produced
+/// them. `bytes` is caller-owned (Go: `RawRecord`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawRecord {
+    /// The parsed header (Go: the embedded `Record`).
+    pub record: Record,
+    /// The complete record bytes, as stored.
+    pub bytes: Vec<u8>,
+}
+
 enum ReaderState {
     Magic,
     Records,
@@ -291,7 +304,8 @@ enum ReaderState {
 /// `Reader` is an iterator over `Result<(Key, Vec<u8>), Error>` (Go:
 /// `Reader.All`, yielding `fstree.Object`s). It yields exactly one error (and
 /// then stops) on any structural problem; on a clean stream it yields every
-/// object and finishes after the end marker.
+/// object and finishes after the end marker. [`Reader::records`] is the same
+/// stream with every record left undecoded.
 pub struct Reader<R: Read> {
     br: BufReader<R>,
     state: ReaderState,
@@ -312,8 +326,8 @@ impl<R: Read> Reader<R> {
             .map_err(|e| Error::Malformed(format!("{what}: {e}")))
     }
 
-    /// Reads the next object, `Ok(None)` on the end marker.
-    fn next_object(&mut self) -> Result<Option<(Key, Vec<u8>)>, Error> {
+    /// Reads the next record undecoded, `Ok(None)` on the end marker.
+    fn next_record(&mut self) -> Result<Option<RawRecord>, Error> {
         if matches!(self.state, ReaderState::Magic) {
             let mut magic = [0u8; PACK_MAGIC.len()];
             self.read_full(&mut magic, "reading magic")?;
@@ -348,24 +362,42 @@ impl<R: Read> Reader<R> {
                     self.read_full(payload, "truncated record payload")?;
                 }
                 let rec = parse_record(&full).map_err(|e| Error::Malformed(e.to_string()))?;
-                let payload = decode_payload(rec.flags, rec.ulen, &full[REC_HEADER_SIZE..])
-                    .map_err(|e| Error::Malformed(e.to_string()))?;
-                Ok(Some((rec.key, payload)))
+                Ok(Some(RawRecord {
+                    record: rec,
+                    bytes: full,
+                }))
             }
             t => Err(Error::Malformed(format!("bad record tag {t:#x}"))),
         }
     }
-}
 
-impl<R: Read> Iterator for Reader<R> {
-    type Item = Result<(Key, Vec<u8>), Error>;
+    /// Reads the next object, `Ok(None)` on the end marker: the next record
+    /// with its payload decoded.
+    fn next_object(&mut self) -> Result<Option<(Key, Vec<u8>)>, Error> {
+        let Some(raw) = self.next_record()? else {
+            return Ok(None);
+        };
+        let payload = decode_payload(
+            raw.record.flags,
+            raw.record.ulen,
+            &raw.bytes[REC_HEADER_SIZE..],
+        )
+        .map_err(|e| Error::Malformed(e.to_string()))?;
+        Ok(Some((raw.record.key, payload)))
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    /// One fused iterator step: `read` runs unless the reader is already
+    /// done, and the end marker or an error finishes it, so at most one
+    /// error is ever yielded.
+    fn step<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<Option<T>, Error>,
+    ) -> Option<Result<T, Error>> {
         if matches!(self.state, ReaderState::Done) {
             return None;
         }
-        match self.next_object() {
-            Ok(Some(obj)) => Some(Ok(obj)),
+        match read(self) {
+            Ok(Some(v)) => Some(Ok(v)),
             Ok(None) => {
                 self.state = ReaderState::Done;
                 None
@@ -375,6 +407,44 @@ impl<R: Read> Iterator for Reader<R> {
                 Some(Err(e))
             }
         }
+    }
+
+    /// Iterates over the records in the stream without decoding them. Every
+    /// record is validated exactly as the decoding iterator validates it
+    /// (framing, the size bound, CRC, key canonicality) but its payload stays
+    /// as stored, so a consumer that appends records verbatim (a packstore
+    /// `Object` offered with its `record` set, [`Writer::add_record`]) skips
+    /// the decompress/recompress round trip; it is the read-side counterpart
+    /// of `add_record`. The iterator yields exactly one error (and then
+    /// stops) on any structural problem; on a clean stream it yields every
+    /// record and finishes after the end marker. It consumes the `Reader`,
+    /// so the stream is read once whichever way it is consumed; records the
+    /// decoding iterator already yielded are not re-read (Go:
+    /// `Reader.Records`).
+    pub fn records(self) -> Records<R> {
+        Records { reader: self }
+    }
+}
+
+impl<R: Read> Iterator for Reader<R> {
+    type Item = Result<(Key, Vec<u8>), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.step(Reader::next_object)
+    }
+}
+
+/// The iterator [`Reader::records`] returns: each validated record of the
+/// stream, undecoded, as a [`RawRecord`].
+pub struct Records<R: Read> {
+    reader: Reader<R>,
+}
+
+impl<R: Read> Iterator for Records<R> {
+    type Item = Result<RawRecord, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.reader.step(Reader::next_record)
     }
 }
 
@@ -868,6 +938,111 @@ mod tests {
         // The iterator yields exactly one error and then fuses, mirroring
         // Go's All yielding once and returning.
         let mut r = Reader::new(&b"NOTAMBER..."[..]);
+        assert!(matches!(r.next(), Some(Err(_))));
+        assert!(r.next().is_none());
+    }
+
+    /// Drains `records`, returning what it yielded and the error that ended
+    /// it (Go: `collectRecords`).
+    fn collect_records<R: Read>(r: Records<R>) -> (Vec<RawRecord>, Option<Error>) {
+        let mut out = Vec::new();
+        for item in r {
+            match item {
+                Ok(rec) => out.push(rec),
+                Err(e) => return (out, Some(e)),
+            }
+        }
+        (out, None)
+    }
+
+    #[test]
+    fn reader_records_round_trip() {
+        // records yields every record's bytes exactly as encode_record
+        // produced them, with its parsed header, and without decoding: a
+        // consumer that appends records verbatim (packstore's Object.record)
+        // never touches zstd. Feeding those bytes back through add_record
+        // must give a stream the decoding iterator reads as the original
+        // objects.
+        let big: Vec<u8> = b"amber".iter().copied().cycle().take(250_000).collect();
+        let noise = incompressible(4000);
+        let objs: Vec<(Key, Vec<u8>)> = vec![
+            (mk_key(b"alpha"), b"alpha".to_vec()),
+            (mk_key(b""), Vec::new()),
+            (mk_key(&big), big), // compressed on disk
+            (mk_key(&noise), noise),
+        ];
+        let mut w = Writer::new(Vec::new());
+        let mut want = Vec::new();
+        for (i, (k, p)) in objs.iter().enumerate() {
+            let rec = encode_record(*k, p).unwrap();
+            if i % 2 == 0 {
+                w.add(*k, p).unwrap();
+            } else {
+                w.add_record(&rec).unwrap();
+            }
+            want.push(rec);
+        }
+        let buf = w.finish().unwrap();
+
+        let (got, err) = collect_records(Reader::new(&buf[..]).records());
+        assert!(err.is_none(), "records: {err:?}");
+        assert_eq!(got.len(), objs.len(), "record count");
+        let mut w2 = Writer::new(Vec::new());
+        for (i, rec) in got.iter().enumerate() {
+            assert_eq!(
+                rec.bytes, want[i],
+                "record {i} bytes differ from encode_record's"
+            );
+            assert_eq!(rec.record.key, objs[i].0, "record {i} key");
+            assert_eq!(rec.record.ulen as usize, objs[i].1.len(), "record {i} ulen");
+            assert_eq!(
+                rec.bytes.len(),
+                REC_HEADER_SIZE + rec.record.slen as usize,
+                "record {i} length disagrees with its header"
+            );
+            w2.add_record(&rec.bytes).unwrap();
+        }
+        let again = w2.finish().unwrap();
+        let decoded = collect(Reader::new(&again[..])).unwrap();
+        assert_eq!(decoded, objs, "objects differ after the record round trip");
+    }
+
+    #[test]
+    fn reader_records_truncated() {
+        // A stream cut before the end marker is malformed for records exactly
+        // as it is for the decoding iterator.
+        let rec = encode_record(mk_key(b"alpha"), b"alpha").unwrap();
+        let (got, err) = collect_records(Reader::new(&wire_pack(&rec)[..]).records());
+        let err = err.expect("want an error");
+        assert!(err.is_malformed(), "err = {err}, want malformed");
+        assert_eq!(
+            got.len(),
+            1,
+            "yielded {} records before the truncation, want 1",
+            got.len()
+        );
+    }
+
+    #[test]
+    fn reader_records_crc_mismatch() {
+        let data = incompressible(64);
+        let mut rec = encode_record(mk_key(&data), &data).unwrap();
+        let last = rec.len() - 1;
+        rec[last] ^= 0x01;
+        rec.push(TAG_END);
+        let (_, err) = collect_records(Reader::new(&wire_pack(&rec)[..]).records());
+        let err = err.expect("want an error");
+        assert!(
+            err.is_malformed(),
+            "err = {err}, want malformed (record CRC mismatch)"
+        );
+    }
+
+    #[test]
+    fn records_stops_after_error() {
+        // Like the decoding iterator, records yields exactly one error and
+        // then fuses.
+        let mut r = Reader::new(&b"NOTAMBER..."[..]).records();
         assert!(matches!(r.next(), Some(Err(_))));
         assert!(r.next().is_none());
     }

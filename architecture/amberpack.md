@@ -67,7 +67,10 @@ questions:
 Keeping the hash check out of the codec is deliberate: the codec is a framing
 layer, and the storage layer is the single authoritative gate on object
 identity. A pack stream is therefore trusted only for framing, never for
-content.
+content. A record read from a pack can also be appended to a store as it is
+(packstore's `Object.Record`): the store re-parses it, and with verification
+decodes and rehashes the payload, so the gate is the same whichever form an
+object arrives in.
 
 ## The wire pack
 

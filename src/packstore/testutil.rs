@@ -36,6 +36,7 @@ pub(crate) fn blob_obj(data: &[u8]) -> Object {
     Object {
         key: Key::new(Type::Blob, data.len() as u64, data),
         data: data.to_vec(),
+        record: None,
     }
 }
 

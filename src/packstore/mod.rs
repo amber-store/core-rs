@@ -18,6 +18,7 @@ mod gc;
 mod markset;
 mod missing;
 mod parallel;
+mod prepare;
 mod recover;
 mod verify;
 
@@ -39,6 +40,7 @@ use crate::amberpack::{self, REC_HEADER_SIZE, decode_payload, encode_record};
 use crate::key::Key;
 
 use footer::SealedSegment;
+use prepare::prepare;
 use recover::{ActiveLoc, scan_active};
 
 /// First byte of the footer (Go: `tagSeal`).
@@ -57,13 +59,24 @@ pub const DEFAULT_SEGMENT_SIZE: u64 = 256 << 20; // 256 MiB
 const SEALED_SUFFIX: &str = ".seg";
 const ACTIVE_SUFFIX: &str = ".seg.active";
 
-/// One CAS object: its key and its serialized bytes (Go: `packstore.Object`).
+/// One CAS object to store: its key and either its serialized bytes
+/// (`data`) or, for an object that was encoded elsewhere, the complete
+/// record as [`encode_record`] produced it (`record`). Exactly one of the two
+/// is set: an object offered as a record carries an empty `data`. A record is
+/// parsed (framing, CRC, canonical key, key equal to `key`) and appended
+/// verbatim, so a caller that already holds encoded records, say a pack it
+/// staged on disk, skips the compression round trip; with
+/// [`WriteOpts::verify`] its payload is decoded and rehashed like `data` is
+/// (Go: `packstore.Object`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Object {
     /// The object's 32-byte lookup key.
     pub key: Key,
-    /// The object's serialized bytes.
+    /// The object's serialized bytes; empty when `record` is set.
     pub data: Vec<u8>,
+    /// The complete pre-encoded record, for an object that was encoded
+    /// elsewhere.
+    pub record: Option<Vec<u8>>,
 }
 
 impl From<crate::fstree::Object> for Object {
@@ -71,6 +84,7 @@ impl From<crate::fstree::Object> for Object {
         Object {
             key: o.key,
             data: o.bytes,
+            record: None,
         }
     }
 }
@@ -717,11 +731,12 @@ impl Store {
             if has {
                 continue;
             }
-            let rec = match encode_record(obj.key, &obj.data) {
-                Ok(r) => r,
-                Err(e) => return Err(fail(appended, Error::Pack(e))),
+            let key = obj.key;
+            let rec = match prepare(obj, false) {
+                Ok((r, _)) => r,
+                Err(e) => return Err(fail(appended, e)),
             };
-            if let Err(e) = self.append(obj.key, &rec, false) {
+            if let Err(e) = self.append(key, &rec, false) {
                 return Err(fail(appended, e));
             }
             appended = true;
@@ -995,3 +1010,6 @@ mod gc_tests;
 
 #[cfg(test)]
 mod store_tests;
+
+#[cfg(test)]
+mod record_tests;
