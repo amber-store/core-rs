@@ -6,10 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::thread;
 
-use crate::amberpack::encode_record;
 use crate::key::{self, Key};
 
-use super::verify::verify_object;
+use super::prepare::prepare;
 use super::{Error, Object, Store, unpoison};
 
 /// The byte threshold at which a writer fsyncs the active segment, making
@@ -100,7 +99,9 @@ impl Store {
     /// re-run deduplicates. The final fsync also covers dedup hits against
     /// records a concurrent, uncommitted run appended. If the iterator
     /// yields an error, the run stops and returns it. With `verify`, a
-    /// key/payload mismatch stops the run with an [`Error::Verify`].
+    /// key/payload mismatch stops the run with an [`Error::Verify`]. An
+    /// [`Object`] may carry a pre-encoded `record` instead of `data`; it is
+    /// validated and appended as is (see [`Object`]).
     ///
     /// Returns the stats alongside the outcome because, exactly like Go's
     /// `(WriteStats, error)` pair, an erroring run still reports the work
@@ -213,22 +214,16 @@ impl Store {
                 Ok(false) => {}
                 Err(e) => return run.fail(e),
             }
-            if verify {
-                let checked = verify_object(obj.key, &obj.data);
-                if let Err(msg) = checked {
-                    return run.fail(Error::Verify(msg));
-                }
-            }
-            let rec = match encode_record(obj.key, &obj.data) {
-                Ok(r) => r,
-                Err(e) => return run.fail(Error::Pack(e)),
+            let key = obj.key;
+            let (rec, ulen) = match prepare(obj, verify) {
+                Ok(v) => v,
+                Err(e) => return run.fail(e),
             };
-            if let Err(e) = self.append(obj.key, &rec, false) {
+            if let Err(e) = self.append(key, &rec, false) {
                 return run.fail(e);
             }
             run.stored.fetch_add(1, Ordering::Relaxed);
-            run.bytes_stored
-                .fetch_add(obj.data.len() as u64, Ordering::Relaxed);
+            run.bytes_stored.fetch_add(ulen, Ordering::Relaxed);
             pending += rec.len();
             if pending >= batch_size {
                 pending = 0;

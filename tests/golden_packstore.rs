@@ -149,6 +149,7 @@ fn golden_segments_rewrite_rotate_reopen() {
         .map(|(i, o)| Object {
             key: parse_key(&o.key, &format!("object {i}")),
             data: o.payload.bytes(),
+            record: None,
         })
         .collect();
 

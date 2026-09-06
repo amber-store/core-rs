@@ -106,3 +106,31 @@ cross-check.
   issue an end-of-input flush, only the batch-size ones. `Store` grew the
   Go-matching `fsyncs` counter (test-observed, maintained unconditionally
   in `sync_active` like Go's).
+
+## Go PR #4 backport (2026-09-06)
+
+- `Object` gains `record: Option<Vec<u8>>` (Go: `Record []byte`), the
+  Go-literal shape rather than a `data | record` enum: `Object { key, data }`
+  is built in six places but `.data` is read in about eighty (tests
+  included), and the Go tests port one-to-one. Rust cannot tell a nil `Data`
+  from an empty one, so the "carries both Data and Record" rejection fires
+  on a non-empty `data` next to a `record`; an empty `data` next to a
+  `record` is taken as a record object (Go rejects `Data: []byte{}` there
+  and accepts `nil`). The record's own key check makes the difference
+  harmless. The error text keeps Go's field names (`carries both Data and
+  Record`) for byte parity.
+- `prepare.rs`: `prepare(obj, verify) -> (record, ulen)` is Go's `prepare`;
+  its record half is split out as `check_record(k, raw, verify) -> Record`
+  (parse, key equality, exact length, optional decode + rehash) so that
+  `append_record`, which borrows its slice, shares the check without copying
+  the record into an `Object`. Error mapping: `parse_record` /
+  `decode_payload` failures pass through as `Error::Pack` (corrupt class,
+  as Go returns the amberpack error unwrapped), key/length mismatches are
+  `corrupt(...)`, a rehash failure is `Error::Verify`. `run_writer` and
+  `write_batch` route through `prepare`; `bytes_stored` charges a record
+  object's `ulen`, as in Go.
+- Go's `AppendRecord` nil-raw guard is unrepresentable: a `&[u8]` is always
+  offered as a record, so `append_record(k, &[])` fails in `parse_record`
+  (corrupt class). The ported test pins the class and that nothing is
+  stored.
+- Tests: `record_tests.rs` (Go `record_test.go`, all eight cases).

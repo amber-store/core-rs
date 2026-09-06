@@ -13,6 +13,7 @@ use crate::amberpack::{REC_HEADER_SIZE, parse_record};
 use crate::key::{self, Key};
 
 use super::footer::{INDEX_ENTRY_SIZE, SealedSegment};
+use super::prepare::check_record;
 use super::{Error, MAGIC_HEADER, Store, corrupt, unpoison};
 
 /// In-flight exported-write starts (Go: the `writes map[*writeToken]time.Time`
@@ -194,23 +195,13 @@ impl Store {
     /// Re-appends an already-encoded record through the normal append path:
     /// no decode, no re-encode, no fsync — callers batch appends and call
     /// [`Store::sync`]. `raw` must be exactly one record, CRC-valid, keyed
-    /// `k`. Re-appending a key already in the active index is a silent no-op
+    /// `k`: it gets the write paths' record check (the one an [`Object`](super::Object)
+    /// offered with its `record` set gets), so an empty or otherwise
+    /// non-record slice is rejected as corrupt rather than stored.
+    /// Re-appending a key already in the active index is a silent no-op
     /// (the append path's existing dedup) (Go: `AppendRecord`).
     pub fn append_record(&self, k: Key, raw: &[u8]) -> Result<(), Error> {
-        let rec = parse_record(raw).map_err(Error::Pack)?;
-        if rec.key != k {
-            return Err(corrupt(format!(
-                "record key {} does not match {}",
-                rec.key, k
-            )));
-        }
-        if raw.len() != REC_HEADER_SIZE + rec.slen as usize {
-            return Err(corrupt(format!(
-                "record is {} bytes, want {}",
-                raw.len(),
-                REC_HEADER_SIZE + rec.slen as usize
-            )));
-        }
+        check_record(k, raw, false)?;
         self.append(k, raw, false)
     }
 
