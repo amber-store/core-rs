@@ -2,7 +2,7 @@
 name = "amber-store-core"
 version = "0.1.0"
 edition = "2024"
-license = "AGPL-3.0-only"
+license = "LGPL-3.0-only"
 description = "Content-addressable store for filesystem trees — Rust port of github.com/jobs-build/amber-store-core"
 repository = "https://github.com/amber-store/core-rs"
 keywords = ["content-addressable", "cas", "merkle", "cdc", "storage"]
