@@ -20,6 +20,7 @@ mod missing;
 mod parallel;
 mod prepare;
 mod recover;
+mod repair;
 mod verify;
 
 pub use compact::{CompactOpts, CompactStats, SegmentLiveness};
@@ -1013,3 +1014,6 @@ mod store_tests;
 
 #[cfg(test)]
 mod record_tests;
+
+#[cfg(test)]
+mod repair_tests;

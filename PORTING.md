@@ -268,3 +268,19 @@ generator reproduces Go's byte streams exactly (Go `math/rand/v2` PCG +
 `IntN`/`Shuffle`, xorshift64* file content) so both implementations ingest
 the identical dataset; results.json is schema-compatible with Go's. See
 `port-notes/amber-bench.md`.
+
+### Verified repair and reference batches
+
+`packstore::Store::put_verified` matches Go `packstore.Store.PutVerified`.
+It verifies supplied content before mutation and checks every indexed copy.
+A healthy newer copy does not hide damage in older segments.
+Replacement preserves segment IDs, index key order, and unrelated record bytes.
+Existing readers retain their old mapping until they release it.
+New readers use the repaired mapping after publication.
+New writes and healthy deduplication follow the configured sync option.
+Replacement files and directory renames always sync.
+Repair does not rebuild corrupt footers or discover unindexed objects.
+An error can leave some copies repaired. Retrying is safe.
+Recovery accepts a complete footer before scanning an active file's body.
+This preserves later records after payload damage during an interrupted seal.
+
