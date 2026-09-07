@@ -294,3 +294,7 @@ Regression tests live in `src/packstore/repair_tests.rs` and `tests/refstore.rs`
 They cover corruption, duplicate copies, restart recovery, reader lifetime,
 concurrency, GC observation, storage errors, and batch snapshot visibility.
 
+CI runs `interop/check.sh` against a pinned Go parity revision.
+The check compares ingestion keys, cross-reads stores, and compares exported archives.
+It also corrupts each implementation's pack and repairs it with the other.
+The original implementation then verifies and reads the repaired pack.
