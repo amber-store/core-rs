@@ -284,3 +284,13 @@ An error can leave some copies repaired. Retrying is safe.
 Recovery accepts a complete footer before scanning an active file's body.
 This preserves later records after payload damage during an interrupted seal.
 
+`refstore::Store::put_batch` matches Go `refstore.Store.PutBatch`.
+Each batch uses one transaction with the configured durability.
+The final record wins when names repeat. Empty batches are accepted.
+`all` reads one snapshot and cannot see a partial batch.
+Reference database files remain implementation-specific.
+
+Regression tests live in `src/packstore/repair_tests.rs` and `tests/refstore.rs`.
+They cover corruption, duplicate copies, restart recovery, reader lifetime,
+concurrency, GC observation, storage errors, and batch snapshot visibility.
+
