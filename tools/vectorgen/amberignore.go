@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jobs-build/amber-store-core/amberignore"
+	"github.com/amber-store/core/amberignore"
 )
 
 type ignoreFileSpec struct {

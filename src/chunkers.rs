@@ -8,12 +8,17 @@
 
 use std::io::Read;
 
-/// Default minimum chunk size for the UltraCDC byte chunker (2 KiB).
-pub const DEFAULT_MIN_SIZE: usize = 2 * 1024;
-/// Default normal (target) chunk size for the UltraCDC byte chunker (10 KiB).
-pub const DEFAULT_NORMAL_SIZE: usize = 10 * 1024;
-/// Default maximum chunk size for the UltraCDC byte chunker (64 KiB).
-pub const DEFAULT_MAX_SIZE: usize = 64 * 1024;
+/// Default minimum chunk size for the UltraCDC byte chunker (32 KiB).
+///
+/// The three defaults determine every Blob boundary and so every file key;
+/// they match Go `chunkers.DefaultMinSize` / `DefaultNormalSize` /
+/// `DefaultMaxSize`, and two stores dedup against each other only when they
+/// chunk with the same sizes.
+pub const DEFAULT_MIN_SIZE: usize = 32 * 1024;
+/// Default normal (target) chunk size for the UltraCDC byte chunker (512 KiB).
+pub const DEFAULT_NORMAL_SIZE: usize = 512 * 1024;
+/// Default maximum chunk size for the UltraCDC byte chunker (1 MiB).
+pub const DEFAULT_MAX_SIZE: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // UltraCDC byte chunker.
@@ -225,8 +230,8 @@ fn ultra_cdc_cutpoint(opts: &Resolved, data: &[u8]) -> usize {
 
 /// Runs the UltraCDC content-defined chunker over `reader` and calls `f` once
 /// per chunk, in order. Each chunk passed to `f` is owned, so `f` may retain
-/// it. `None` options (or zero fields) use UltraCDC's default sizes (min
-/// 2 KiB, normal 10 KiB, max 64 KiB). An empty reader yields zero chunks.
+/// it. `None` options (or zero fields) use the default sizes (min 32 KiB,
+/// normal 512 KiB, max 1 MiB). An empty reader yields zero chunks.
 ///
 /// This is the Go `chunkers.SplitBytes` wrapper fused with the upstream
 /// `Chunker.Next` driver: up to `max_size` bytes are buffered from the reader
@@ -401,7 +406,7 @@ mod tests {
         // Constant data: every window equals the previous one, so the LEST
         // path fires after 64 equal windows: cut at minSize+8 + 63*8 + 8 =
         // minSize + 520.
-        let input = vec![0xAAu8; 10_000];
+        let input = vec![0xAAu8; DEFAULT_MIN_SIZE + 10_000];
         let chunks = collect(&input, None);
         assert_eq!(chunks[0].len(), DEFAULT_MIN_SIZE + 520);
         let got: Vec<u8> = chunks.concat();

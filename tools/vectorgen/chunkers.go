@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/jobs-build/amber-store-core/chunkers"
+	"github.com/amber-store/core/chunkers"
 )
 
 type ultracdcCase struct {
@@ -23,7 +23,7 @@ type ultracdcFile struct {
 
 // genUltraCDC writes ultracdc.json: chunk-length sequences produced by
 // chunkers.SplitBytes. min/normal/max of 0 select the library defaults
-// (2048/10240/65536).
+// (chunkers.DefaultMinSize/DefaultNormalSize/DefaultMaxSize).
 func genUltraCDC(outDir string) error {
 	type in struct {
 		name             string
@@ -33,10 +33,10 @@ func genUltraCDC(outDir string) error {
 	cases := []in{
 		{"empty", 0, 0, 0, SM(200, 0)},
 		{"one-byte", 0, 0, 0, SM(201, 1)},
-		{"min-exact", 0, 0, 0, SM(202, 2048)},
-		{"min-plus-1", 0, 0, 0, SM(203, 2049)},
-		{"max-exact", 0, 0, 0, SM(204, 65536)},
-		{"big-splitmix", 0, 0, 0, SM(205, 3*1024*1024+12345)},
+		{"min-exact", 0, 0, 0, SM(202, chunkers.DefaultMinSize)},
+		{"min-plus-1", 0, 0, 0, SM(203, chunkers.DefaultMinSize+1)},
+		{"max-exact", 0, 0, 0, SM(204, chunkers.DefaultMaxSize)},
+		{"big-splitmix", 0, 0, 0, SM(205, 16*1024*1024+12345)},
 		{"const-lest-aa", 0, 0, 0, Const(0xAA, 500000)},
 		{"const-zero", 0, 0, 0, Const(0x00, 300000)},
 		{"mixed-concat", 0, 0, 0, Concat(SM(206, 100000), Const(0x55, 200000), SM(207, 150000))},

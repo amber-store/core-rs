@@ -54,7 +54,7 @@ pub(crate) const MAGIC_TRAILER: [u8; 8] = *b"AMBERSGF";
 
 /// The default rotation threshold: the active segment is sealed once it
 /// reaches this many bytes (Go: `DefaultSegmentSize`).
-pub const DEFAULT_SEGMENT_SIZE: u64 = 256 << 20; // 256 MiB
+pub const DEFAULT_SEGMENT_SIZE: u64 = 2 << 30; // 2 GiB
 
 const SEALED_SUFFIX: &str = ".seg";
 const ACTIVE_SUFFIX: &str = ".seg.active";
