@@ -1,6 +1,6 @@
 // Command vectorgen generates the golden test vectors described in
 // core-rs/VECTORS.md by driving the Go implementation of
-// github.com/jobs-build/amber-store-core (the normative reference for the
+// github.com/amber-store/core (the normative reference for the
 // Rust port). Usage:
 //
 //	go run . ../../tests/golden

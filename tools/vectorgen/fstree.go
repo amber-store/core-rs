@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/jobs-build/amber-store-core/cborx"
-	"github.com/jobs-build/amber-store-core/chunkers"
-	"github.com/jobs-build/amber-store-core/fstree"
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/cborx"
+	"github.com/amber-store/core/chunkers"
+	"github.com/amber-store/core/fstree"
+	"github.com/amber-store/core/key"
 )
 
 // goldenItemBits and goldenXattrInlineMax are the golden tree's chunking

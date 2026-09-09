@@ -53,7 +53,7 @@ five types, length-field sizes 1–8, and cases where `length` ≠ payload lengt
                "data": {..}, "chunks": [2048, 777, ...] } ] }
 ```
 
-`min`/`normal`/`max` of 0 select the library defaults (2048/10240/65536).
+`min`/`normal`/`max` of 0 select the library defaults (32768/524288/1048576).
 `chunks` are the byte lengths of the chunks produced by `chunkers.SplitBytes`,
 in order; their sum equals the input length. An empty input has `"chunks": []`.
 Cases include: empty, 1 byte, `min`, `min+1`, exactly `max`, several-MiB
@@ -102,8 +102,8 @@ directories themselves) has mtime 0.
 |------|------|---------|
 | `empty` | file | 0 bytes |
 | `small.txt` | file | `data(1, 100)` |
-| `medium.bin` | file | `data(2, 30000)` (a few chunks) |
-| `big.bin` | file | `data(3, 5242880)` (5 MiB, multi-level index) |
+| `medium.bin` | file | `data(2, 30000)` (a single chunk at the default sizes) |
+| `big.bin` | file | `data(3, 5242880)` (5 MiB, a file index over several blobs) |
 | `constant.dat` | file | `const(0xAA, 300000)` (low-entropy chunking) |
 | `A-upper` | file | `data(4, 10)` (sorts before lowercase) |
 | `\xc3\xa9-utf8` | file | `data(5, 10)` (name is "é-utf8" in UTF-8) |

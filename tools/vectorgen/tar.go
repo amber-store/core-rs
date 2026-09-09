@@ -4,7 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/jobs-build/amber-store-core/tarexport"
+	"github.com/amber-store/core/tarexport"
 )
 
 // genTar writes tar_go.tar: tarexport.Write of the golden tree, served by an

@@ -62,7 +62,7 @@ fn golden_fstree_objects() {
         return;
     };
 
-    assert_eq!(objects.len(), 3444, "golden object count");
+    assert_eq!(objects.len(), 3046, "golden object count");
     assert_eq!(manifest.objects.len(), objects.len(), "manifest count");
 
     // The manifest is the deduplicated set of emitted objects, sorted by key

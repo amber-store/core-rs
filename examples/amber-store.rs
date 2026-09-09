@@ -76,13 +76,13 @@ enum Cmd {
 #[derive(Args)]
 struct IngestArgs {
     /// ultracdc minimum chunk size in bytes
-    #[arg(long, default_value_t = 32 << 10)]
+    #[arg(long, default_value_t = amber_store_core::chunkers::DEFAULT_MIN_SIZE as i64)]
     min: i64,
     /// ultracdc average (normal) chunk size in bytes
-    #[arg(long, default_value_t = 128 << 10)]
+    #[arg(long, default_value_t = amber_store_core::chunkers::DEFAULT_NORMAL_SIZE as i64)]
     avg: i64,
     /// ultracdc maximum chunk size in bytes
-    #[arg(long, default_value_t = 256 << 10)]
+    #[arg(long, default_value_t = amber_store_core::chunkers::DEFAULT_MAX_SIZE as i64)]
     max: i64,
     /// item chunker average run = 2^bits
     #[arg(long = "item-bits", default_value_t = ingest::DEFAULT_ITEM_BITS)]
