@@ -268,3 +268,33 @@ generator reproduces Go's byte streams exactly (Go `math/rand/v2` PCG +
 `IntN`/`Shuffle`, xorshift64* file content) so both implementations ingest
 the identical dataset; results.json is schema-compatible with Go's. See
 `port-notes/amber-bench.md`.
+
+### Verified repair and reference batches
+
+`packstore::Store::put_verified` matches Go `packstore.Store.PutVerified`.
+It verifies supplied content before mutation and checks every indexed copy.
+A healthy newer copy does not hide damage in older segments.
+Replacement preserves segment IDs, index key order, and unrelated record bytes.
+Existing readers retain their old mapping until they release it.
+New readers use the repaired mapping after publication.
+New writes and healthy deduplication follow the configured sync option.
+Replacement files and directory renames always sync.
+Repair does not rebuild corrupt footers or discover unindexed objects.
+An error can leave some copies repaired. Retrying is safe.
+Recovery accepts a complete footer before scanning an active file's body.
+This preserves later records after payload damage during an interrupted seal.
+
+`refstore::Store::put_batch` matches Go `refstore.Store.PutBatch`.
+Each batch uses one transaction with the configured durability.
+The final record wins when names repeat. Empty batches are accepted.
+`all` reads one snapshot and cannot see a partial batch.
+Reference database files remain implementation-specific.
+
+Regression tests live in `src/packstore/repair_tests.rs` and `tests/refstore.rs`.
+They cover corruption, duplicate copies, restart recovery, reader lifetime,
+concurrency, GC observation, storage errors, and batch snapshot visibility.
+
+CI runs `interop/check.sh` against a pinned Go parity revision.
+The check compares ingestion keys, cross-reads stores, and compares exported archives.
+It also corrupts each implementation's pack and repairs it with the other.
+The original implementation then verifies and reads the repaired pack.

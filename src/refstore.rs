@@ -141,6 +141,22 @@ impl Store {
         Ok(())
     }
 
+    /// Publishes every record in one transaction using the configured durability.
+    /// Repeated names use the last record. Empty batches are accepted.
+    /// Readers of `all` see the complete old or new snapshot.
+    pub fn put_batch(&self, records: &[Record]) -> Result<(), Error> {
+        let mut tx = self.db.begin_write()?;
+        tx.set_durability(self.durability);
+        {
+            let mut table = tx.open_table(TABLE)?;
+            for record in records {
+                table.insert(record.name.as_bytes(), record.data.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Returns the record stored under `name`, or [`Error::NotFound`] (Go:
     /// `Get`).
     pub fn get(&self, name: &str) -> Result<Vec<u8>, Error> {

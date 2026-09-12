@@ -47,6 +47,13 @@ pub(crate) fn scan_active(path: &Path) -> io::Result<ScanResult> {
         // too). Reset to empty.
         return Ok(res);
     }
+    // A synced footer can precede a crashed seal rename. Its index
+    // preserves later records even when an earlier payload has bit rot.
+    if parse_footer(&b).is_ok() {
+        res.size = b.len() as u64;
+        res.sealed = true;
+        return Ok(res);
+    }
     let mut off = MAGIC_HEADER.len();
     while off < b.len() {
         if b[off] == TAG_SEAL {

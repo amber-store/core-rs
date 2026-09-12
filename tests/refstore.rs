@@ -201,3 +201,66 @@ fn reference_records_round_trip_byte_exactly() {
         assert_eq!(rec.data, r.encode().unwrap());
     }
 }
+
+#[test]
+fn batch_replaces_records_and_survives_reopen() {
+    use amber_store_core::refstore::Record;
+    for sync in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), sync).unwrap();
+        store.put("a", b"old").unwrap();
+        store.put_batch(&[]).unwrap();
+        store
+            .put_batch(&[
+                Record {
+                    name: "a".into(),
+                    data: b"first".to_vec(),
+                },
+                Record {
+                    name: "\0binary".into(),
+                    data: vec![0, 255, 1],
+                },
+                Record {
+                    name: "a".into(),
+                    data: b"last".to_vec(),
+                },
+            ])
+            .unwrap();
+        drop(store);
+        let store = Store::open(dir.path(), sync).unwrap();
+        assert_eq!(store.get("a").unwrap(), b"last");
+        assert_eq!(store.get("\0binary").unwrap(), vec![0, 255, 1]);
+        assert_eq!(store.all().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn batch_is_visible_atomically_to_readers() {
+    use amber_store_core::refstore::Record;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(open(dir.path()));
+    let records = |value| {
+        (0..20)
+            .map(|i| Record {
+                name: format!("name-{i:02}"),
+                data: vec![value],
+            })
+            .collect::<Vec<_>>()
+    };
+    store.put_batch(&records(0)).unwrap();
+    let gate = Barrier::new(2);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            gate.wait();
+            for value in 1..100 {
+                store.put_batch(&records(value)).unwrap();
+            }
+        });
+        gate.wait();
+        for _ in 0..200 {
+            let snapshot = store.all().unwrap();
+            assert_eq!(snapshot.len(), 20);
+            assert!(snapshot.iter().all(|r| r.data == snapshot[0].data));
+        }
+    });
+}

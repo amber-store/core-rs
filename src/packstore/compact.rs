@@ -95,7 +95,7 @@ pub struct CompactStats {
 
 /// Decodes every 44-byte index row of a sealed segment, in index order (Go:
 /// `footerView.allEntries`; a plain iterator rather than `iter.Seq`).
-fn all_entries(g: &SealedSegment) -> impl Iterator<Item = IndexEntry> + '_ {
+pub(super) fn all_entries(g: &SealedSegment) -> impl Iterator<Item = IndexEntry> + '_ {
     let entries = &g.mm[g.fv.entries_off..g.fv.entries_off + g.fv.entries_len];
     entries.as_chunks::<INDEX_ENTRY_SIZE>().0.iter().map(|row| {
         let mut kb = [0u8; key::SIZE];

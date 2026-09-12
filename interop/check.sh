@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Live Go <-> Rust interoperability check.
 #
-# Requires a checkout of the Go implementation (github.com/jobs-build/amber-store-core)
+# Requires a checkout of the Go implementation (github.com/amber-store/core)
 # at $AMBER_GO_REPO (default: ../amber-store-core) with the Go toolchain available,
 # and cargo for this repository.
 #
@@ -80,5 +80,31 @@ echo "== refs (per-implementation; DB formats intentionally differ, see PORTING.
 "$RS" --store "$WORK/store-rs" ref set nightly "$ROOT_RS"
 [ "$("$RS" --store "$WORK/store-rs" ref get nightly)" = "$ROOT_RS" ]
 "$RS" --store "$WORK/store-rs" ls "ref:nightly@docs" > /dev/null
+
+echo "== repairing packs across implementations"
+(cd "$RS_REPO" && cargo build -q --example repair-interop)
+(cd "$GO_REPO" && go build -o "$WORK/repair-go" "$RS_REPO/interop/repair.go")
+RS_REPAIR="$RS_REPO/target/debug/examples/repair-interop"
+for producer in rust go; do
+  if [ "$producer" = rust ]; then
+    CREATE="$RS_REPAIR"
+    REPAIR="$WORK/repair-go"
+  else
+    CREATE="$WORK/repair-go"
+    REPAIR="$RS_REPAIR"
+  fi
+  STORE="$WORK/store-repair-$producer"
+  "$CREATE" create "$STORE"
+  python3 - "$STORE/0000000000000001.seg" <<'PYREPAIR'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+record = bytearray(path.read_bytes())
+record[8] ^= 0x40  # Damage the first record header, preserving the footer.
+path.write_bytes(record)
+PYREPAIR
+  "$REPAIR" repair "$STORE"
+  "$CREATE" check "$STORE"
+done
 
 echo "OK: all interop checks passed"

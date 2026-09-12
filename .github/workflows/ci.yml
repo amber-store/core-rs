@@ -21,3 +21,22 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --all-targets
       - run: cargo test
+
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: amber-store/core
+          ref: 4ed4660657b12421a534ab0b08cfd717ae3d2291
+          path: amber-go
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: amber-go/go.mod
+          cache-dependency-path: amber-go/go.sum
+      - run: bash interop/check.sh
+        env:
+          AMBER_GO_REPO: ${{ github.workspace }}/amber-go

@@ -14,6 +14,10 @@
         (system: f system nixpkgs.legacyPackages.${system});
     in {
 
+      formatter = eachSystem (system: pkgs: pkgs.writeShellScriptBin "fmt" ''
+        exec ${pkgs.rustfmt}/bin/cargo-fmt --all
+      '');
+
       devShells = eachSystem (system: pkgs: {
         default = pkgs.mkShell {
           hardeningDisable = [ "all" ];
