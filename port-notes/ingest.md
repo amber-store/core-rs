@@ -163,3 +163,27 @@ abort. Go refactored to an injectable `readXattrsWith(list, get)` for
 testability; the port mirrors that as `read_xattrs_with` over the `xattr`
 crate's closure shapes (an iterator-returning `list` instead of Go's
 two-call size/fill protocol — the crate owns that dance).
+
+## Go PR #11 backport (2026-09-16)
+
+`Opts.Exclude []string` → `Opts::exclude: Vec<OsString>`: names directly
+under the root that are never ingested, whatever `no_ignore` says. Root
+only — the same name deeper in the tree is ingested normally (the consumer
+is dstore, whose working copies keep `.dstore/` at the root of the tree they
+push). Go carries a `root`/`exclude` pair on both `pbuilder` and `scanner`
+and tests `path == root && exclude[name]` ahead of the `.amberignore`
+check; the port folds that pair into one `Exclude` helper (`mod.rs`) shared
+by `PBuilder` and `Scanner`, with the same check order and the same
+"nil when empty" short-circuit (`Opts::exclude_set` → `None`). Names
+compare bytewise (`OsStrExt::as_bytes`) against the sorted dirents, like
+Go's string compare. `Path` equality is component-wise where Go compares
+strings; the two cannot disagree here because a child path is always
+strictly longer than the root it was joined from.
+
+`ScanWith(dir, opts)` → `scan_with(dir, &opts)` (borrowed: the caller goes
+on to pass the same `Opts` to `dir`/`objects`). It resolves `jobs` via
+`Opts::jobs` (0 ⇒ available parallelism) exactly as `ScanWith` uses
+`opts.jobs()`, while `scan` keeps clamping `< 1` to 1 like `Scan`.
+`exclude_test.go` is ported one-to-one into `tests.rs`. The CLI example
+gained no flag (Go's `cmd/amber-store` did not either). Go pin `c628b89`
+(tag `v0.0.8`).

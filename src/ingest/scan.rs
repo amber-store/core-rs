@@ -10,7 +10,7 @@ use crate::amberignore::{Matcher, descend_opt, ignored_opt};
 
 use super::driver::{DirEnt, read_dir_sorted};
 use super::parallel::Sem;
-use super::{Error, lock};
+use super::{Error, Exclude, Opts, lock};
 
 /// Walks the directory tree at `dir` concurrently (readdir + lstat only, no
 /// content reads) and returns the number of regular files and the total size
@@ -37,6 +37,24 @@ pub fn scan(dir: impl AsRef<Path>, no_ignore: bool, jobs: usize) -> Result<(u64,
     scan_tree(dir, ign.as_ref(), jobs)
 }
 
+/// [`scan`] with every relevant option of `opts` applied — `no_ignore`,
+/// `jobs` and `exclude` — so that the totals match what
+/// [`objects`](super::objects) reads with the same options (Go: `ScanWith`).
+pub fn scan_with(dir: impl AsRef<Path>, opts: &Opts) -> Result<(u64, u64), Error> {
+    let dir = dir.as_ref();
+    let ign = if !opts.no_ignore {
+        Some(Matcher::root(dir).map_err(|e| Error::ignore_load(dir, e))?)
+    } else {
+        None
+    };
+    run(
+        dir,
+        ign.as_ref(),
+        opts.jobs(),
+        Exclude::new(dir, opts.exclude_set()),
+    )
+}
+
 /// Implements [`scan`] over an explicit matcher (`None` ingests everything)
 /// (Go: `scanTree`).
 pub(crate) fn scan_tree(
@@ -44,11 +62,22 @@ pub(crate) fn scan_tree(
     ign: Option<&Matcher>,
     jobs: usize,
 ) -> Result<(u64, u64), Error> {
+    run(dir, ign, jobs.max(1), Exclude::none(dir))
+}
+
+/// Runs one scan with a resolved worker count and exclusion list.
+fn run(
+    dir: &Path,
+    ign: Option<&Matcher>,
+    jobs: usize,
+    exclude: Exclude<'_>,
+) -> Result<(u64, u64), Error> {
     let s = Scanner {
         files: AtomicU64::new(0),
         bytes: AtomicU64::new(0),
-        sem: Sem::new(jobs.max(1)),
+        sem: Sem::new(jobs),
         first_err: Mutex::new(None),
+        exclude,
     };
     s.walk(dir, ign);
     if let Some(e) = lock(&s.first_err).take() {
@@ -61,14 +90,16 @@ pub(crate) fn scan_tree(
 }
 
 /// Shared state of one scan (Go: `scanner`).
-struct Scanner {
+struct Scanner<'a> {
     files: AtomicU64,
     bytes: AtomicU64,
     sem: Sem,
     first_err: Mutex<Option<Error>>,
+    /// Implements [`Opts::exclude`] for [`scan_with`] (Go: `root`/`exclude`).
+    exclude: Exclude<'a>,
 }
 
-impl Scanner {
+impl Scanner<'_> {
     fn set_err(&self, e: Error) {
         let mut slot = lock(&self.first_err);
         if slot.is_none() {
@@ -83,6 +114,9 @@ impl Scanner {
         };
         thread::scope(|s| {
             for de in ents {
+                if self.exclude.skips(dir, &de.name) {
+                    continue;
+                }
                 if ignored_opt(ign, &de.name, de.is_dir) {
                     continue;
                 }

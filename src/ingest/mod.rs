@@ -19,8 +19,11 @@ mod xattrs;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -34,7 +37,7 @@ use crate::packstore;
 
 use driver::{ChanSink, Driver, Stopped};
 use parallel::PBuilder;
-pub use scan::scan;
+pub use scan::{scan, scan_with};
 
 /// The item-chunker bit width used when [`ChunkOpts`] leaves it zero:
 /// directory leaves and file index nodes average 2^7 entries (Go:
@@ -84,6 +87,11 @@ pub struct Opts {
     pub no_ignore: bool,
     /// When set, receives build-progress events.
     pub progress: Option<Arc<dyn Progress>>,
+    /// Names directly under the root that are never ingested, whatever
+    /// `no_ignore` says. It applies to the root directory only; the same
+    /// name deeper in the tree is ingested normally (Go: `Exclude []string`;
+    /// names are compared bytewise against directory entries).
+    pub exclude: Vec<OsString>,
 }
 
 impl std::fmt::Debug for Opts {
@@ -93,6 +101,7 @@ impl std::fmt::Debug for Opts {
             .field("chunk", &self.chunk)
             .field("no_ignore", &self.no_ignore)
             .field("progress", &self.progress.is_some())
+            .field("exclude", &self.exclude)
             .finish()
     }
 }
@@ -105,6 +114,14 @@ impl Opts {
         } else {
             self.jobs
         }
+    }
+
+    /// Turns `exclude` into a set; `None` when empty (Go: `Opts.excludeSet`).
+    fn exclude_set(&self) -> Option<HashSet<Vec<u8>>> {
+        if self.exclude.is_empty() {
+            return None;
+        }
+        Some(self.exclude.iter().map(|n| n.as_bytes().to_vec()).collect())
     }
 
     /// Builds a driver from the chunking options (Go: `Opts.driver`).
@@ -203,6 +220,33 @@ impl Error {
     }
 }
 
+/// The root-only exclusion of [`Opts::exclude`], resolved against the build
+/// root: a name in the set is skipped when the directory being read is `root`
+/// (Go: the `root`/`exclude` pair carried by `pbuilder` and `scanner`).
+pub(crate) struct Exclude<'a> {
+    root: &'a Path,
+    names: Option<HashSet<Vec<u8>>>,
+}
+
+impl<'a> Exclude<'a> {
+    pub(crate) fn new(root: &'a Path, names: Option<HashSet<Vec<u8>>>) -> Exclude<'a> {
+        Exclude { root, names }
+    }
+
+    /// No exclusions (Go: a zero `root`/nil `exclude`).
+    pub(crate) fn none(root: &'a Path) -> Exclude<'a> {
+        Exclude::new(root, None)
+    }
+
+    /// Reports whether `name`, an entry of directory `dir`, is excluded (Go:
+    /// `path == b.root && b.exclude[name]`).
+    pub(crate) fn skips(&self, dir: &Path, name: &[u8]) -> bool {
+        self.names
+            .as_ref()
+            .is_some_and(|names| dir == self.root && names.contains(name))
+    }
+}
+
 /// Locks `m`, ignoring poisoning: a panicking worker already aborts the
 /// build, and the guarded state stays consistent.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -274,6 +318,7 @@ pub fn objects(path: impl AsRef<Path>, opts: Opts) -> Result<(ObjectStream, Root
     };
     let d = opts.driver();
     let jobs = opts.jobs();
+    let exclude = opts.exclude_set();
 
     // Built objects stream to the consumer through a buffered channel, so
     // production and consumption overlap (Go: `objects` with bufSize jobs*2).
@@ -289,7 +334,7 @@ pub fn objects(path: impl AsRef<Path>, opts: Opts) -> Result<(ObjectStream, Root
         .spawn(move || {
             let sink = ChanSink::new(tx);
             let res = if is_dir {
-                let b = PBuilder::new(&d, &sink, jobs);
+                let b = PBuilder::new(&d, &sink, jobs, Exclude::new(&path, exclude));
                 b.build_dir(&path, ign.as_ref())
             } else {
                 let r = d.build_file(&path, &sink);

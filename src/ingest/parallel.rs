@@ -8,8 +8,8 @@ use crate::amberignore::{Matcher, ignored_opt};
 use crate::fstree::{self, DirBuilder};
 use crate::key::Key;
 
-use super::Error;
 use super::driver::{Driver, Emit, read_dir_sorted};
+use super::{Error, Exclude};
 
 /// A non-blocking counting semaphore (Go: the `chan struct{}` used with a
 /// non-blocking send).
@@ -50,26 +50,37 @@ pub(crate) struct PBuilder<'a> {
     /// the current thread, so a parent never blocks waiting for a slot held
     /// by one of its own descendants — the recursion cannot deadlock.
     sem: Sem,
+    /// Implements [`super::Opts::exclude`]: names skipped at the root
+    /// directory only (Go: `root`/`exclude`).
+    exclude: Exclude<'a>,
 }
 
 impl<'a> PBuilder<'a> {
-    pub(crate) fn new(d: &'a Driver, sink: &'a dyn Emit, jobs: usize) -> PBuilder<'a> {
+    pub(crate) fn new(
+        d: &'a Driver,
+        sink: &'a dyn Emit,
+        jobs: usize,
+        exclude: Exclude<'a>,
+    ) -> PBuilder<'a> {
         PBuilder {
             d,
             sink,
             sem: Sem::new(jobs),
+            exclude,
         }
     }
 
     /// Builds the directory at `path` and returns its root key. Entries
-    /// excluded by `ign` are skipped (excluded directories are pruned without
-    /// being read). Sibling entries are built concurrently; the directory's
-    /// leaf/index objects are then emitted in sorted-entry order, identical
-    /// to the sequential walk (Go: `pbuilder.buildDir`).
+    /// excluded by `ign` — or, at the root, by the exclude list — are skipped
+    /// (excluded directories are pruned without being read). Sibling entries
+    /// are built concurrently; the directory's leaf/index objects are then
+    /// emitted in sorted-entry order, identical to the sequential walk (Go:
+    /// `pbuilder.buildDir`).
     pub(crate) fn build_dir(&self, path: &Path, ign: Option<&Matcher>) -> Result<Key, Error> {
         let ents = read_dir_sorted(path)?;
         let kept: Vec<_> = ents
             .into_iter()
+            .filter(|de| !self.exclude.skips(path, &de.name))
             .filter(|de| !ignored_opt(ign, &de.name, de.is_dir))
             .collect();
 

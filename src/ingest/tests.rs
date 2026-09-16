@@ -25,7 +25,8 @@ use super::driver::{ChanSink, Driver, MapSink};
 use super::parallel::PBuilder;
 use super::scan::scan_tree;
 use super::{
-    DEFAULT_ITEM_BITS, DEFAULT_XATTR_INLINE_MAX, Opts, Progress, dir, meta, objects, scan,
+    DEFAULT_ITEM_BITS, DEFAULT_XATTR_INLINE_MAX, Exclude, Opts, Progress, dir, meta, objects, scan,
+    scan_with,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,7 +79,7 @@ fn collect_parallel(
         let d = &d;
         let h = s.spawn(move || {
             let sink = ChanSink::new(tx);
-            PBuilder::new(d, &sink, jobs).build_dir(dir, ign)
+            PBuilder::new(d, &sink, jobs, Exclude::none(dir)).build_dir(dir, ign)
         });
         for o in rx.iter() {
             objs.insert(o.key, o.bytes);
@@ -713,4 +714,104 @@ fn end_to_end_structure_round_trips() {
     let link = &by_name[b"link".as_slice()];
     assert_eq!(link.mode & meta::S_IFMT, meta::S_IFLNK, "link type");
     assert_eq!(link.link_target, b"big.bin", "link target");
+}
+
+// ---------------------------------------------------------------------------
+// exclude_test.go
+// ---------------------------------------------------------------------------
+
+/// A tree with a metadata dir at the root and a same-named dir one level
+/// down, which must not be excluded (Go: `excludeFixture`).
+fn exclude_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    write_file(&dir.join("a.txt"), b"alpha", 0o644);
+    fs::create_dir_all(dir.join(".meta")).unwrap();
+    write_file(&dir.join(".meta").join("junk"), &[0u8; 1000], 0o644);
+    fs::create_dir_all(dir.join("sub").join(".meta")).unwrap();
+    write_file(&dir.join("sub").join(".meta").join("keep"), b"keep", 0o644);
+    tmp
+}
+
+/// An unsynced packstore in its own temp dir (Go: `packstore.Open(...,
+/// packstore.WithSync(false))`).
+fn open_unsynced_store() -> (TempDir, packstore::Store) {
+    let store_dir = TempDir::new().unwrap();
+    let st = packstore::Store::open_with(
+        store_dir.path().join("ps"),
+        packstore::Options::new().sync(false),
+    )
+    .unwrap();
+    (store_dir, st)
+}
+
+/// The excluded root name gives the same root as a tree that never had it
+/// (Go: `TestExclude_SkipsRootNameOnly`).
+#[test]
+fn exclude_skips_root_name_only() {
+    let tmp = exclude_fixture();
+    let (_store_dir, st) = open_unsynced_store();
+    let (_, res) = dir(
+        &st,
+        tmp.path(),
+        Opts {
+            exclude: vec![".meta".into()],
+            ..Default::default()
+        },
+    );
+    let got = res.unwrap();
+    // The same tree without the root .meta must give the same key.
+    fs::remove_dir_all(tmp.path().join(".meta")).unwrap();
+    let (_, res) = dir(&st, tmp.path(), Opts::default());
+    let want = res.unwrap();
+    assert_eq!(got, want, "root with exclude != root without .meta");
+    st.close().unwrap();
+}
+
+/// Exclude applies whatever `no_ignore` says (Go:
+/// `TestExclude_IgnoresNoIgnore`).
+#[test]
+fn exclude_ignores_no_ignore() {
+    let tmp = exclude_fixture();
+    let (_store_dir, st) = open_unsynced_store();
+    let (_, res) = dir(
+        &st,
+        tmp.path(),
+        Opts {
+            exclude: vec![".meta".into()],
+            no_ignore: true,
+            ..Default::default()
+        },
+    );
+    let got = res.unwrap();
+    fs::remove_dir_all(tmp.path().join(".meta")).unwrap();
+    let (_, res) = dir(
+        &st,
+        tmp.path(),
+        Opts {
+            no_ignore: true,
+            ..Default::default()
+        },
+    );
+    let want = res.unwrap();
+    assert_eq!(got, want, "exclude must apply with no_ignore");
+    st.close().unwrap();
+}
+
+/// The sizing scan skips the excluded root name too (Go:
+/// `TestScanWith_HonorsExclude`).
+#[test]
+fn scan_with_honors_exclude() {
+    let tmp = exclude_fixture();
+    let (files, bytes) = scan_with(
+        tmp.path(),
+        &Opts {
+            exclude: vec![".meta".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // a.txt (5 bytes) and sub/.meta/keep (4 bytes); the root .meta/junk is
+    // skipped.
+    assert_eq!((files, bytes), (2, 9), "files, bytes");
 }
