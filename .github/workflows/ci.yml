@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: amber-store/core
-          ref: 4ed4660657b12421a534ab0b08cfd717ae3d2291
+          ref: c628b89a8c40b1271de95cfe3db13918378edd66 # core v0.0.8
           path: amber-go
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

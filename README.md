@@ -46,7 +46,7 @@ The modules mirror the Go packages; see the crate docs (`cargo doc --open`).
 | `key` | The 32-byte content key: type, length, truncated BLAKE3 hash. |
 | `fstree` | Tree objects (encode/decode), bottom-up builders, read paths. |
 | `chunkers` | UltraCDC byte chunking and BLAKE3 item chunking. |
-| `ingest` | Build a tree from a local directory; honors `.amberignore`. |
+| `ingest` | Build a tree from a local directory; honors `.amberignore`; `Opts::exclude` skips names at the root (a working copy's metadata directory). |
 | `amberignore` | `.gitignore`-semantics exclusion for ingestion. |
 | `packstore` | Append-only pack segments with parallel, deduplicating, verifying writers. |
 | `refstore` | Name → record map for references (redb-backed). |

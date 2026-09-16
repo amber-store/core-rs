@@ -380,6 +380,7 @@ fn run_ingest(cli: &Cli, a: &IngestArgs) -> Result<(), CliError> {
         chunk,
         no_ignore: a.no_ignore,
         progress: None,
+        exclude: Vec::new(),
     };
     let (_stats, res) = ingest::dir(&st.objects, &a.path, opts);
     let root = match res {

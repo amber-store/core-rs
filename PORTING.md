@@ -1,10 +1,14 @@
 # Porting contract (Go → Rust)
 
-This crate is a port of `github.com/jobs-build/amber-store-core` (Go), pinned
-at commit `9f3c60ea3306f1b53509006dc45048878a75fd2f` (the merge of PR #4,
-the pre-encoded record write path and `Reader.Records`). The Go sources
-are the normative reference wherever this document or `architecture/` is
-silent; a local checkout lives at `/Users/dragan/jobs-build/amber-store-core`.
+This crate is a port of `github.com/amber-store/core` (Go; formerly
+`jobs-build/amber-store-core`), pinned at commit
+`c628b89a8c40b1271de95cfe3db13918378edd66` (tag `v0.0.8`, the merge of
+PR #11, `ingest.Opts.Exclude` and `ScanWith`). Not yet ported from that
+range: Go PR #8's gc write-span gate (`Collector.BeginWrite`) and
+`inbox.WithGate`. The Go sources are the normative reference wherever this
+document or `architecture/` is silent; clone the parent fresh when porting
+(the checkout at `/Users/dragan/jobs-build/amber-store-core` lags GitHub).
+The CI interop job pins the same Go commit in `.github/workflows/ci.yml`.
 
 ## Compatibility contract
 
@@ -228,8 +232,10 @@ logging callback or `log` facade (document choice in port-notes).
 
 ### `ingest` (Go: `ingest/`)
 
-`Objects`/`Dir`/`Scan` APIs, options (jobs, chunk opts, xattr inline max,
-no-ignore), scan order (bytewise-sorted dirents), metadata capture (lstat:
+`Objects`/`Dir`/`Scan`/`ScanWith` APIs, options (jobs, chunk opts, xattr
+inline max, no-ignore, and the root-only exclude list: names skipped in the
+root directory only, whatever no-ignore says), scan order (bytewise-sorted
+dirents), metadata capture (lstat:
 mode/uid/gid/mtime ns; macOS + Linux xattr via the `xattr` crate matching
 `xattr_darwin.go`/`xattr_linux.go` behavior incl. error tolerance),
 `.amberignore` loading/composition/pruning with always-store-the-ignore-file
