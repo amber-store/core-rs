@@ -2,7 +2,10 @@
 //! `cmd/amber-store/e2e_test.go`'s pin..HEAD delta
 //! (`TestE2E_RefSetChecksCompleteness`, `TestE2E_RefLifecycle`,
 //! `TestE2E_GC`) plus the pre-existing `TestE2E_MissingStoreFlag`, which
-//! had no Rust counterpart yet. Go drives `newApp()` in-process; here each
+//! had no Rust counterpart yet, and `TestE2E_Commit` (Go PR #12). The Go
+//! unit tests of `parseIdentity` and `renderCommit` are covered through the
+//! CLI in `commit_identity_and_rendering`: the example carries no unit
+//! tests. Go drives `newApp()` in-process; here each
 //! case spawns the compiled example binary.
 
 use std::fs;
@@ -253,4 +256,265 @@ fn gc_end_to_end() {
         got.starts_with("fresh content"),
         "restored content wrong after gc"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Commits (Go: TestE2E_Commit, plus commit_test.go's parseIdentity and
+// renderCommit cases driven through the CLI).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn commit_end_to_end() {
+    let src = TempDir::new().unwrap();
+    write_fixture(src.path());
+    let store = TempDir::new().unwrap();
+    let src_s = src.path().display().to_string();
+    let run = |args: &[&str]| -> String {
+        match run_seg(store.path(), args) {
+            Ok(out) => out.trim().to_string(),
+            Err(e) => panic!("{args:?}: {e}"),
+        }
+    };
+    let create = |extra: &[&str]| -> String {
+        let mut args = vec![
+            "commit",
+            "create",
+            "--ref",
+            "main",
+            "--author",
+            "Ann <ann@example.com>",
+            "--date",
+            "2026-01-02T03:04:05+01:00",
+        ];
+        args.extend_from_slice(extra);
+        run(&args)
+    };
+
+    let root1 = run(&["ingest", "--no-progress", &src_s]);
+    let c1 = create(&["-m", "first", &root1]);
+
+    fs::write(src.path().join("a.txt"), "alpha, revised").unwrap();
+    let root2 = run(&["ingest", "--no-progress", &src_s]);
+    let c2 = create(&["--parent", "ref:main", "-m", "second", &root2]);
+    assert!(c1 != c2 && c2 != root2, "c1 {c1}, c2 {c2}, root2 {root2}");
+    assert_eq!(run(&["ref", "get", "main"]), c2, "ref get main");
+
+    let show = run(&["commit", "show", "ref:main"]);
+    for want in [
+        format!("commit {c2}"),
+        format!("tree {root2}"),
+        format!("parent {c1}"),
+        "author Ann <ann@example.com> 2026-01-02T03:04:05+01:00".to_string(),
+        "    second".to_string(),
+    ] {
+        assert!(
+            show.contains(&want),
+            "commit show {show:?} is missing {want:?}"
+        );
+    }
+
+    // A commit stands in for its tree wherever a directory is expected.
+    for (spec, want) in [
+        ("ref:main".to_string(), "a.txt"),
+        ("ref:main@sub".to_string(), "b.txt"),
+        (c1.clone(), "a.txt"),
+        (format!("{c1}/sub"), "b.txt"),
+    ] {
+        let out = run(&["ls", &spec]);
+        assert!(out.contains(want), "ls {spec} output {out:?} lacks {want}");
+    }
+
+    // History is reachable from the branch, so a forced gc keeps the first
+    // commit's tree: it still restores, with the original content.
+    thread::sleep(Duration::from_millis(50));
+    run(&["gc", "run", "--grace", "1ms", "--garbage", "0"]);
+    for (commit_key, want) in [(&c1, "alpha"), (&c2, "alpha, revised")] {
+        let dest = TempDir::new().unwrap();
+        let dest_s = dest.path().join("restored").display().to_string();
+        run(&["restore", commit_key, &dest_s]);
+        let got = fs::read_to_string(dest.path().join("restored").join("a.txt")).unwrap();
+        assert_eq!(got, want, "restored a.txt of {commit_key}");
+    }
+
+    // Rejections: a tree as a parent, a file as the tree, a missing author,
+    // showing something that is not a commit.
+    let file_spec = format!("{root2}/a.txt");
+    for (name, args) in [
+        (
+            "tree as parent",
+            vec![
+                "commit", "create", "--author", "Ann", "-m", "x", "--parent", &root1, &root2,
+            ],
+        ),
+        (
+            "file as tree",
+            vec!["commit", "create", "--author", "Ann", "-m", "x", &file_spec],
+        ),
+        ("no author", vec!["commit", "create", "-m", "x", &root2]),
+        ("show a tree", vec!["commit", "show", &root2]),
+    ] {
+        assert!(
+            run_seg(store.path(), &args).is_err(),
+            "{name}: command succeeded"
+        );
+    }
+}
+
+#[test]
+fn commit_identity_and_rendering() {
+    let src = TempDir::new().unwrap();
+    write_fixture(src.path());
+    let store = TempDir::new().unwrap();
+    let src_s = src.path().display().to_string();
+    let tree = run_seg(store.path(), &["ingest", "--no-progress", &src_s])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Go's TestRenderCommit layout, byte for byte: headers, a blank line, the
+    // message indented by four spaces with trailing newlines dropped; the
+    // time rendered in the identity's own zone; an identity without an email
+    // prints the bare name. (The "signature N bytes" line is unreachable
+    // through the CLI, which cannot create signed commits.)
+    let key = run_seg(
+        store.path(),
+        &[
+            "commit",
+            "create",
+            "--author",
+            "  Ann  <ann@example.com>  ",
+            "--committer",
+            "Bob",
+            "--date",
+            "2026-01-01T22:04:05-05:00",
+            "-m",
+            "subject\n\nbody\n",
+            &tree,
+        ],
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let show = run_seg(store.path(), &["commit", "show", &key]).unwrap();
+    assert_eq!(
+        show,
+        format!(
+            "commit {key}\ntree {tree}\n\
+             author Ann <ann@example.com> 2026-01-01T22:04:05-05:00\n\
+             committer Bob 2026-01-01T22:04:05-05:00\n\
+             \n    subject\n    \n    body\n"
+        )
+    );
+
+    // The same instant given in another zone is a different commit: the
+    // offset is part of the record.
+    let utc = run_seg(
+        store.path(),
+        &[
+            "commit",
+            "create",
+            "--author",
+            "Ann <ann@example.com>",
+            "--committer",
+            "Bob",
+            "--date",
+            "2026-01-02T03:04:05Z",
+            "-m",
+            "subject\n\nbody\n",
+            &tree,
+        ],
+    )
+    .unwrap();
+    assert_ne!(utc.trim(), key);
+    let show = run_seg(store.path(), &["commit", "show", utc.trim()]).unwrap();
+    assert!(
+        show.contains("committer Bob 2026-01-02T03:04:05Z\n"),
+        "{show:?}"
+    );
+
+    // An empty message prints no blank line and no body.
+    let bare = run_seg(
+        store.path(),
+        &[
+            "commit",
+            "create",
+            "--author",
+            "A <b> C <c@d>",
+            "--date",
+            "2026-01-02T03:04:05Z",
+            &tree,
+        ],
+    )
+    .unwrap();
+    let show = run_seg(store.path(), &["commit", "show", bare.trim()]).unwrap();
+    assert!(
+        show.ends_with("committer A <b> C <c@d> 2026-01-02T03:04:05Z\n"),
+        "{show:?}"
+    );
+
+    // parseIdentity's rejections and the other argument errors.
+    for (name, args) in [
+        (
+            "nameless author",
+            vec!["commit", "create", "--author", "<ann@example.com>", &tree],
+        ),
+        (
+            "empty author",
+            vec!["commit", "create", "--author", "", &tree],
+        ),
+        (
+            "bad date",
+            vec![
+                "commit",
+                "create",
+                "--author",
+                "Ann",
+                "--date",
+                "yesterday",
+                &tree,
+            ],
+        ),
+        (
+            "date without zone",
+            vec![
+                "commit",
+                "create",
+                "--author",
+                "Ann",
+                "--date",
+                "2026-01-02T03:04:05",
+                &tree,
+            ],
+        ),
+        (
+            "absent parent",
+            vec![
+                "commit",
+                "create",
+                "--author",
+                "Ann",
+                "--parent",
+                "5073d980bd63330e7b37ddd0989bea896cd6a35988e973dfc4b1b28808930a7c",
+                &tree,
+            ],
+        ),
+        (
+            "parent with a path",
+            vec![
+                "commit",
+                "create",
+                "--author",
+                "Ann",
+                "--parent",
+                "ref:main@sub",
+                &tree,
+            ],
+        ),
+        ("show with a path", vec!["commit", "show", "ref:main@sub"]),
+    ] {
+        assert!(
+            run_seg(store.path(), &args).is_err(),
+            "{name}: command succeeded"
+        );
+    }
 }

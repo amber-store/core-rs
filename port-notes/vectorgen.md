@@ -1,9 +1,9 @@
 # vectorgen notes
 
 `tools/vectorgen` (Go) generates every vector file in `tests/golden/` per
-VECTORS.md, driving the pinned Go library
-(`github.com/jobs-build/amber-store-core@e4fcb60cba49520a9ceeea266948bbaed9125837`,
-resolved as pseudo-version `v0.0.0-20260727080459-e4fcb60cba49`, no replace
+VECTORS.md, driving the pinned Go library (`github.com/amber-store/core`
+at the version in `tools/vectorgen/go.mod` — v0.0.9 since the Go PR #12
+backport; originally `jobs-build/amber-store-core@e4fcb60`; no replace
 directive). Regenerate with `cd tools/vectorgen && go run . ../../tests/golden`
 — the generator first deletes exactly the files it owns, so a rerun is a clean
 rebuild.
@@ -74,3 +74,10 @@ deterministic for the pinned `klauspost/compress` version).
   both runs identical to each other **and** to the committed
   `tests/golden/` output. JSON is emitted from structs only (fixed field
   order), never maps.
+
+## Go PR #12 backport (2026-09-23)
+
+`commit.go` writes `commit.json` (7 cases, see VECTORS.md). The pin moved
+v0.0.7 → v0.0.9; a full regeneration into a scratch directory at the new pin
+reproduced every existing file byte for byte, so only `commit.json` was
+added.

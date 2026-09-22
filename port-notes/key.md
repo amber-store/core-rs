@@ -135,3 +135,11 @@ required. `rustfmt --check` is clean on `src/key.rs` and
 `tests/common/mod.rs` (shared helper, not touchable from this task): rustfmt
 wants the `panic!` at line ~68 wrapped. Whoever owns the shared helpers
 should run `cargo fmt` on it — no semantic change needed.
+
+## Go PR #12 backport (2026-09-23)
+
+`Type::Commit = 5` (Go `key.Commit`); the reserved range is now 6..=15.
+`is_valid`, `from_u8` and `Display` follow; the tests that used 5 as "a
+reserved type" use 6. A `Commit` key's length field is the object's own
+serialized byte length, the `Blob`/`XattrSet` rule. `keys.json` needed no
+regeneration: it never pinned 5 as reserved. See `port-notes/commit.md`.

@@ -141,6 +141,24 @@ pub fn append_head(b: &mut Vec<u8>, major: u8, n: u64) {
     }
 }
 
+/// Appends `s` as a CBOR text string (major type 3).
+pub fn append_tstr(b: &mut Vec<u8>, s: &str) {
+    append_head(b, MAJOR_TSTR, s.len() as u64);
+    b.extend_from_slice(s.as_bytes());
+}
+
+/// Appends `v` as a CBOR integer in the shortest form: major type 0 when
+/// non-negative, major type 1 otherwise.
+pub fn append_int(b: &mut Vec<u8>, v: i64) {
+    if v >= 0 {
+        append_head(b, MAJOR_UINT, v as u64);
+    } else {
+        // Major 1 carries -1 - n; for negative v that argument is the bitwise
+        // complement, which also holds for i64::MIN.
+        append_head(b, MAJOR_NEGINT, !(v as u64));
+    }
+}
+
 /// Appends `s` as a CBOR byte string (major type 2).
 pub fn append_bstr(b: &mut Vec<u8>, s: &[u8]) {
     append_head(b, MAJOR_BSTR, s.len() as u64);

@@ -361,13 +361,13 @@ impl Reference {
         let mut b = Vec::new();
         cbor::append_head(&mut b, MAJOR_MAP, pairs);
         cbor::append_head(&mut b, MAJOR_UINT, 0);
-        append_tstr(&mut b, &self.name);
+        cbor::append_tstr(&mut b, &self.name);
         cbor::append_head(&mut b, MAJOR_UINT, 1);
         cbor::append_bstr(&mut b, &self.key);
         cbor::append_head(&mut b, MAJOR_UINT, 2);
-        append_tstr(&mut b, &self.user);
+        cbor::append_tstr(&mut b, &self.user);
         cbor::append_head(&mut b, MAJOR_UINT, 3);
-        append_int(&mut b, self.created_at);
+        cbor::append_int(&mut b, self.created_at);
         if !self.signature.is_empty() {
             cbor::append_head(&mut b, MAJOR_UINT, 4);
             cbor::append_bstr(&mut b, &self.signature);
@@ -410,21 +410,6 @@ impl Reference {
         let mut r = self.clone();
         r.signature = Vec::new();
         r.encode()
-    }
-}
-
-fn append_tstr(b: &mut Vec<u8>, s: &str) {
-    cbor::append_head(b, MAJOR_TSTR, s.len() as u64);
-    b.extend_from_slice(s.as_bytes());
-}
-
-fn append_int(b: &mut Vec<u8>, v: i64) {
-    if v >= 0 {
-        cbor::append_head(b, MAJOR_UINT, v as u64);
-    } else {
-        // CBOR major 1 carries -1 - n; for negative v that argument is the
-        // bitwise complement, which also holds for i64::MIN.
-        cbor::append_head(b, MAJOR_NEGINT, !(v as u64));
     }
 }
 
@@ -1844,11 +1829,11 @@ mod tests {
         b.push(0x18);
         b.push(42);
         cbor::append_head(&mut b, MAJOR_UINT, 2);
-        append_tstr(&mut b, "u");
+        cbor::append_tstr(&mut b, "u");
         cbor::append_head(&mut b, MAJOR_UINT, 1);
         cbor::append_bstr(&mut b, &test_key());
         cbor::append_head(&mut b, MAJOR_UINT, 0);
-        append_tstr(&mut b, "n");
+        cbor::append_tstr(&mut b, "n");
         assert_eq!(Reference::decode(&b).unwrap_err(), Error::NotCanonical);
     }
 

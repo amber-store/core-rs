@@ -162,3 +162,9 @@ The Go tests derive their valid key via `fstree.EncodeBlob("hello")`; the
 Rust unit tests use `key::Key::new(Type::Blob, 5, b"hello")` to avoid a
 cross-module dependency. Equivalence is pinned by the ported `golden_vector`
 test (byte-for-byte against the Go suite's `goldenHex`).
+
+## Go PR #12 backport (2026-09-23)
+
+The private `append_tstr` / `append_int` encoders moved to `cbor.rs` as public
+helpers, shared with the new `commit` codec. No behavior change; the unit
+tests and `reference.json` pin the encoding as before.

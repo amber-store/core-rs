@@ -21,6 +21,7 @@
 //! | [`packstore`] | Append-only segment object store. |
 //! | [`refstore`] | Name → reference-record map (redb-backed; see PORTING.md). |
 //! | [`reference`] | The reference record: canonical CBOR encoding and validation. |
+//! | [`commit`] | The commit record (object type 5): canonical CBOR encoding and validation. |
 //! | [`inbox`] | Durable pack receiving. |
 //! | [`ingest`] | Build a tree from a local directory. |
 //! | [`tarexport`] | Stream a stored tree as a PAX tar. |
@@ -31,6 +32,7 @@ pub mod amberpack;
 pub mod binaryfuse;
 pub mod cbor;
 pub mod chunkers;
+pub mod commit;
 pub mod fstree;
 pub mod gc;
 pub mod inbox;

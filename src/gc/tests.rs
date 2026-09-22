@@ -634,3 +634,114 @@ fn wipe_waits_for_running_cycle_before_reset() {
     let hook = lock(&c.core.mu).mid_mark.take();
     drop(hook);
 }
+
+// ---------------------------------------------------------------------------
+// Commit history (Go: commit_test.go). No production change backs these: the
+// mark, prepare_ref and why all dispatch through fstree::child_keys.
+
+/// Stores `store_tree`'s file under a one-entry directory and returns the
+/// directory root (a commit's tree must be a directory) and every key.
+fn store_dir_tree(objects: &packstore::Store, seed: &str, n: usize) -> (Key, Vec<Key>) {
+    let (file, mut all) = store_tree(objects, seed, n);
+    let leaf = crate::fstree::encode_dir_leaf(&[crate::fstree::Entry {
+        name: b"f".to_vec(),
+        mode: 0o100644,
+        content_key: file.as_bytes().to_vec(),
+        ..Default::default()
+    }])
+    .unwrap();
+    objects.put(leaf.key, &leaf.bytes).unwrap();
+    all.push(leaf.key);
+    (leaf.key, all)
+}
+
+/// Builds a commit of `tree` without storing it.
+fn new_commit(tree: Key, parents: &[Key]) -> (Key, Vec<u8>) {
+    let id = crate::commit::Identity {
+        name: "Ann".into(),
+        when: 1,
+        ..Default::default()
+    };
+    crate::commit::Commit {
+        tree,
+        parents: parents.to_vec(),
+        author: id.clone(),
+        committer: id,
+        message: "m".into(),
+        signature: Vec::new(),
+        public_key: Vec::new(),
+    }
+    .object()
+    .unwrap()
+}
+
+fn store_commit(objects: &packstore::Store, tree: Key, parents: &[Key]) -> Key {
+    let (k, b) = new_commit(tree, parents);
+    objects.put(k, &b).unwrap();
+    k
+}
+
+fn count_gone(objects: &packstore::Store, keys: &[Key]) -> usize {
+    keys.iter()
+        .filter(|k| matches!(objects.get(**k), Err(ref e) if e.is_not_found()))
+        .count()
+}
+
+#[test]
+fn commit_history_stays_live() {
+    let ts = new_test_store(4 << 10);
+    let c = open_collector(
+        &ts,
+        Options {
+            grace: HOUR,
+            ..Options::default()
+        },
+    );
+    let (tree_old, keys_old) = store_dir_tree(&ts.objects, "old", 40);
+    let (tree_new, keys_new) = store_dir_tree(&ts.objects, "new", 40);
+    let (_, keys_dead) = store_dir_tree(&ts.objects, "dead", 40); // never referenced
+    let first = store_commit(&ts.objects, tree_old, &[]);
+    let tip = store_commit(&ts.objects, tree_new, &[first]);
+    put_test_ref(&c, &ts.refs, "main", tip);
+
+    // why walks through the commits: the old tree is held by the branch.
+    assert_eq!(c.why(keys_old[0]).unwrap(), ["main"], "why(old blob)");
+
+    backdate_packs(&ts);
+    let stats = c.run(0.0).unwrap();
+    assert!(!stats.reaped.is_empty(), "nothing reaped: {stats:?}");
+    for k in keys_old.iter().chain(&keys_new).chain(&[first, tip]) {
+        if let Err(e) = ts.objects.get(*k) {
+            panic!("key {k} reachable from the branch: {e}");
+        }
+    }
+    assert!(
+        count_gone(&ts.objects, &keys_dead) > 0,
+        "no unreferenced key was collected"
+    );
+
+    // Dropping the branch makes the whole history garbage.
+    rm_test_ref(&c, &ts.refs, "main", tip);
+    backdate_packs(&ts);
+    c.run(0.0).unwrap();
+    assert!(
+        count_gone(&ts.objects, &keys_old) > 0,
+        "no key of the old commit's tree was collected after the branch went"
+    );
+}
+
+#[test]
+fn prepare_ref_missing_ancestor_fails() {
+    let ts = new_test_store(1 << 20);
+    let c = open_collector(&ts, Options::default());
+    let (tree, _) = store_dir_tree(&ts.objects, "tree", 4);
+    let (absent, _) = new_commit(tree, &[]); // built, never stored
+    let tip = store_commit(&ts.objects, tree, &[absent]);
+    let err = c
+        .prepare_ref(tip)
+        .expect_err("prepare_ref accepted a commit whose parent is missing");
+    assert!(
+        err.to_string().starts_with("gc: walking root "),
+        "err = {err}"
+    );
+}

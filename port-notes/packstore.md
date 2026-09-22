@@ -134,3 +134,9 @@ cross-check.
   (corrupt class). The ported test pins the class and that nothing is
   stored.
 - Tests: `record_tests.rs` (Go `record_test.go`, all eight cases).
+
+## Go PR #12 backport (2026-09-23)
+
+`verify_object` checks the length field of `Commit` keys too: like `Blob` and
+`XattrSet`, a commit's length is its own serialized byte length. Port of Go
+`TestVerifyObjectChecksCommitLength` in `verify.rs`.

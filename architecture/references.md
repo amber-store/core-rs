@@ -1,7 +1,7 @@
 # References
 
-A **reference** is a global name pointing at a store key (a file or a
-directory), recorded with its creator and creation time, with room for a
+A **reference** is a global name pointing at a store key (a file, a
+directory, or a [commit](commits.md)), recorded with its creator and creation time, with room for a
 signature. References give roots names: `ingest --ref NAME` creates one, and
 any `KEY[/PATH]` argument also accepts `ref:NAME[@PATH]`.
 

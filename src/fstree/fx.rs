@@ -31,6 +31,7 @@
 use std::fmt;
 
 use super::{DirPair, Entry};
+use crate::commit::{WireCommit, WireIdentity};
 
 /// CBOR major-type names exactly as fxamacker/cbor renders them in
 /// diagnostics (`cborType.String()`).
@@ -672,6 +673,38 @@ pub(super) fn unmarshal_pairs(data: &[u8]) -> Result<Vec<DirPair>, CborError> {
         None => Ok(v),
     }
 }
+
+/// Unmarshals a Commit body (Go `commit.wireCommit`, a `keyasint` struct
+/// holding two nested `commit.wireIdentity` structs). The caller — package
+/// `commit` — converts, validates and canonical-checks the result.
+pub(crate) fn unmarshal_commit(data: &[u8]) -> Result<WireCommit, CborError> {
+    wellformed(data, &DECODE_WF)?;
+    let mut d = Dec::new(data);
+    let (v, err) = d.parse_to_wire_commit();
+    match err {
+        Some(e) => Err(e),
+        None => Ok(v),
+    }
+}
+
+/// Go struct-field diagnostic names for `commit.wireCommit` keys 0–6.
+const WIRE_COMMIT_FIELDS: [&str; 7] = [
+    "commit.wireCommit.0",
+    "commit.wireCommit.1",
+    "commit.wireCommit.2",
+    "commit.wireCommit.3",
+    "commit.wireCommit.4",
+    "commit.wireCommit.5",
+    "commit.wireCommit.6",
+];
+
+/// Go struct-field diagnostic names for `commit.wireIdentity` keys 0–3.
+const WIRE_IDENTITY_FIELDS: [&str; 4] = [
+    "commit.wireIdentity.0",
+    "commit.wireIdentity.1",
+    "commit.wireIdentity.2",
+    "commit.wireIdentity.3",
+];
 
 /// Go struct-field diagnostic names for `Entry` keys 0–9.
 const ENTRY_FIELDS: [&str; 10] = [
@@ -1844,6 +1877,351 @@ impl<'a> Dec<'a> {
                 (Vec::new(), Some(type_err(t, go_type)))
             }
         }
+    }
+
+    /// Decodes into Go `string` (default `ByteStringToStringForbidden`): only
+    /// a text string fills it; null/undefined are a no-op; bignum tags take
+    /// the integer paths and end as type errors; other tags unwrap.
+    fn parse_to_string(&mut self) -> (String, Option<CborError>) {
+        const GO: &str = "string";
+        if let Err(e) = self.prologue() {
+            return (String::new(), Some(e));
+        }
+        let t = self.next_type();
+        match t {
+            CborType::TextString => match self.parse_text_string() {
+                // parse_text_string has already rejected invalid UTF-8.
+                Ok(b) => (String::from_utf8(b).unwrap_or_default(), None),
+                Err(e) => (String::new(), Some(e)),
+            },
+            CborType::ByteString => {
+                self.parse_byte_string();
+                (String::new(), Some(type_err(t, GO)))
+            }
+            CborType::PositiveInt => {
+                self.get_head();
+                (String::new(), Some(type_err(t, GO)))
+            }
+            CborType::NegativeInt => {
+                let (_, _, val) = self.get_head();
+                if val > i64::MAX as u64 {
+                    let dec = bignum_dec(&val.to_be_bytes(), true);
+                    (
+                        String::new(),
+                        Some(type_err_msg(t, GO, format!("{dec} overflows Go's int64"))),
+                    )
+                } else {
+                    (String::new(), Some(type_err(t, GO)))
+                }
+            }
+            CborType::Primitives => {
+                let (_, ai, _) = self.get_head();
+                match ai {
+                    22 | 23 => (String::new(), None), // null/undefined: no-op
+                    _ => (String::new(), Some(type_err(t, GO))),
+                }
+            }
+            CborType::Tag => {
+                let (_, _, num) = self.get_head();
+                match num {
+                    2 | 3 => {
+                        let b = self.parse_byte_string();
+                        let fits = match bignum_u64(&b) {
+                            Some(x) => num == 2 || x <= i64::MAX as u64,
+                            None => false,
+                        };
+                        if fits {
+                            (String::new(), Some(type_err(CborType::Tag, GO)))
+                        } else {
+                            let dec = bignum_dec(&b, num == 3);
+                            (
+                                String::new(),
+                                Some(type_err_msg(
+                                    CborType::Tag,
+                                    GO,
+                                    format!("{dec} overflows {GO}"),
+                                )),
+                            )
+                        }
+                    }
+                    _ => self.parse_to_string(),
+                }
+            }
+            CborType::Array | CborType::Map => {
+                self.skip();
+                (String::new(), Some(type_err(t, GO)))
+            }
+        }
+    }
+
+    /// `parseToValue` into a Go struct without the `toarray` option: a map
+    /// goes to `map` (a `parse_map_to_struct` driver), null/undefined leave
+    /// the zero value, everything else is a type error against `go_type`.
+    /// The same arms as [`Dec::parse_to_entry`], which predates this helper.
+    fn parse_to_struct<T: Default>(
+        &mut self,
+        go_type: &'static str,
+        map: impl FnOnce(&mut Self) -> (T, Option<CborError>),
+    ) -> (T, Option<CborError>) {
+        if let Err(e) = self.prologue() {
+            return (T::default(), Some(e));
+        }
+        let t = self.next_type();
+        match t {
+            CborType::Map => map(self),
+            CborType::Array => {
+                self.skip();
+                (
+                    T::default(),
+                    Some(type_err_msg(
+                        t,
+                        go_type,
+                        "cannot decode CBOR array to struct without toarray option".to_owned(),
+                    )),
+                )
+            }
+            CborType::PositiveInt => {
+                self.get_head();
+                (T::default(), Some(type_err(t, go_type)))
+            }
+            CborType::NegativeInt => {
+                let (_, _, val) = self.get_head();
+                if val > i64::MAX as u64 {
+                    let dec = bignum_dec(&val.to_be_bytes(), true);
+                    (
+                        T::default(),
+                        Some(type_err_msg(
+                            t,
+                            go_type,
+                            format!("{dec} overflows Go's int64"),
+                        )),
+                    )
+                } else {
+                    (T::default(), Some(type_err(t, go_type)))
+                }
+            }
+            CborType::ByteString => {
+                self.parse_byte_string();
+                (T::default(), Some(type_err(t, go_type)))
+            }
+            CborType::TextString => match self.parse_text_string() {
+                Err(e) => (T::default(), Some(e)),
+                Ok(_) => (T::default(), Some(type_err(t, go_type))),
+            },
+            CborType::Primitives => {
+                let (_, ai, _) = self.get_head();
+                match ai {
+                    22 | 23 => (T::default(), None), // zero value
+                    _ => (T::default(), Some(type_err(t, go_type))),
+                }
+            }
+            CborType::Tag => {
+                let (_, _, num) = self.get_head();
+                match num {
+                    2 | 3 => {
+                        let b = self.parse_byte_string();
+                        let fits = match bignum_u64(&b) {
+                            Some(x) => num == 2 || x <= i64::MAX as u64,
+                            None => false,
+                        };
+                        if fits {
+                            (T::default(), Some(type_err(CborType::Tag, go_type)))
+                        } else {
+                            let dec = bignum_dec(&b, num == 3);
+                            (
+                                T::default(),
+                                Some(type_err_msg(
+                                    CborType::Tag,
+                                    go_type,
+                                    format!("{dec} overflows {go_type}"),
+                                )),
+                            )
+                        }
+                    }
+                    _ => self.parse_to_struct(go_type, map),
+                }
+            }
+        }
+    }
+
+    /// The `parseMapToStruct` mirror for a `keyasint` struct with integer
+    /// keys `0..nfields` (at most 64): the first occurrence of a key goes to
+    /// `field`, which decodes the value and returns its error already wrapped
+    /// with the field's name; duplicates and unknown keys are skipped; text
+    /// keys never match; other key types are diagnosed but tolerated. The
+    /// first error wins and decoding continues, as in Go. The same loop as
+    /// [`Dec::parse_map_to_entry`], which predates this helper.
+    fn parse_map_to_struct(
+        &mut self,
+        nfields: u64,
+        mut field: impl FnMut(&mut Self, u64) -> Option<CborError>,
+    ) -> Option<CborError> {
+        debug_assert!(nfields <= 64, "`found` is a 64-bit mask");
+        let (_, ai, val) = self.get_head();
+        let indef = ai == 31;
+        let mut found = 0u64;
+        let mut first: Option<CborError> = None;
+        let record = |first: &mut Option<CborError>, err: Option<CborError>| {
+            if first.is_none() {
+                *first = err;
+            }
+        };
+        let mut i = 0u64;
+        loop {
+            if indef {
+                if self.found_break() {
+                    break;
+                }
+            } else if i >= val {
+                break;
+            }
+            let kt = self.next_type();
+            match kt {
+                CborType::PositiveInt => {
+                    let (_, _, k) = self.get_head();
+                    if k > i64::MAX as u64 {
+                        record(
+                            &mut first,
+                            Some(type_err_msg(
+                                kt,
+                                "int64",
+                                format!("{k} overflows Go's int64"),
+                            )),
+                        );
+                        self.skip();
+                    } else if k < nfields && found & (1 << k) == 0 {
+                        found |= 1 << k;
+                        let err = field(self, k);
+                        record(&mut first, err);
+                    } else {
+                        // Unknown positive key, or a duplicate: skip value.
+                        self.skip();
+                    }
+                }
+                CborType::NegativeInt => {
+                    let (_, _, k) = self.get_head();
+                    if k > i64::MAX as u64 {
+                        record(
+                            &mut first,
+                            Some(type_err_msg(
+                                kt,
+                                "int64",
+                                format!("-1-{k} overflows Go's int64"),
+                            )),
+                        );
+                    }
+                    // Negative keys never match a field: skip value.
+                    self.skip();
+                }
+                CborType::TextString => {
+                    if let Err(err) = self.parse_text_string() {
+                        record(&mut first, Some(err));
+                    }
+                    // keyasint fields are not matchable by name.
+                    self.skip(); // value
+                }
+                _ => {
+                    record(
+                        &mut first,
+                        Some(type_err_msg(
+                            kt,
+                            "string",
+                            format!(
+                                "map key is of type {kt} and cannot be used to match struct field name"
+                            ),
+                        )),
+                    );
+                    self.skip(); // key
+                    self.skip(); // value
+                }
+            }
+            i += 1;
+        }
+        first
+    }
+
+    /// Decodes into Go `commit.wireIdentity`.
+    fn parse_to_wire_identity(&mut self) -> (WireIdentity, Option<CborError>) {
+        self.parse_to_struct("commit.wireIdentity", |d| {
+            let mut w = WireIdentity::default();
+            let err = d.parse_map_to_struct(4, |d, k| {
+                let err = match k {
+                    0 => {
+                        let (v, err) = d.parse_to_string();
+                        w.name = v;
+                        err
+                    }
+                    1 => {
+                        let (v, err) = d.parse_to_string();
+                        w.email = v;
+                        err
+                    }
+                    2 => {
+                        let (v, err) = d.parse_to_i64();
+                        w.when = v;
+                        err
+                    }
+                    _ => {
+                        let (v, err) = d.parse_to_i64();
+                        w.tz_offset = v;
+                        err
+                    }
+                };
+                err.map(|e| wrap_field(e, WIRE_IDENTITY_FIELDS[k as usize]))
+            });
+            (w, err)
+        })
+    }
+
+    /// Decodes into Go `commit.wireCommit`. A type error inside a nested
+    /// identity leaves here carrying the **outer** field name
+    /// (`commit.wireCommit.2`/`.3`) with the inner Go type: fxamacker's two
+    /// wrap sites both overwrite `StructFieldName` on the way out.
+    fn parse_to_wire_commit(&mut self) -> (WireCommit, Option<CborError>) {
+        self.parse_to_struct("commit.wireCommit", |d| {
+            let mut w = WireCommit::default();
+            let err = d.parse_map_to_struct(7, |d, k| {
+                let err = match k {
+                    0 => {
+                        let (v, err) = d.parse_to_bytes("[]uint8");
+                        w.tree = v;
+                        err
+                    }
+                    1 => {
+                        let (v, err) = d.parse_to_byte_slices();
+                        w.parents = v;
+                        err
+                    }
+                    2 => {
+                        let (v, err) = d.parse_to_wire_identity();
+                        w.author = v;
+                        err
+                    }
+                    3 => {
+                        let (v, err) = d.parse_to_wire_identity();
+                        w.committer = v;
+                        err
+                    }
+                    4 => {
+                        let (v, err) = d.parse_to_string();
+                        w.message = v;
+                        err
+                    }
+                    5 => {
+                        let (v, err) = d.parse_to_bytes("[]uint8");
+                        w.signature = v;
+                        err
+                    }
+                    _ => {
+                        let (v, err) = d.parse_to_bytes("[]uint8");
+                        w.public_key = v;
+                        err
+                    }
+                };
+                err.map(|e| wrap_field(e, WIRE_COMMIT_FIELDS[k as usize]))
+            });
+            (w, err)
+        })
     }
 
     fn parse_to_byte_slices(&mut self) -> (Vec<Vec<u8>>, Option<CborError>) {

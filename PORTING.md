@@ -2,8 +2,8 @@
 
 This crate is a port of `github.com/amber-store/core` (Go; formerly
 `jobs-build/amber-store-core`), pinned at commit
-`c628b89a8c40b1271de95cfe3db13918378edd66` (tag `v0.0.8`, the merge of
-PR #11, `ingest.Opts.Exclude` and `ScanWith`). Not yet ported from that
+`e318780544694a2047ca167b44ad49a62f3e156b` (tag `v0.0.9`, the merge of
+PR #12, the `Commit` object type). Not yet ported from that
 range: Go PR #8's gc write-span gate (`Collector.BeginWrite`) and
 `inbox.WithGate`. The Go sources are the normative reference wherever this
 document or `architecture/` is silent; clone the parent fresh when porting
@@ -15,10 +15,11 @@ The CI interop job pins the same Go commit in `.github/workflows/ci.yml`.
 **Byte-identical** (same input ⇒ same bytes, enforced by golden vectors):
 
 - 32-byte keys, BLAKE3 hashing, and every serialized object
-  (`Blob`/`FileNode`/`DirLeaf`/`DirNode`/`XattrSet`) — hence identical root
-  keys for identical logical trees.
+  (`Blob`/`FileNode`/`DirLeaf`/`DirNode`/`XattrSet`/`Commit`) — hence
+  identical root keys for identical logical trees, and identical commit keys
+  for identical commits.
 - UltraCDC and item-chunker cut points.
-- Reference records (canonical CBOR).
+- Reference records and commit records (canonical CBOR).
 - Binary fuse filter sections (the Go construction is deterministic:
   `rngcounter` starts at 1; port it exactly).
 - Segment footers (index + filter + trailer) given identical record bytes.
@@ -223,6 +224,24 @@ bounds (1–1024 bytes UTF-8, `@`/control-char rules, 64 KiB signature cap),
 and Decode's canonical-bytes enforcement — match `reference.go` exactly,
 including whether Decode re-encodes-and-compares or validates structurally.
 
+### `commit` (Go: `commit/`)
+
+The Commit object, CAS type 5 (`architecture/commits.md`): canonical record
+codec (keys 0–6, two nested identity maps with keys 0–3), the validation
+rules and bounds in Go's check order, `object` (key = type 5, length field =
+the encoding's own byte length), `signature_payload`, and Decode's four
+stages in Go's order — lax unmarshal, wire conversion, validation, canonical
+re-encode comparison — so the accept set is exactly "canonical encodings of
+valid commits" on both sides and every rejection is classified alike. The
+lax unmarshal lives in `fstree::fx` (a Go `string` target, generic
+`keyasint`-struct helpers, `unmarshal_commit`), so decode-stage diagnostics
+are fxamacker's byte for byte — including its rule that a type error inside
+a nested identity leaves carrying the **outer** field name with the inner Go
+type. Around it: `key::Type::Commit`; `fstree::child_keys` returns a
+commit's tree, then its parents in order, which is all the walks
+(`reachable_keys`, `check_complete`, the gc mark, `why`) need to follow
+history; `packstore`'s `verify_object` checks a commit's length field.
+
 ### `inbox` (Go: `inbox/`)
 
 Durable receiving: entry file layout and Meta header codec (`entry.go`),
@@ -261,8 +280,9 @@ dir mtimes applied after children, path-safety checks).
 
 ### CLI example (`examples/amber-store.rs`)
 
-Dev-only mirror of `cmd/amber-store` (ingest/ls/export/restore/ref/gc,
---store, --segment-size, ref:NAME[@PATH] addressing) for interop testing;
+Dev-only mirror of `cmd/amber-store` (ingest/ls/export/restore/ref/commit/gc,
+--store, --segment-size, ref:NAME[@PATH] addressing, a commit standing for
+its tree wherever a directory spec is expected) for interop testing;
 uses only the public crate API + clap. No progress UI needed. The gc
 subcommands' output format strings are byte-compatible with Go (the bench
 and tests parse them); reference writes route through the collector.
@@ -302,5 +322,7 @@ concurrency, GC observation, storage errors, and batch snapshot visibility.
 
 CI runs `interop/check.sh` against a pinned Go parity revision.
 The check compares ingestion keys, cross-reads stores, and compares exported archives.
+It creates the same commits with both CLIs and requires identical commit keys.
+Each CLI then shows and lists the commits the other one wrote.
 It also corrupts each implementation's pack and repairs it with the other.
 The original implementation then verifies and reads the repaired pack.

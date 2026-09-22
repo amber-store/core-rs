@@ -25,6 +25,7 @@ pub use decode::{decode_dir_leaf, decode_dir_node, decode_file_node};
 pub use encode::{
     encode_blob, encode_dir_leaf, encode_dir_node, encode_file_node, encode_xattr_set,
 };
+pub(crate) use fx::unmarshal_commit;
 pub use fx::{CborError, CborType};
 pub use read::{
     ChildKeysError, MissingObjectError, WalkError, check_complete, child_keys, collect_entries,

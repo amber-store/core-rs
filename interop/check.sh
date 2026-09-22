@@ -11,6 +11,9 @@
 #      (ls output byte-identical, export tars byte-identical);
 #   3. a Rust restore of the Go-written store re-ingests (with Go) to the
 #      same root key.
+#   4. identical commit keys from both implementations for identical
+#      inputs, and each implementation shows and lists the commits the OTHER
+#      one wrote.
 set -euo pipefail
 
 RS_REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -80,6 +83,33 @@ echo "== refs (per-implementation; DB formats intentionally differ, see PORTING.
 "$RS" --store "$WORK/store-rs" ref set nightly "$ROOT_RS"
 [ "$("$RS" --store "$WORK/store-rs" ref get nightly)" = "$ROOT_RS" ]
 "$RS" --store "$WORK/store-rs" ls "ref:nightly@docs" > /dev/null
+
+echo "== commits (identical keys for identical inputs; cross-read)"
+DATE=2026-01-02T03:04:05+01:00
+MSG=$'second\n\nA body line.'
+C1_GO=$("$GO" --store "$WORK/store-go" commit create --author 'Ann <ann@example.com>' --date "$DATE" -m first "$ROOT_GO")
+C1_RS=$("$RS" --store "$WORK/store-rs" commit create --author 'Ann <ann@example.com>' --date "$DATE" -m first "$ROOT_RS")
+echo "   go:   $C1_GO"
+echo "   rust: $C1_RS"
+[ "$C1_GO" = "$C1_RS" ] || { echo "FAIL: root commit keys differ" >&2; exit 1; }
+# A child commit of a subdirectory, with a distinct committer and a body.
+C2_GO=$("$GO" --store "$WORK/store-go" commit create --ref main --author 'Ann <ann@example.com>' --committer Bob \
+  --date "$DATE" --parent "$C1_GO" -m "$MSG" "$ROOT_GO/docs")
+C2_RS=$("$RS" --store "$WORK/store-rs" commit create --ref main --author 'Ann <ann@example.com>' --committer Bob \
+  --date "$DATE" --parent "$C1_RS" -m "$MSG" "$ROOT_RS/docs")
+[ "$C2_GO" = "$C2_RS" ] || { echo "FAIL: child commit keys differ ($C2_GO vs $C2_RS)" >&2; exit 1; }
+"$GO" --store "$WORK/store-go" commit show "$C2_GO" > "$WORK/show-go-own.txt"
+"$RS" --store "$WORK/store-go" commit show "$C2_GO" > "$WORK/show-rs-cross.txt"
+cmp "$WORK/show-go-own.txt" "$WORK/show-rs-cross.txt"
+"$RS" --store "$WORK/store-rs" commit show "$C2_RS" > "$WORK/show-rs-own.txt"
+"$GO" --store "$WORK/store-rs" commit show "$C2_RS" > "$WORK/show-go-cross.txt"
+cmp "$WORK/show-rs-own.txt" "$WORK/show-go-cross.txt"
+cmp "$WORK/show-go-own.txt" "$WORK/show-rs-own.txt"
+# A commit stands for its tree: list through the commit the OTHER side wrote.
+"$GO" --store "$WORK/store-rs" ls --keys "$C2_RS/deep" > "$WORK/ls-commit-go.txt"
+"$RS" --store "$WORK/store-go" ls --keys "$C2_GO/deep" > "$WORK/ls-commit-rs.txt"
+cmp "$WORK/ls-commit-go.txt" "$WORK/ls-commit-rs.txt"
+[ "$("$RS" --store "$WORK/store-rs" ref get main)" = "$C2_RS" ]
 
 echo "== repairing packs across implementations"
 (cd "$RS_REPO" && cargo build -q --example repair-interop)

@@ -124,9 +124,9 @@ impl SealedSegment {
 }
 
 /// Recomputes `k` from `data` and reports a verification-failure message on
-/// mismatch (the complete `ErrVerify`-prefixed text Go produces). For Blob
-/// and XattrSet — whose key length is the serialized byte length — it also
-/// checks the length field. Aggregate types (FileNode/DirLeaf/DirNode) carry
+/// mismatch (the complete `ErrVerify`-prefixed text Go produces). For Blob,
+/// XattrSet and Commit — whose key length is the serialized byte length — it
+/// also checks the length field. Aggregate types (FileNode/DirLeaf/DirNode) carry
 /// a logical length the store cannot recompute without parsing, so only their
 /// hash is checked (Go: `verifyObject`).
 pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
@@ -144,7 +144,7 @@ pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
             "packstore: object verification failed: payload hashes to {want}, not {k}"
         ));
     }
-    if matches!(t, Type::Blob | Type::XattrSet) && k.length() != data.len() as u64 {
+    if matches!(t, Type::Blob | Type::XattrSet | Type::Commit) && k.length() != data.len() as u64 {
         return Err(format!(
             "packstore: object verification failed: {k} length field {} != payload {}",
             k.length(),
@@ -152,4 +152,29 @@ pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_object;
+    use crate::key::{Key, Type};
+
+    /// Port of Go `TestVerifyObjectChecksCommitLength`.
+    #[test]
+    fn verify_object_checks_commit_length() {
+        // verify_object does not parse payloads, so any bytes serve.
+        let data = b"stand-in for a commit's canonical CBOR";
+        let good = Key::new(Type::Commit, data.len() as u64, data);
+        assert_eq!(verify_object(good, data), Ok(()));
+        // Same payload hash, but a length field that lies about the byte length.
+        let bad = Key::new(Type::Commit, data.len() as u64 + 1, data);
+        assert_eq!(
+            verify_object(bad, data),
+            Err(format!(
+                "packstore: object verification failed: {bad} length field {} != payload {}",
+                data.len() + 1,
+                data.len()
+            ))
+        );
+    }
 }

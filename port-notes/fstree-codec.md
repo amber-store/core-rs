@@ -172,3 +172,13 @@ than guessed, then verified two ways:
   DirLeaf with >131072 entries would fail to decode in both Go and Rust —
   unreachable with the item chunker's run bounds, but worth remembering if
   builder parameters ever allow gigantic runs.
+
+## Go PR #12 backport (2026-09-23)
+
+`fx.rs` gained a Go `string` target (`parse_to_string`), generic
+`keyasint`-struct helpers (`parse_to_struct`, `parse_map_to_struct`) and
+`unmarshal_commit`, re-exported crate-internally for `src/commit.rs`. The
+`Entry` decoder was left exactly as verified. `child_keys` gained the
+`Commit` arm (tree, then parents in order) and
+`ChildKeysError::DecodeCommit`. Rationale and the differential results are
+in `port-notes/commit.md`.

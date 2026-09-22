@@ -11,8 +11,8 @@ pub const SIZE: usize = 32;
 /// (`architecture/types.md`).
 ///
 /// Unlike the Go implementation (where `Type` is a plain `uint8` that may hold
-/// reserved values), this enum can only represent the five defined types.
-/// Reserved raw values (5..=15, and anything above the 4-bit field) are handled
+/// reserved values), this enum can only represent the six defined types.
+/// Reserved raw values (6..=15, and anything above the 4-bit field) are handled
 /// as `u8` via [`Type::from_u8`] / [`Type::is_valid`] and surface as
 /// [`Error::ReservedType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -28,18 +28,21 @@ pub enum Type {
     DirNode = 3,
     /// Spilled extended attributes.
     XattrSet = 4,
+    /// Snapshot record: tree, parent commits, author, committer, message
+    /// (`crate::commit`).
+    Commit = 5,
 }
 
 impl Type {
-    /// Reports whether `v` is a defined CAS object type (0..4). Values 5..15
+    /// Reports whether `v` is a defined CAS object type (0..5). Values 6..15
     /// are reserved and must not be emitted; values above 15 do not fit the
     /// 4-bit field.
     pub const fn is_valid(v: u8) -> bool {
-        v <= Type::XattrSet as u8
+        v <= Type::Commit as u8
     }
 
     /// Converts a raw type value to a [`Type`], or `None` if `v` is reserved
-    /// (5..15) or out of range.
+    /// (6..15) or out of range.
     pub const fn from_u8(v: u8) -> Option<Type> {
         match v {
             0 => Some(Type::Blob),
@@ -47,6 +50,7 @@ impl Type {
             2 => Some(Type::DirLeaf),
             3 => Some(Type::DirNode),
             4 => Some(Type::XattrSet),
+            5 => Some(Type::Commit),
             _ => None,
         }
     }
@@ -64,6 +68,7 @@ impl fmt::Display for Type {
             Type::DirLeaf => "DirLeaf",
             Type::DirNode => "DirNode",
             Type::XattrSet => "XattrSet",
+            Type::Commit => "Commit",
         })
     }
 }
@@ -80,7 +85,7 @@ pub enum Error {
     /// The header's reserved bit (bit 3) is set.
     #[error("key: reserved header bit is set")]
     ReservedBitSet,
-    /// The object type is reserved (5..15) or out of range; carries the raw
+    /// The object type is reserved (6..15) or out of range; carries the raw
     /// type value.
     #[error("key: reserved object type: {0}")]
     ReservedType(u8),
@@ -121,7 +126,7 @@ impl Key {
     /// Assembles a canonical key from a CAS object type, a logical payload
     /// length, and a precomputed full 256-bit BLAKE3 digest. The digest is
     /// truncated to its leading bytes to fill the key. `length` is used
-    /// verbatim: for `Blob`/`XattrSet` it is the serialized byte length; for
+    /// verbatim: for `Blob`/`XattrSet`/`Commit` it is the serialized byte length; for
     /// `FileNode`/`DirLeaf`/`DirNode` it is the logical size (see
     /// `architecture/types.md`).
     ///
@@ -152,7 +157,7 @@ impl Key {
     }
 
     /// Reports whether the key is canonical: the reserved bit is clear, the
-    /// type is defined (0..4), and the length field is minimally encoded (its
+    /// type is defined (0..5), and the length field is minimally encoded (its
     /// first byte is non-zero, except for the single `0x00` byte that encodes
     /// a zero length).
     pub fn validate(&self) -> Result<(), Error> {
@@ -369,6 +374,7 @@ mod tests {
             Type::DirLeaf,
             Type::DirNode,
             Type::XattrSet,
+            Type::Commit,
         ] {
             let k = Key::new_from_hash(t, 12345, full);
             let got = Key::parse(&k.0).unwrap();
@@ -397,9 +403,9 @@ mod tests {
     #[test]
     fn validate_reserved_type() {
         let mut k = Key([0u8; SIZE]);
-        k.0[0] = 5 << 4; // type 5, length_size 1
+        k.0[0] = 6 << 4; // type 6, length_size 1
         k.0[1] = 0x01;
-        assert_eq!(k.validate(), Err(Error::ReservedType(5)));
+        assert_eq!(k.validate(), Err(Error::ReservedType(6)));
     }
 
     #[test]
@@ -440,12 +446,22 @@ mod tests {
         assert_eq!(got.len(), 2 * SIZE);
     }
 
+    /// Port of Go `TestNewFromHash_Commit`.
+    #[test]
+    fn new_from_hash_commit() {
+        let k = Key::new_from_hash(Type::Commit, 100, [0u8; SIZE]);
+        assert_eq!(k.0[0], 0x50, "type 5, one length byte");
+        assert_eq!(k.type_(), Type::Commit);
+        assert_eq!(k.length(), 100);
+        assert_eq!(k.validate(), Ok(()));
+    }
+
     #[test]
     fn type_is_valid() {
-        for v in 0u8..=4 {
+        for v in 0u8..=5 {
             assert!(Type::is_valid(v), "Type({v}) should be valid");
         }
-        for v in [5u8, 6, 15, 16, 255] {
+        for v in [6u8, 7, 15, 16, 255] {
             assert!(!Type::is_valid(v), "Type({v}) should be invalid");
         }
     }
@@ -457,7 +473,8 @@ mod tests {
         assert_eq!(Type::from_u8(2), Some(Type::DirLeaf));
         assert_eq!(Type::from_u8(3), Some(Type::DirNode));
         assert_eq!(Type::from_u8(4), Some(Type::XattrSet));
-        for v in [5u8, 15, 16, 255] {
+        assert_eq!(Type::from_u8(5), Some(Type::Commit));
+        for v in [6u8, 15, 16, 255] {
             assert_eq!(Type::from_u8(v), None, "Type({v})");
         }
     }
@@ -470,6 +487,7 @@ mod tests {
             (Type::DirLeaf, "DirLeaf"),
             (Type::DirNode, "DirNode"),
             (Type::XattrSet, "XattrSet"),
+            (Type::Commit, "Commit"),
         ];
         for (t, want) in cases {
             assert_eq!(t.to_string(), want);
