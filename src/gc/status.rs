@@ -73,6 +73,11 @@ impl Core {
     fn status(&self) -> Result<Status, Error> {
         let recs = self.refs.all().map_err(Error::Refs)?;
         let roots = self.roots()?;
+        // The references are everybody's; the view of the objects is this
+        // store's, as of its last look. What another process wrote and named
+        // since then is not in it yet, and the mark works from a snapshot of
+        // it.
+        self.objects.refresh().map_err(Error::Objects)?;
         let live = self.mark_live(Cancel::NONE, &roots)?;
         let report = self
             .objects

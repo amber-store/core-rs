@@ -209,3 +209,16 @@ No production change: the mark, `prepare_ref` and `why` dispatch through
 `gc/commit_test.go`. One cost carries over from Go unchanged: `prepare_ref`
 re-walks the closure on every reference put, and with commits the closure is
 all of history.
+
+## Go PR #14 backport (2026-09-23): the collector across processes
+
+The cycle holds the packstore's gate from under its first reference lock to
+under its last; `begin_span` / `Span::prepare_ref` bracket object writes and
+the reference put that names them, reference lock first; `prepare_ref` and
+`begin_write` (Go PR #8, unported until now) are built on it; `status`
+refreshes the view first. Details and deviations:
+`port-notes/packstore-multi.md`, section "gc". Tests: `gc/multi_tests.rs`
+(Go `multi_test.go`, `span_test.go`, `process_test.go`); the second process
+is the test binary re-executed with `--exact gc::multi_tests::child_process_entry`.
+`collect_while_another_store_ingests` brackets with the collector's span where
+Go's test opens the span on the store: the pattern the documents recommend.

@@ -2,12 +2,11 @@
 
 This crate is a port of `github.com/amber-store/core` (Go; formerly
 `jobs-build/amber-store-core`), pinned at commit
-`91da3cf24ab72ddac32e67677f7382011a76393c` (the merge of PR #13, the
-reference store on SQLite, between tags `v0.0.9` and `v0.0.10`). Not yet
-ported from that range: Go PR #8's gc write-span gate
-(`Collector.BeginWrite`) and `inbox.WithGate`. The Go sources are the
-normative reference wherever this document or `architecture/` is silent;
-clone the parent fresh when porting (the checkout at
+`1fb6953558f0977bc95857ef05a4a970543d4765` (the merge of PR #14, the
+packstore shared by many processes, between tags `v0.0.9` and `v0.0.10`).
+Not yet ported from that range: Go PR #8's `inbox.WithGate`. The Go sources
+are the normative reference wherever this document or `architecture/` is
+silent; clone the parent fresh when porting (the checkout at
 `/Users/dragan/jobs-build/amber-store-core` lags GitHub). The CI interop job
 pins the same Go commit in `.github/workflows/ci.yml`.
 
@@ -37,6 +36,9 @@ pins the same Go commit in `.github/workflows/ci.yml`.
   *uncompressed* object bytes.
 - Segment *files* additionally depend on write order (Go's parallel writer is
   scheduling-dependent), so they are not reproducible run-to-run even in Go.
+- An active segment's sidecar index and the store's `gc.lock`
+  (`architecture/packstore.md`): each side reads, trusts and continues what
+  the other wrote, and both may write to one store directory at once.
 
 **One shared file** (both implementations open the same file, at the same
 time if need be):
@@ -209,6 +211,25 @@ unlink only after durable copies). Deviations from Go's scrub-wait and
 write-token machinery are documented in `port-notes/packstore-gc.md` —
 Rust's `Arc`-held mmaps make Go's munmap-wait unnecessary.
 
+Many processes on one store (Go: `sidecar.go`, `recover_sidecar.go`,
+`active.go`, `view.go`, `gate.go` → the `.rs` files of the same names).
+`architecture/packstore.md` is the contract, its "Rules for implementations"
+included: the sidecar index beside every active segment and the reading rules
+that recover from it (trust up to the last `synced` record, verify the rest,
+scan the tail); one owner per active segment by a non-blocking flock on its
+data file, adoption before creation, creation under an exclusive temporary
+name with the re-check after locking; a view of sealed segments and of other
+owners' active ones that refreshes when a lookup finds nothing, whole or not
+at all, skipped when a stat shows nothing can have changed; `gc.lock`, shared
+for every write span and exclusive for whatever deletes segments, never
+converted, with the view generation counted from the file and written before
+anything is deleted; a write that relies only on durable copies. Open locks
+and modifies nothing; recovery belongs to the writer that takes a segment.
+The directory flock is shared, so releases from before this change refuse the
+directory. Deviations — nothing is ever closed under a reader, positions kept
+signed as in Go, guards for `done` functions, cancellation as a callback — are
+in `port-notes/packstore-multi.md`, with the live cross-check against Go.
+
 ### `refstore` (Go: `refstore/`)
 
 The shared SQLite store (see the contract above; `architecture/references.md`
@@ -247,6 +268,14 @@ protocol parity, policy thresholds (0.5, or 0.1 under min-free pressure
 probed at the closures dir), and the loud mark abort on a missing object.
 Go's contexts/goroutines map to cancel flags + threads; see
 `port-notes/gc.md`.
+
+Across processes (`architecture/mark-sweep-gc.md`, "Across processes"): a
+cycle holds the packstore's gate (`begin_sweep`) from under its first
+reference lock to under its last, a failed or cancelled mark included;
+`begin_span` opens a write span, reference lock first and then the gate, the
+order a cycle takes them in, and `Span::prepare_ref` prepares a reference
+inside it without taking either again; `prepare_ref` and `begin_write` are
+built on it; `status` refreshes the store's view before its advisory mark.
 
 ### `reference` (Go: `reference/`)
 
@@ -317,7 +346,9 @@ its tree wherever a directory spec is expected, `ref set --expect OLD|none`
 and `ref rm --expect OLD` with Go's parsing rules) for interop testing;
 uses only the public crate API + clap. No progress UI needed. The gc
 subcommands' output format strings are byte-compatible with Go (the bench
-and tests parse them); reference writes route through the collector.
+and tests parse them); reference writes route through the collector, and
+`ingest` and `commit create` hold one write span over their object writes
+and the reference that names them (`open_span`; Go: `openSpan`).
 
 ### bench example (`examples/amber-bench.rs`)
 

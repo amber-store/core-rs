@@ -104,8 +104,9 @@ struct Background {
 }
 
 /// Implements the cycle and the reference hooks over an open packstore and
-/// refstore pair. Single-owner, like the stores it sits next to; close it
-/// before them (Go: `Collector`). The stores are held as `Arc`s so the
+/// refstore pair. A process has one per pair; other processes may run their
+/// own on the same store (`architecture/mark-sweep-gc.md`, "Across
+/// processes"). Close it before the stores (Go: `Collector`). The stores are held as `Arc`s so the
 /// background loop can outlive the caller's borrows; see `port-notes/gc.md`.
 pub struct Collector {
     pub(super) core: Arc<Core>,
@@ -215,7 +216,39 @@ impl Collector {
     /// bookkeeping; [`Collector::release_ref`] exists for symmetry (Go:
     /// `PrepareRef`).
     pub fn prepare_ref(&self, root: Key) -> Result<PreparedRef<'_>, Error> {
-        self.core.prepare_ref(root)
+        let span = self.begin_span()?;
+        // An early return drops the span — Go's sp.End() on the error path.
+        self.core.prepare(root)?;
+        Ok(PreparedRef { _span: Some(span) })
+    }
+
+    /// Gates one object-write span (an ingest, a pull, an inbox drain)
+    /// against the sweep. The span holds the reference lock shared: the sweep
+    /// waits out in-flight writes, and a write stalls while a sweep runs —
+    /// never during the mark, which writers pass behind the write barrier.
+    /// Without the gate a dedup hit against a record in a condemned pack
+    /// could report success and then lose the record to the pack's removal.
+    /// Drop the returned guard when the span's writes are durable (Go:
+    /// `BeginWrite`).
+    pub fn begin_write(&self) -> WriteGate<'_> {
+        match self.begin_span() {
+            Ok(span) => WriteGate {
+                _span: Some(span),
+                _ref_lock: None,
+            },
+            // The store is closing, which the span's writes will report. The
+            // reference lock's half of the span is kept all the same.
+            Err(_) => WriteGate {
+                _span: None,
+                _ref_lock: Some(read_lock(&self.core.ref_lock)),
+            },
+        }
+    }
+
+    /// Opens a write span. End it — drop it — when its writes are durable and
+    /// its references are stored (Go: `BeginSpan`).
+    pub fn begin_span(&self) -> Result<Span<'_>, Error> {
+        self.core.begin_span()
     }
 
     /// Records that one reference naming `root` was deleted or overwritten.
@@ -254,7 +287,9 @@ impl Drop for Collector {
 #[derive(Debug)]
 #[must_use = "call commit after storing the reference record, or abort"]
 pub struct PreparedRef<'c> {
-    _guard: RwLockReadGuard<'c, ()>,
+    /// The span [`Collector::prepare_ref`] opened for this one PUT; `None`
+    /// when the PUT was prepared inside a span the caller holds.
+    _span: Option<Span<'c>>,
 }
 
 impl PreparedRef<'_> {
@@ -267,6 +302,68 @@ impl PreparedRef<'_> {
     pub fn abort(self) {}
 }
 
+/// An open write span: object writes and the reference puts that name them,
+/// as one unit against the sweep, in this process and in every other. A sweep
+/// here or elsewhere waits for it to end, and it waits for one. Inside it
+/// references are prepared with [`Span::prepare_ref`], which takes no lock
+/// again: [`Collector::prepare_ref`] inside a span would take the reference
+/// lock a second time, and wait for ever behind a cycle that is waiting for
+/// the span.
+///
+/// [`Collector::begin_span`] takes the reference lock and then the store's
+/// gate, the order a cycle takes them in. A span opened on the store itself
+/// ([`packstore::Store::begin_write`]) and held across
+/// [`Collector::prepare_ref`] takes them the other way round; in a process
+/// that runs cycles the two can wait for each other.
+///
+/// Dropping the span ends it; a span that has ended cannot be used, which Go
+/// checks at run time (Go: `Span`).
+#[must_use = "the span ends when this is dropped"]
+pub struct Span<'c> {
+    core: &'c Core,
+    // In this order: the store's span ends first, then the reference lock
+    // goes (Go: `sp.end()`, then `refLock.RUnlock()`).
+    _span: packstore::WriteSpan<'c>,
+    _guard: RwLockReadGuard<'c, ()>,
+}
+
+impl std::fmt::Debug for Span<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Span").finish_non_exhaustive()
+    }
+}
+
+impl Span<'_> {
+    /// Readies a reference PUT naming `root`, as [`Collector::prepare_ref`]
+    /// does, under the locks the span already holds. The reference may be
+    /// stored any time before the span ends; the returned handle's `commit`
+    /// and `abort` are there for the shape and release nothing (Go:
+    /// `Span.PrepareRef`).
+    pub fn prepare_ref(&self, root: Key) -> Result<PreparedRef<'_>, Error> {
+        self.core.prepare(root)?;
+        Ok(PreparedRef { _span: None })
+    }
+
+    /// [`Collector::release_ref`] (Go: `Span.ReleaseRef`).
+    pub fn release_ref(&self, root: Key) -> Result<(), Error> {
+        let _ = root;
+        Ok(())
+    }
+
+    /// Closes the span (Go: `End`). Dropping it does the same.
+    pub fn end(self) {}
+}
+
+/// What [`Collector::begin_write`] holds until it is dropped.
+#[derive(Debug)]
+#[must_use = "the write span ends when this is dropped"]
+pub struct WriteGate<'c> {
+    /// The whole span, or, when the store would not open one, the reference
+    /// lock's half of it.
+    _span: Option<Span<'c>>,
+    _ref_lock: Option<RwLockReadGuard<'c, ()>>,
+}
+
 impl Core {
     /// Trips the running cycle's cancel flag, if one is running (Go:
     /// `c.cancelCycle()` under `mu`).
@@ -277,11 +374,27 @@ impl Core {
         }
     }
 
-    /// See [`Collector::prepare_ref`].
-    pub(super) fn prepare_ref(&self, root: Key) -> Result<PreparedRef<'_>, Error> {
+    /// See [`Collector::begin_span`].
+    pub(super) fn begin_span(&self) -> Result<Span<'_>, Error> {
         let guard = read_lock(&self.ref_lock);
+        // The same span across processes (packstore's gate): a cycle in
+        // another store waits for it, and it waits for one. The barrier that
+        // lets a PUT land during a mark lives in the cycle's own process, so
+        // a PUT from elsewhere must not land between a cycle's roots snapshot
+        // and its sweep at all. An early return drops `guard`.
+        let span = self.objects.begin_write().map_err(Error::Span)?;
+        Ok(Span {
+            core: self,
+            _span: span,
+            _guard: guard,
+        })
+    }
+
+    /// The work of a reference PUT under the reference lock: the completeness
+    /// walk, and the walked closure handed to the write barrier (Go:
+    /// `prepare`).
+    pub(super) fn prepare(&self, root: Key) -> Result<(), Error> {
         let objects = &self.objects;
-        // An early return drops `guard` — Go's RUnlock on the error path.
         let keys =
             fstree::check_complete(root, |k| objects.get(k), |k| objects.has(k), self.opts.jobs)
                 .map_err(|source| Error::Walk {
@@ -289,7 +402,7 @@ impl Core {
                     source: Box::new(source),
                 })?;
         self.objects.observe_keys(&keys);
-        Ok(PreparedRef { _guard: guard })
+        Ok(())
     }
 
     /// Lists the root key of every reference. The caller snapshots under the

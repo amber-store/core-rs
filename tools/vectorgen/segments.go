@@ -157,6 +157,20 @@ func genSegments(outDir string) error {
 	if bytes.HasSuffix(ab, []byte("AMBERSGF")) {
 		return fmt.Errorf("segments_go: active segment unexpectedly carries a footer")
 	}
+	// The active segment's sidecar index (architecture/packstore.md) is part
+	// of the fixture: magic, one entry per tail record, and the synced record
+	// that Close writes. The sealed segments' sidecars went with their seals.
+	// gc.lock, which every open creates, holds nothing a reader needs.
+	idx, err := os.ReadFile(filepath.Join(dir, active[0]+".idx"))
+	if err != nil {
+		return fmt.Errorf("segments_go: the active segment has no sidecar: %w", err)
+	}
+	if want := 8 + 56*(3+1); len(idx) != want {
+		return fmt.Errorf("segments_go: sidecar is %d bytes, want %d", len(idx), want)
+	}
+	if err := os.Remove(filepath.Join(dir, "gc.lock")); err != nil {
+		return err
+	}
 
 	return writeJSON(filepath.Join(dir, "manifest.json"), man)
 }

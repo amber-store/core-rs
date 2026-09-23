@@ -19,9 +19,11 @@ mod cycle;
 mod status;
 
 #[cfg(test)]
+mod multi_tests;
+#[cfg(test)]
 mod tests;
 
-pub use collector::{Collector, PreparedRef};
+pub use collector::{Collector, PreparedRef, Span, WriteGate};
 pub use cycle::CycleStats;
 pub use status::{PackStatus, Status};
 
@@ -142,6 +144,10 @@ pub enum Error {
         /// The decode/parse/walk failure.
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// Opening a write span failed: the store is closing (Go: `"gc: %w"` in
+    /// `BeginSpan`).
+    #[error("gc: {0}")]
+    Span(packstore::Error),
     /// A packstore error surfaced unchanged, as in Go: the mark's `get`,
     /// `liveness`, `segments`, or the sweep's `compact`.
     #[error(transparent)]

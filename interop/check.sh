@@ -168,6 +168,41 @@ cmp "$WORK/ls-commit-go.txt" "$WORK/ls-commit-rs.txt"
 [ "$("$GO" --store "$WORK/store-rs" ref get main)" = "$C2_RS" ]
 [ "$("$RS" --store "$WORK/store-go" ref get main)" = "$C2_GO" ]
 
+echo "== two processes, two implementations, one store (concurrent ingest)"
+# Both CLIs write into the same store directory at the same time: each owns
+# an active segment of its own, indexes it in a sidecar the other reads, and
+# sees the other's objects (architecture/packstore.md).
+T2="$WORK/tree2"
+mkdir -p "$T2/sub"
+head -c 2000000 /dev/urandom > "$T2/other.bin"
+printf 'second tree\n' > "$T2/sub/note.txt"
+SHARED="$WORK/store-shared"
+"$GO" --store "$SHARED" ingest "$T" > "$WORK/shared-root1" &
+GO_PID=$!
+ROOT2=$("$RS" --store "$SHARED" ingest "$T2")
+wait "$GO_PID"
+ROOT1=$(cat "$WORK/shared-root1")
+[ "$ROOT1" = "$ROOT_GO" ] || { echo "FAIL: concurrent go ingest gave $ROOT1" >&2; exit 1; }
+echo "   active segments afterwards: $(find "$SHARED/packstore" -name '*.seg.active' | wc -l | tr -d ' ')"
+"$GO" --store "$SHARED" export -o "$WORK/shared1-go.tar" "$ROOT1"
+"$RS" --store "$SHARED" export -o "$WORK/shared1-rs.tar" "$ROOT1"
+cmp "$WORK/go-from-go.tar" "$WORK/shared1-go.tar"
+cmp "$WORK/go-from-go.tar" "$WORK/shared1-rs.tar"
+"$GO" --store "$SHARED" export -o "$WORK/shared2-go.tar" "$ROOT2"
+"$RS" --store "$SHARED" export -o "$WORK/shared2-rs.tar" "$ROOT2"
+cmp "$WORK/shared2-go.tar" "$WORK/shared2-rs.tar"
+# And in turn: each continues the segment, and the sidecar, the other left.
+printf 'third\n' > "$T2/sub/third.txt"
+ROOT3_RS=$("$RS" --store "$SHARED" ingest "$T2")
+printf 'fourth\n' > "$T2/sub/fourth.txt"
+ROOT4_GO=$("$GO" --store "$SHARED" ingest "$T2")
+"$GO" --store "$SHARED" ls --keys "$ROOT3_RS/sub" > "$WORK/ls3-go.txt"
+"$RS" --store "$SHARED" ls --keys "$ROOT3_RS/sub" > "$WORK/ls3-rs.txt"
+cmp "$WORK/ls3-go.txt" "$WORK/ls3-rs.txt"
+"$GO" --store "$SHARED" ls --keys "$ROOT4_GO/sub" > "$WORK/ls4-go.txt"
+"$RS" --store "$SHARED" ls --keys "$ROOT4_GO/sub" > "$WORK/ls4-rs.txt"
+cmp "$WORK/ls4-go.txt" "$WORK/ls4-rs.txt"
+
 echo "== repairing packs across implementations"
 (cd "$RS_REPO" && cargo build -q --example repair-interop)
 (cd "$GO_REPO" && go build -o "$WORK/repair-go" "$RS_REPO/interop/repair.go")

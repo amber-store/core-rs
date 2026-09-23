@@ -50,6 +50,9 @@ impl Store {
         if workers == 0 {
             return Ok(Vec::new());
         }
+        // Misses are what this call expects, so it looks at the directory
+        // once, up front, rather than after each.
+        self.refresh_after_miss(false)?;
         thread::scope(|s| {
             let handles: Vec<_> = (0..workers)
                 .map(|i| {
@@ -58,7 +61,7 @@ impl Store {
                     s.spawn(move || -> Result<Vec<Key>, Error> {
                         let mut miss = Vec::new();
                         for &k in chunk {
-                            let has = self.has(k).map_err(|e| Error::Context {
+                            let has = self.has_local(k).map_err(|e| Error::Context {
                                 msg: format!("missing-check {k}"),
                                 source: Box::new(e),
                             })?;

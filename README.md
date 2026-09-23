@@ -7,7 +7,7 @@ its content.
 
 This crate is the Rust port of
 [`github.com/amber-store/core`](https://github.com/amber-store/core)
-(pinned at Go `91da3cf`, after v0.0.9, see [`PORTING.md`](PORTING.md)), intended to be embedded as a **library** in other Rust
+(pinned at Go `1fb6953`, after v0.0.9, see [`PORTING.md`](PORTING.md)), intended to be embedded as a **library** in other Rust
 projects. The format is specified in [`architecture/`](architecture/).
 
 ## Compatibility with the Go implementation
@@ -54,7 +54,7 @@ The modules mirror the Go packages; see the crate docs (`cargo doc --open`).
 | `chunkers` | UltraCDC byte chunking and BLAKE3 item chunking. |
 | `ingest` | Build a tree from a local directory; honors `.amberignore`; `Opts::exclude` skips names at the root (a working copy's metadata directory). |
 | `amberignore` | `.gitignore`-semantics exclusion for ingestion. |
-| `packstore` | Append-only pack segments with parallel, deduplicating, verifying writers. |
+| `packstore` | Append-only pack segments with parallel, deduplicating, verifying writers. Any number of processes may read and write one store at once; see [`architecture/packstore.md`](architecture/packstore.md). |
 | `refstore` | SQLite-backed (WAL, multi-process) name → record map for references, with optimistic updates; the file is shared with the Go implementation. |
 | `reference` | The reference record: canonical CBOR encoding and validation. |
 | `commit` | The commit record (object type 5): canonical CBOR encoding and validation; signature fields carried opaquely. See [`architecture/commits.md`](architecture/commits.md). |

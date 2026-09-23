@@ -2,7 +2,7 @@
 
 `tools/vectorgen` (Go) generates every vector file in `tests/golden/` per
 VECTORS.md, driving the pinned Go library (`github.com/amber-store/core`
-at the version in `tools/vectorgen/go.mod` — Go `91da3cf` since the Go PR #13
+at the version in `tools/vectorgen/go.mod` — Go `1fb6953` since the Go PR #14
 backport; originally `jobs-build/amber-store-core@e4fcb60`; no replace
 directive). Regenerate with `cd tools/vectorgen && go run . ../../tests/golden`
 — the generator first deletes exactly the files it owns, so a rerun is a clean
@@ -90,3 +90,16 @@ has no vectors. The pin moved v0.0.9 →
 a pseudo-version, because the commit lies between two tags). A full
 regeneration into a scratch directory at the new pin reproduced all 18 files
 byte for byte.
+
+## Go PR #14 backport (2026-09-23)
+
+The pin moved on to `v0.0.10-0.20260923125444-1fb6953558f0` (Go `1fb6953`,
+the merge of PR #14). A full regeneration into a scratch directory reproduced
+every existing file byte for byte and added one:
+`segments_go/0000000000000003.seg.active.idx`, the active segment's sidecar
+index, which `genSegments` now asserts (232 bytes: magic, three entries, the
+`synced` record of `Close`) and keeps. It deletes `gc.lock`, which every open
+creates and which holds nothing a reader needs. `golden_segments_go_sidecar_is_trusted`
+proves through the public API that Rust accepts the Go-written sidecar rather
+than falling back to a scan; it was seen failing with the sidecar removed from
+the fixture.

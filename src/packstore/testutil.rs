@@ -3,8 +3,9 @@
 //! than Go's PCG — the tests rely on the *properties* (incompressible /
 //! compressible), not the exact bytes.
 
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
@@ -12,7 +13,10 @@ use crate::amberpack::{REC_HEADER_SIZE, encode_record};
 use crate::key::{Key, Type};
 
 use super::footer::{IndexEntry, TRAILER_SIZE, build_footer};
-use super::{MAGIC_HEADER, Object, be_u32};
+use super::recover::scan_active;
+use super::sidecar::{SIDECAR_MAGIC, SIDECAR_SUFFIX, SidecarRec, read_sidecar};
+use super::view::with_suffix;
+use super::{MAGIC_HEADER, Object, Store, be_u32};
 
 /// Deterministic splitmix64 stream.
 pub(crate) struct Rng(pub u64);
@@ -144,4 +148,138 @@ pub(crate) fn refresh_footer_crc(b: &mut [u8]) {
 /// Reads the big-endian u64 at `off` in `b`.
 pub(crate) fn be_u64(b: &[u8], off: usize) -> u64 {
     (u64::from(be_u32(b, off)) << 32) | u64::from(be_u32(b, off + 4))
+}
+
+/// Go: `putAll`.
+pub(crate) fn put_all(s: &Store, objs: &[Object]) {
+    for o in objs {
+        s.put(o.key, &o.data).unwrap();
+    }
+}
+
+/// Go: `wantObjects`.
+pub(crate) fn want_objects(s: &Store, objs: &[Object]) {
+    for o in objs {
+        match s.get(o.key) {
+            Ok(got) => assert!(
+                got == o.data,
+                "get({}): {} bytes, want the {} bytes put",
+                o.key,
+                got.len(),
+                o.data.len()
+            ),
+            Err(e) => panic!("get({}): {e}", o.key),
+        }
+    }
+}
+
+/// The files in `dir` whose names end in `suffix`, sorted.
+pub(crate) fn files_with_suffix(dir: &Path, suffix: &str) -> Vec<PathBuf> {
+    let mut out: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().ends_with(suffix))
+        .collect();
+    out.sort();
+    out
+}
+
+/// The path of the directory's single active segment (Go: `onlyActive`).
+pub(crate) fn only_active(dir: &Path) -> PathBuf {
+    let actives = files_with_suffix(dir, ".seg.active");
+    assert_eq!(
+        actives.len(),
+        1,
+        "active segments = {actives:?}; want exactly one"
+    );
+    actives[0].clone()
+}
+
+/// The sidecar of the active segment at `data`.
+pub(crate) fn sidecar_of(data: &Path) -> PathBuf {
+    with_suffix(data, SIDECAR_SUFFIX)
+}
+
+/// Go: `sidecars`.
+pub(crate) fn sidecar_files(dir: &Path) -> Vec<PathBuf> {
+    files_with_suffix(dir, SIDECAR_SUFFIX)
+}
+
+/// Go: `flipByte`.
+pub(crate) fn flip_byte(path: &Path, off: u64) {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut b = [0u8; 1];
+    f.read_exact_at(&mut b, off).unwrap();
+    b[0] ^= 0xff;
+    f.write_all_at(&b, off).unwrap();
+}
+
+/// Go: `readSidecarFile`.
+pub(crate) fn read_sidecar_file(path: &Path) -> (Vec<SidecarRec>, usize) {
+    read_sidecar(&fs::read(path).unwrap(), true)
+}
+
+/// Go: `sidecarImage`.
+pub(crate) fn sidecar_image(recs: &[SidecarRec]) -> Vec<u8> {
+    let mut b = SIDECAR_MAGIC.to_vec();
+    for r in recs {
+        b.extend_from_slice(&r.encode());
+    }
+    b
+}
+
+/// Appends a complete footer to the directory's only active segment, as a
+/// seal that crashed before its rename leaves it (Go: `crashSeal`).
+pub(crate) fn crash_seal(dir: &Path) {
+    let data = only_active(dir);
+    let res = scan_active(&data).unwrap();
+    let entries: Vec<IndexEntry> = res
+        .index
+        .iter()
+        .map(|(k, loc)| IndexEntry {
+            k: *k,
+            off: loc.off,
+            slen: loc.slen,
+        })
+        .collect();
+    let footer = build_footer(res.size, &entries).unwrap();
+    let mut b = fs::read(&data).unwrap();
+    b.extend_from_slice(&footer);
+    fs::write(&data, &b).unwrap();
+}
+
+/// A live predicate true for exactly the objects at `idx`, fit to move into a
+/// thread (Go: `liveSet`).
+pub(crate) fn live_at(
+    objs: &[Object],
+    idx: &[usize],
+) -> impl Fn(Key) -> bool + Send + Sync + 'static {
+    let live: std::collections::HashSet<Key> = idx.iter().map(|&i| objs[i].key).collect();
+    move |k| live.contains(&k)
+}
+
+/// The options the compaction tests sweep with.
+pub(crate) fn sweep_opts() -> super::CompactOpts {
+    super::CompactOpts {
+        min_dead_ratio: 0.1,
+        ..super::CompactOpts::default()
+    }
+}
+
+/// Kills the child process `pid` unless the sender it returns is dropped
+/// within `limit`: a child that hangs must fail its test, not hang the suite
+/// (`cargo test` has no timeout of its own).
+pub(crate) fn watchdog(pid: u32, limit: std::time::Duration) -> std::sync::mpsc::Sender<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if rx.recv_timeout(limit) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            // SAFETY: kill takes a process id and a signal number.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    });
+    tx
 }

@@ -54,6 +54,12 @@ impl Store {
                 m.active.insert(*k, false);
             }
         }
+        for fa in &sh.foreign {
+            // Present, and as little a victim as the store's own.
+            for k in unpoison(fa.state.read()).scan.index.keys() {
+                m.active.insert(*k, false);
+            }
+        }
         m
     }
 }

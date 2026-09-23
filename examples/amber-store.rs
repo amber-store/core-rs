@@ -264,7 +264,7 @@ fn run() -> Result<(), CliError> {
 
 struct Stores {
     // Arcs so a collector can share the open stores (Go passes the same
-    // pointers); each underlying store stays single-owner per process.
+    // pointers).
     objects: Arc<packstore::Store>,
     refs: Arc<refstore::Store>,
 }
@@ -285,8 +285,8 @@ fn store_dir(cli: &Cli) -> Result<PathBuf, CliError> {
 
 /// Opens (creating as needed) the store directory named by --store or
 /// $AMBER_STORE: `<dir>/packstore` holds the objects, `<dir>/refs` the
-/// references DB. Stores are single-owner: never open one directory from two
-/// live processes.
+/// references DB. Any number of processes may have one store open at once
+/// (architecture/packstore.md, architecture/references.md).
 fn open_store(cli: &Cli) -> Result<Stores, CliError> {
     let dir = store_dir(cli)?;
     let objects = packstore::Store::open_with(
@@ -327,6 +327,82 @@ fn open_collector(cli: &Cli, st: &Stores, opts: gc::Options) -> Result<gc::Colle
         Arc::clone(&st.refs),
         opts,
     )?)
+}
+
+/// What a reference put needs from the collector: the completeness walk under
+/// the reference lock. A collector opens a span for the one put; a
+/// [`gc::Span`] is a span already open around the writes the reference names
+/// (Go: `refGate`).
+trait RefGate {
+    fn prepare_ref(&self, root: Key) -> Result<gc::PreparedRef<'_>, gc::Error>;
+    fn release_ref(&self, root: Key) -> Result<(), gc::Error>;
+}
+
+impl RefGate for gc::Collector {
+    fn prepare_ref(&self, root: Key) -> Result<gc::PreparedRef<'_>, gc::Error> {
+        gc::Collector::prepare_ref(self, root)
+    }
+
+    fn release_ref(&self, root: Key) -> Result<(), gc::Error> {
+        gc::Collector::release_ref(self, root)
+    }
+}
+
+impl RefGate for gc::Span<'_> {
+    fn prepare_ref(&self, root: Key) -> Result<gc::PreparedRef<'_>, gc::Error> {
+        gc::Span::prepare_ref(self, root)
+    }
+
+    fn release_ref(&self, root: Key) -> Result<(), gc::Error> {
+        gc::Span::release_ref(self, root)
+    }
+}
+
+/// One write span over a command's object writes and, when the command names
+/// them, the reference put. With a reference to put it is the collector's
+/// ([`gc::Collector::begin_span`]), which takes the reference lock before the
+/// store's gate, the order a cycle takes them in; without one, the store's
+/// own. Dropping it ends the span (Go: `cliSpan`; the caller opens the
+/// collector here, because the span borrows it).
+enum CliSpan<'a> {
+    Store { _span: packstore::WriteSpan<'a> },
+    Collector(gc::Span<'a>),
+}
+
+impl CliSpan<'_> {
+    /// What a reference put inside this span goes through.
+    fn ref_gate(&self) -> Result<&dyn RefGate, CliError> {
+        match self {
+            CliSpan::Collector(span) => Ok(span),
+            CliSpan::Store { .. } => Err("a reference put needs the collector's span".into()),
+        }
+    }
+}
+
+/// Go: `openSpan`.
+fn open_span<'a>(st: &'a Stores, coll: Option<&'a gc::Collector>) -> Result<CliSpan<'a>, CliError> {
+    Ok(match coll {
+        Some(coll) => CliSpan::Collector(coll.begin_span()?),
+        None => CliSpan::Store {
+            _span: st.objects.begin_write()?,
+        },
+    })
+}
+
+/// The collector a command needs when it names what it writes.
+fn collector_for(cli: &Cli, st: &Stores, wanted: bool) -> Result<Option<gc::Collector>, CliError> {
+    if !wanted {
+        return Ok(None);
+    }
+    open_collector(cli, st, gc::Options::default()).map(Some)
+}
+
+/// Closes the collector a span was opened through, if there was one.
+fn close_collector(coll: Option<gc::Collector>) -> Result<(), CliError> {
+    match coll {
+        Some(coll) => coll.close().map_err(CliError::from),
+        None => Ok(()),
+    }
 }
 
 /// Joins the failures' messages with newlines, mirroring the Go CLI's
@@ -458,14 +534,42 @@ fn run_ingest(cli: &Cli, a: &IngestArgs) -> Result<(), CliError> {
         progress: None,
         exclude: Vec::new(),
     };
-    let (_stats, res) = ingest::dir(&st.objects, &a.path, opts);
-    let root = match res {
-        Ok(k) => k,
+    // One write span over the ingest and the reference that names it: a GC
+    // cycle in another process cannot fall between the two and find objects
+    // whose reference is still to come, which only the grace period would
+    // protect (Go: runIngest's openSpan).
+    let coll = match collector_for(cli, &st, a.reference.is_some()) {
+        Ok(coll) => coll,
         Err(e) => {
             let _ = close_store(st);
-            return Err(e.into());
+            return Err(e);
         }
     };
+    let res = ingest_in_span(&st, coll.as_ref(), a, opts);
+    let closed = close_collector(coll);
+    let root = match res {
+        Ok(root) => root,
+        Err(e) => {
+            let _ = close_store(st);
+            return Err(e);
+        }
+    };
+    closed?;
+    close_store(st)?;
+    println!("{root}");
+    Ok(())
+}
+
+/// The part of an ingest that runs inside its write span.
+fn ingest_in_span(
+    st: &Stores,
+    coll: Option<&gc::Collector>,
+    a: &IngestArgs,
+    opts: ingest::Opts,
+) -> Result<Key, CliError> {
+    let span = open_span(st, coll)?;
+    let (_stats, res) = ingest::dir(&st.objects, &a.path, opts);
+    let root = res?;
     if let Some(name) = &a.reference {
         let rec = Reference {
             name: name.clone(),
@@ -473,25 +577,19 @@ fn run_ingest(cli: &Cli, a: &IngestArgs) -> Result<(), CliError> {
             created_at: now_unix_nanos(),
             ..Default::default()
         };
+        // The reference is published through the collector, so an incomplete
+        // tree can fail the write — shouldn't happen right after ingest.
         let put = rec.encode().map_err(CliError::from).and_then(|raw| {
-            // The reference is published through the collector, so an
-            // incomplete tree can fail the write — shouldn't happen right
-            // after ingest (Go: runIngest's openCollector + putRef +
-            // coll.Close join).
-            let coll = open_collector(cli, &st, gc::Options::default())?;
-            let res = put_ref(
-                &coll,
+            put_ref(
+                span.ref_gate()?,
                 &st.refs,
                 name,
                 root,
                 &raw,
                 Expectation::Unconditional,
-            );
-            let closed = coll.close().map_err(CliError::from);
-            join_errs([res, closed])
+            )
         });
         if let Err(e) = put {
-            let _ = close_store(st);
             return Err(format!(
                 "tree stored (root {root}) but creating reference {name:?} failed: {e}\n\
                  retry with: amber-store ref set {name:?} {root}"
@@ -499,9 +597,7 @@ fn run_ingest(cli: &Cli, a: &IngestArgs) -> Result<(), CliError> {
             .into());
         }
     }
-    close_store(st)?;
-    println!("{root}");
-    Ok(())
+    Ok(root)
 }
 
 fn now_unix_nanos() -> i64 {
@@ -907,7 +1003,7 @@ fn ref_list(st: &Stores) -> Result<(), CliError> {
 /// expectation the store itself refuses the write if the reference moved
 /// meanwhile.
 fn put_ref(
-    coll: &gc::Collector,
+    coll: &dyn RefGate,
     refs: &refstore::Store,
     name: &str,
     root: Key,
@@ -1105,12 +1201,33 @@ fn create_commit(
         public_key: Vec::new(),
     };
     let (k, raw) = rec.object()?;
+    // One write span from the check that the children are there to the
+    // reference that names the commit: no sweep in another process falls in
+    // between (Go: createCommit's openSpan).
+    let coll = collector_for(cli, st, ref_name.is_some())?;
+    let res = commit_in_span(st, coll.as_ref(), &rec, k, &raw, ref_name);
+    let closed = close_collector(coll);
+    let k = res?;
+    closed?;
+    Ok(k)
+}
+
+/// The part of a commit's creation that runs inside its write span.
+fn commit_in_span(
+    st: &Stores,
+    coll: Option<&gc::Collector>,
+    rec: &Commit,
+    k: Key,
+    raw: &[u8],
+    ref_name: Option<&str>,
+) -> Result<Key, CliError> {
+    let span = open_span(st, coll)?;
     for child in std::iter::once(rec.tree).chain(rec.parents.iter().copied()) {
         if !st.objects.has(child)? {
             return Err(format!("{child} is not in the store").into());
         }
     }
-    st.objects.put(k, &raw)?;
+    st.objects.put(k, raw)?;
     let Some(name) = ref_name else {
         return Ok(k);
     };
@@ -1124,17 +1241,14 @@ fn create_commit(
         .encode()
         .map_err(CliError::from)
         .and_then(|ref_raw| {
-            let coll = open_collector(cli, st, gc::Options::default())?;
-            let res = put_ref(
-                &coll,
+            put_ref(
+                span.ref_gate()?,
                 &st.refs,
                 name,
                 k,
                 &ref_raw,
                 Expectation::Unconditional,
-            );
-            let closed = coll.close().map_err(CliError::from);
-            join_errs([res, closed])
+            )
         });
     if let Err(e) = put {
         return Err(format!(

@@ -112,7 +112,17 @@ impl Store {
         I::IntoIter: Send,
         E: std::error::Error + Send + Sync + 'static,
     {
-        let _write_token = self.begin_write();
+        let _write_token = match self.begin_write_token() {
+            Ok(token) => token,
+            Err(e) => {
+                let none = WriteStats {
+                    stored: 0,
+                    deduped: 0,
+                    bytes_stored: 0,
+                };
+                return (none, Err(e));
+            }
+        };
         let writers = if opts.writers == 0 {
             thread::available_parallelism().map_or(1, |n| n.get())
         } else {
@@ -206,7 +216,7 @@ impl Store {
                 run.deduped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            match self.has(obj.key) {
+            match self.has_durably(obj.key) {
                 Ok(true) => {
                     run.deduped.fetch_add(1, Ordering::Relaxed);
                     continue;
