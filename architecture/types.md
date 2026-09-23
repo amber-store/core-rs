@@ -26,7 +26,7 @@ device, fifo, or socket entry holds its small data **inline** and references no 
 
 ## CAS object types
 
-The 4-bit type field has 16 slots; 5 are defined.
+The 4-bit type field has 16 slots; 6 are defined.
 
 | Type | Name       | Role                                                              | Key length field encodes        | Child object types   |
 |------|------------|------------------------------------------------------------------|---------------------------------|----------------------|
@@ -35,7 +35,8 @@ The 4-bit type field has 16 slots; 5 are defined.
 | 2    | `DirLeaf`  | A contiguous run of complete directory entries (prolly-tree leaf).| **own bytes + subtree footprint** | (entries are inline) |
 | 3    | `DirNode`  | Directory index node, keyed by entry name (directory tree).      | **own bytes + subtree footprint** | `DirNode` / `DirLeaf`|
 | 4    | `XattrSet` | Spilled extended attributes, when too large to store inline.     | own serialized byte length      | —                    |
-| 5–15 | reserved   | Must not be emitted.                                             | —                               | —                    |
+| 5    | `Commit`   | Snapshot record: a directory root, parent commits, author, committer, message ([commits.md](commits.md)). | own serialized byte length      | `DirLeaf` / `DirNode` (tree), `Commit` (parents) |
+| 6–15 | reserved   | Must not be emitted.                                             | —                               | —                    |
 
 **Leaf and internal nodes are distinct types** (`Blob`/`FileNode`,
 `DirLeaf`/`DirNode`) so the key alone tells a reader whether following it yields
@@ -48,7 +49,7 @@ The key's hash always covers the object's **serialized bytes**. The key's
 **length field**, however, carries a *logical* size for the aggregate types — this
 extends the rule [keys.md](keys.md) already states for directories:
 
-- `Blob`, `XattrSet`: length = the object's own serialized byte length.
+- `Blob`, `XattrSet`, `Commit`: length = the object's own serialized byte length.
 - `FileNode`: length = total bytes of the file region it covers — i.e. the file's
   **content size**, *excluding* this node's own index bytes. This buys **O(1)
   `stat`** (a file's size is read from the `contentKey` already inline in its parent
@@ -125,5 +126,11 @@ inlining of file content into the directory entry), keeping the model uniform.
 The top of a store is simply a directory key (`DirLeaf` or `DirNode`). Because
 entry metadata lives in the *parent* entry, the **root directory carries no
 metadata of its own** for now — whatever external reference names the root key can
-hold root ownership/mode/mtime later if needed. Snapshot/versioning objects are
-intentionally out of scope at this stage.
+hold root ownership/mode/mtime later if needed.
+
+## Commits
+
+A [`Commit`](commits.md) is the snapshot record in content-addressed form: it
+names a root directory and carries who recorded it, when, why, and which
+commits it follows. Its children in the object graph are that tree and its
+parent commits, so whatever keeps a commit alive keeps its history alive.

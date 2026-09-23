@@ -2,7 +2,8 @@
 //! interop testing against the Go binary: same store layout
 //! (`<dir>/packstore` + `<dir>/refs`), same spec addressing
 //! (`KEY[/PATH]` | `ref:NAME[@PATH]`), same subcommand behavior and
-//! `ls -l`-style output.
+//! `ls -l`-style output. A commit key, or a reference to one, stands for the
+//! commit's tree wherever a directory is expected.
 
 use std::fs;
 use std::io::{self, Seek as _, SeekFrom, Write as _};
@@ -14,10 +15,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 
 use amber_store_core::chunkers::ByteOpts;
+use amber_store_core::commit::{Commit, Identity};
 use amber_store_core::fstree::{self, Entry};
 use amber_store_core::gc;
 use amber_store_core::ingest;
-use amber_store_core::key::Key;
+use amber_store_core::key::{Key, Type};
 use amber_store_core::packstore;
 use amber_store_core::reference::{self, Reference};
 use amber_store_core::refstore;
@@ -68,6 +70,10 @@ enum Cmd {
     /// manage references: named pointers to root keys
     #[command(subcommand)]
     Ref(RefCmd),
+    /// create and inspect commits: a tree with its parent commits, author,
+    /// committer and message
+    #[command(subcommand)]
+    Commit(CommitCmd),
     /// garbage collection: score packs, reap the mostly-dead ones
     #[command(subcommand)]
     Gc(GcCmd),
@@ -145,6 +151,42 @@ enum RefCmd {
 }
 
 #[derive(Subcommand)]
+enum CommitCmd {
+    /// record the directory at TREE as a commit and print the commit key
+    Create(CommitCreateArgs),
+    /// print the commit at KEY or ref:NAME
+    Show {
+        #[arg(value_name = "KEY | ref:NAME")]
+        spec: String,
+    },
+}
+
+#[derive(Args)]
+struct CommitCreateArgs {
+    /// commit message
+    #[arg(long, short = 'm', default_value = "")]
+    message: String,
+    /// author as 'Name <email>'
+    #[arg(long)]
+    author: String,
+    /// committer as 'Name <email>' (default: the author)
+    #[arg(long)]
+    committer: Option<String>,
+    /// author and committer time, RFC 3339 (default: now, local zone)
+    #[arg(long)]
+    date: Option<String>,
+    /// parent commit, KEY or ref:NAME; repeat for a merge, mainline first
+    #[arg(long)]
+    parent: Vec<String>,
+    /// point reference NAME at the new commit
+    #[arg(long = "ref")]
+    reference: Option<String>,
+    /// the directory to record: KEY[/PATH] | ref:NAME[@PATH]
+    #[arg(value_name = "TREE")]
+    tree: String,
+}
+
+#[derive(Subcommand)]
 enum GcCmd {
     /// packs: id, sealed, bytes, garbage, eligible; totals; closures;
     /// union; last cycle
@@ -193,6 +235,7 @@ fn run() -> Result<(), CliError> {
         Cmd::Export(a) => run_export(&cli, a),
         Cmd::Restore(a) => run_restore(&cli, a),
         Cmd::Ref(r) => run_ref(&cli, r),
+        Cmd::Commit(c) => run_commit(&cli, c),
         Cmd::Gc(g) => run_gc(&cli, g),
     }
 }
@@ -325,11 +368,26 @@ fn parse_hex_key(s: &str) -> Result<Key, CliError> {
     Ok(k)
 }
 
+/// Maps a Commit key to the directory root it records; any other key is
+/// returned unchanged. Only a spec's root can be a commit — directory entries
+/// never hold one (Go: `peelCommit`).
+fn peel_commit(objects: &packstore::Store, k: Key) -> Result<Key, CliError> {
+    if k.type_() != Type::Commit {
+        return Ok(k);
+    }
+    let data = objects
+        .get(k)
+        .map_err(|e| format!("reading commit {k}: {e}"))?;
+    let rec = Commit::decode(&data).map_err(|e| format!("commit {k}: {e}"))?;
+    Ok(rec.tree)
+}
+
 /// Resolves a slash-separated subpath from `root` and returns the target
 /// entry's content key. Every traversed segment must be an entry carrying a
-/// content key (a regular file or a directory).
+/// content key (a regular file or a directory). A Commit root stands for its
+/// tree.
 fn descend(objects: &packstore::Store, root: Key, path: &str) -> Result<Key, CliError> {
-    let mut k = root;
+    let mut k = peel_commit(objects, root)?;
     for seg in path.split('/') {
         if seg.is_empty() {
             continue;
@@ -827,6 +885,323 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
     let y = yoe + era * 400 + i64::from(m <= 2);
     (y, m, d)
+}
+
+// ---------------------------------------------------------------------------
+// commit (Go: commit.go).
+// ---------------------------------------------------------------------------
+
+fn run_commit(cli: &Cli, cmd: &CommitCmd) -> Result<(), CliError> {
+    match cmd {
+        CommitCmd::Create(a) => run_commit_create(cli, a),
+        CommitCmd::Show { spec } => run_commit_show(cli, spec),
+    }
+}
+
+/// Splits "Name <email>" into its parts. A string with no trailing "<...>"
+/// is all name; the name must not be empty (Go: `parseIdentity`).
+fn parse_identity(s: &str) -> Result<Identity, CliError> {
+    let s = s.trim();
+    let (mut name, mut email) = (s, "");
+    if s.ends_with('>')
+        && let Some(i) = s.rfind('<')
+    {
+        name = s[..i].trim();
+        email = &s[i + 1..s.len() - 1];
+    }
+    if name.is_empty() {
+        return Err(format!("identity {s:?} has no name; want 'Name <email>'").into());
+    }
+    Ok(Identity {
+        name: name.to_string(),
+        email: email.to_string(),
+        ..Default::default()
+    })
+}
+
+fn run_commit_create(cli: &Cli, a: &CommitCreateArgs) -> Result<(), CliError> {
+    let mut author = parse_identity(&a.author).map_err(|e| format!("--author: {e}"))?;
+    let mut committer = match a.committer.as_deref() {
+        Some(s) if !s.is_empty() => parse_identity(s).map_err(|e| format!("--committer: {e}"))?,
+        _ => author.clone(),
+    };
+    let (when, tz_offset) = match a.date.as_deref() {
+        Some(s) if !s.is_empty() => parse_rfc3339(s).map_err(|e| format!("--date: {e}"))?,
+        _ => {
+            // Now, in the local zone; the zone's offset is recorded (Go:
+            // `when.Zone()`, whole minutes).
+            let now = now_unix_nanos();
+            let tm = local_tm(now.div_euclid(1_000_000_000));
+            (now, (tm.tm_gmtoff / 60) as i32)
+        }
+    };
+    (author.when, author.tz_offset) = (when, tz_offset);
+    (committer.when, committer.tz_offset) = (when, tz_offset);
+    let ref_name = a.reference.as_deref().filter(|n| !n.is_empty());
+    if let Some(name) = ref_name {
+        reference::validate_name(name)?;
+    }
+
+    let st = open_store(cli)?;
+    let created = create_commit(cli, &st, a, author, committer, ref_name);
+    let closed = close_store(st);
+    let (key, res) = match created {
+        Ok(k) => (Some(k), Ok(())),
+        Err(e) => (None, Err(e)),
+    };
+    join_errs([res, closed])?;
+    if let Some(k) = key {
+        println!("{k}");
+    }
+    Ok(())
+}
+
+/// Resolves the tree and parent specs, stores the commit and, when
+/// `ref_name` is set, points that reference at it (Go: `createCommit`).
+fn create_commit(
+    cli: &Cli,
+    st: &Stores,
+    a: &CommitCreateArgs,
+    author: Identity,
+    committer: Identity,
+    ref_name: Option<&str>,
+) -> Result<Key, CliError> {
+    let (root, path) = resolve_spec(&st.refs, &a.tree)?;
+    let tree = descend(&st.objects, root, &path)?;
+    let mut parents = Vec::with_capacity(a.parent.len());
+    for spec in &a.parent {
+        let (pk, ppath) =
+            resolve_spec(&st.refs, spec).map_err(|e| format!("--parent {spec}: {e}"))?;
+        if !ppath.is_empty() {
+            return Err(
+                format!("--parent {spec}: a parent is a commit, not a path within one").into(),
+            );
+        }
+        parents.push(pk);
+    }
+    let rec = Commit {
+        tree,
+        parents,
+        author,
+        committer,
+        message: a.message.clone(),
+        signature: Vec::new(),
+        public_key: Vec::new(),
+    };
+    let (k, raw) = rec.object()?;
+    for child in std::iter::once(rec.tree).chain(rec.parents.iter().copied()) {
+        if !st.objects.has(child)? {
+            return Err(format!("{child} is not in the store").into());
+        }
+    }
+    st.objects.put(k, &raw)?;
+    let Some(name) = ref_name else {
+        return Ok(k);
+    };
+    let ref_rec = Reference {
+        name: name.to_string(),
+        key: k.as_bytes().to_vec(),
+        created_at: now_unix_nanos(),
+        ..Default::default()
+    };
+    let put = ref_rec
+        .encode()
+        .map_err(CliError::from)
+        .and_then(|ref_raw| {
+            let coll = open_collector(cli, st, gc::Options::default())?;
+            let res = put_ref(&coll, &st.refs, name, k, &ref_raw);
+            let closed = coll.close().map_err(CliError::from);
+            join_errs([res, closed])
+        });
+    if let Err(e) = put {
+        return Err(format!(
+            "commit stored ({k}) but setting reference {name:?} failed: {e}\n\
+             retry with: amber-store ref set {name:?} {k}"
+        )
+        .into());
+    }
+    Ok(k)
+}
+
+fn run_commit_show(cli: &Cli, spec: &str) -> Result<(), CliError> {
+    let st = open_store(cli)?;
+    let res = commit_show_inner(&st, spec);
+    let closed = close_store(st);
+    join_errs([res, closed])
+}
+
+fn commit_show_inner(st: &Stores, spec: &str) -> Result<(), CliError> {
+    let (k, path) = resolve_spec(&st.refs, spec)?;
+    if !path.is_empty() {
+        return Err("commit show takes a commit, not a path within one".into());
+    }
+    if k.type_() != Type::Commit {
+        return Err(format!("{k} is not a commit (type {})", k.type_()).into());
+    }
+    let data = st.objects.get(k)?;
+    let rec = Commit::decode(&data).map_err(|e| format!("commit {k}: {e}"))?;
+    io::stdout().write_all(render_commit(k, &rec).as_bytes())?;
+    Ok(())
+}
+
+/// Renders a commit in git's cat-file layout: headers, a blank line, then
+/// the message indented by four spaces (Go: `renderCommit`).
+fn render_commit(k: Key, c: &Commit) -> String {
+    let mut b = format!("commit {k}\ntree {}\n", c.tree);
+    for p in &c.parents {
+        b.push_str(&format!("parent {p}\n"));
+    }
+    b.push_str(&format!(
+        "author {}\ncommitter {}\n",
+        identity_line(&c.author),
+        identity_line(&c.committer)
+    ));
+    if !c.signature.is_empty() {
+        b.push_str(&format!("signature {} bytes\n", c.signature.len()));
+    }
+    let msg = c.message.trim_end_matches('\n');
+    if !msg.is_empty() {
+        b.push('\n');
+        for line in msg.split('\n') {
+            b.push_str(&format!("    {line}\n"));
+        }
+    }
+    b
+}
+
+/// Renders "Name <email> time", the time in the identity's own zone (Go:
+/// `identityLine`).
+fn identity_line(id: &Identity) -> String {
+    let mut who = id.name.clone();
+    if !id.email.is_empty() {
+        who.push_str(&format!(" <{}>", id.email));
+    }
+    format!("{who} {}", rfc3339_at(id.when, id.tz_offset))
+}
+
+/// Formats a ns-precision Unix timestamp at a fixed offset the way Go's
+/// `time.Unix(0, ns).In(time.FixedZone("", min*60)).Format(time.RFC3339)`
+/// does: seconds precision, "Z" for a zero offset, "±hh:mm" otherwise.
+fn rfc3339_at(ns: i64, tz_minutes: i32) -> String {
+    let secs = ns.div_euclid(1_000_000_000) + i64::from(tz_minutes) * 60;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let zone = if tz_minutes == 0 {
+        "Z".to_string()
+    } else {
+        let sign = if tz_minutes < 0 { '-' } else { '+' };
+        let abs = tz_minutes.unsigned_abs();
+        format!("{sign}{:02}:{:02}", abs / 60, abs % 60)
+    };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}{zone}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Days since 1970-01-01 of a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`), the inverse of [`civil_from_days`].
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400); // [0, 399]
+    let mp = (m + 9) % 12; // March = 0
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Parses an RFC 3339 timestamp, `2006-01-02T15:04:05[.frac](Z|±hh:mm)`, into
+/// (ns since the Unix epoch, offset in minutes) — what Go's
+/// `time.Parse(time.RFC3339, s)` followed by `UnixNano()` and `Zone()` yields.
+fn parse_rfc3339(s: &str) -> Result<(i64, i32), String> {
+    let bad = || format!("parsing time {s:?} as \"2006-01-02T15:04:05Z07:00\"");
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let t = s.get(from..to)?;
+        if t.is_empty() || !t.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        t.parse().ok()
+    };
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return Err(bad());
+    }
+    let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(sec)) = (
+        num(0, 4),
+        num(5, 7),
+        num(8, 10),
+        num(11, 13),
+        num(14, 16),
+        num(17, 19),
+    ) else {
+        return Err(bad());
+    };
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Err(format!("{}: month out of range", bad())),
+    };
+    if d < 1 || d > month_days {
+        return Err(format!("{}: day out of range", bad()));
+    }
+    if h > 23 || mi > 59 || sec > 59 {
+        return Err(format!("{}: time out of range", bad()));
+    }
+    // Optional fractional seconds: at least one digit, kept to ns precision.
+    let mut i = 19;
+    let mut frac_ns = 0i64;
+    if b[i] == b'.' {
+        let start = i + 1;
+        let mut j = start;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == start {
+            return Err(bad());
+        }
+        for k in 0..9 {
+            let digit = if start + k < j {
+                i64::from(b[start + k] - b'0')
+            } else {
+                0
+            };
+            frac_ns = frac_ns * 10 + digit;
+        }
+        i = j;
+    }
+    let offset_min = match b.get(i) {
+        Some(b'Z') if i + 1 == b.len() => 0,
+        Some(sign @ (b'+' | b'-')) if b.len() == i + 6 && b[i + 3] == b':' => {
+            let (Some(hh), Some(mm)) = (num(i + 1, i + 3), num(i + 4, i + 6)) else {
+                return Err(bad());
+            };
+            if hh > 23 || mm > 59 {
+                return Err(format!("{}: time zone offset out of range", bad()));
+            }
+            let v = hh * 60 + mm;
+            if *sign == b'-' { -v } else { v }
+        }
+        _ => return Err(bad()),
+    };
+    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec - offset_min * 60;
+    let ns = secs
+        .checked_mul(1_000_000_000)
+        .and_then(|n| n.checked_add(frac_ns))
+        .ok_or_else(|| format!("{}: outside the int64 nanosecond range", bad()))?;
+    Ok((ns, offset_min as i32))
 }
 
 // ---------------------------------------------------------------------------

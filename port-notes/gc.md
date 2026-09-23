@@ -200,3 +200,12 @@ generic over the callback's error type (`fn wipe<E>(&self, reset: impl
 FnOnce() -> Result<(), E>) -> Result<(), E>`) since the collector itself
 has nothing to fail with there. Nothing in this crate calls it (no server),
 same as Go.
+
+## Go PR #12 backport (2026-09-23)
+
+No production change: the mark, `prepare_ref` and `why` dispatch through
+`fstree::child_keys`, which now follows a commit to its tree and parents.
+`commit_history_stays_live` and `prepare_ref_missing_ancestor_fails` port Go
+`gc/commit_test.go`. One cost carries over from Go unchanged: `prepare_ref`
+re-walks the closure on every reference put, and with commits the closure is
+all of history.

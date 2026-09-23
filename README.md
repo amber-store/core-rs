@@ -6,8 +6,8 @@ and every object is identified by a fixed 32-byte key derived from a hash of
 its content.
 
 This crate is the Rust port of
-[`github.com/jobs-build/amber-store-core`](https://github.com/jobs-build/amber-store-core)
-(pinned at `e4fcb60`), intended to be embedded as a **library** in other Rust
+[`github.com/amber-store/core`](https://github.com/amber-store/core)
+(pinned at v0.0.9, see [`PORTING.md`](PORTING.md)), intended to be embedded as a **library** in other Rust
 projects. The format is specified in [`architecture/`](architecture/).
 
 ## Compatibility with the Go implementation
@@ -16,10 +16,11 @@ The port is **byte-compatible** at the content-addressing layer and
 **interoperable** at the storage layer:
 
 - **Byte-identical** (same input ⇒ same bytes): 32-byte keys, every serialized
-  object (`Blob`/`FileNode`/`DirLeaf`/`DirNode`/`XattrSet`), UltraCDC and
-  item-chunker cut points — hence identical root keys for identical trees —
-  reference records, binary-fuse filter sections, segment footers, raw pack
-  records, and PAX tar exports.
+  object (`Blob`/`FileNode`/`DirLeaf`/`DirNode`/`XattrSet`/`Commit`), UltraCDC
+  and item-chunker cut points — hence identical root keys for identical trees
+  and identical commit keys for identical commits — reference records,
+  binary-fuse filter sections, segment footers, raw pack records, and PAX tar
+  exports.
 - **Interoperable, not byte-identical**: zstd-compressed record payloads (Go
   uses klauspost's Go-native encoder, this crate uses libzstd; each decodes
   the other's frames, but pack/segment files containing compressed records
@@ -32,8 +33,9 @@ The port is **byte-compatible** at the content-addressing layer and
 See [`PORTING.md`](PORTING.md) for the full contract,
 [`VECTORS.md`](VECTORS.md) for the Go-generated golden vectors that gate the
 test suite, and [`interop/check.sh`](interop/check.sh) for a live
-cross-implementation check (identical ingest roots, cross-reading each
-other's store directories, byte-identical exports).
+cross-implementation check (identical ingest roots and commit keys,
+cross-reading each other's store directories and commits, byte-identical
+exports).
 
 [redb]: https://github.com/cberner/redb
 
@@ -51,6 +53,7 @@ The modules mirror the Go packages; see the crate docs (`cargo doc --open`).
 | `packstore` | Append-only pack segments with parallel, deduplicating, verifying writers. |
 | `refstore` | Name → record map for references (redb-backed). |
 | `reference` | The reference record: canonical CBOR encoding and validation. |
+| `commit` | The commit record (object type 5): canonical CBOR encoding and validation; signature fields carried opaquely. See [`architecture/commits.md`](architecture/commits.md). |
 | `amberpack` | The flat pack stream format for transfer and storage. |
 | `inbox` | Durable pack receiving. |
 | `tarexport` / `tarextract` | PAX tar streaming out of / into the store. |
@@ -67,8 +70,8 @@ let (root, _stats) = ingest::dir(&store, "./some/dir", ingest::Opts::default())?
 tarexport::write(&mut out, root, |k| store.get(k))?;
 ```
 
-A dev CLI mirroring the Go `amber-store` commands (ingest/ls/export/restore/ref)
-ships as an example: `cargo run --example amber-store -- --store ./store ingest DIR`.
+A dev CLI mirroring the Go `amber-store` commands
+(ingest/ls/export/restore/ref/commit/gc) ships as an example: `cargo run --example amber-store -- --store ./store ingest DIR`.
 
 ## Development
 

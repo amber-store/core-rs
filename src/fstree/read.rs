@@ -26,7 +26,7 @@ const S_IFDIR: u64 = 0o040000;
 /// diagnostic text.
 ///
 /// Go's trailing `fstree: unknown object type %s` branch is unrepresentable:
-/// [`Type`] admits only the five defined types, all of which are handled, and
+/// [`Type`] admits only the six defined types, all of which are handled, and
 /// a non-canonical key panics in [`Key::type_`] per that method's contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildKeysError {
@@ -57,6 +57,13 @@ pub enum ChildKeysError {
         key: Key,
         /// The decode failure.
         source: Error,
+    },
+    /// `fstree: decoding Commit <key>: <err>`
+    DecodeCommit {
+        /// The Commit object's key.
+        key: Key,
+        /// The decode failure.
+        source: crate::commit::Error,
     },
     /// `fstree: "<name>": content key: <err>`
     EntryContentKey {
@@ -89,6 +96,9 @@ impl fmt::Display for ChildKeysError {
             ChildKeysError::DecodeDirLeaf { key, source } => {
                 write!(f, "fstree: decoding DirLeaf {key}: {source}")
             }
+            ChildKeysError::DecodeCommit { key, source } => {
+                write!(f, "fstree: decoding Commit {key}: {source}")
+            }
             ChildKeysError::EntryContentKey { name, source } => {
                 write!(
                     f,
@@ -113,6 +123,7 @@ impl std::error::Error for ChildKeysError {
             ChildKeysError::DecodeFileNode { source, .. }
             | ChildKeysError::DecodeDirNode { source, .. }
             | ChildKeysError::DecodeDirLeaf { source, .. } => Some(source),
+            ChildKeysError::DecodeCommit { source, .. } => Some(source),
             ChildKeysError::DirNodeChildKey { source, .. }
             | ChildKeysError::EntryContentKey { source, .. }
             | ChildKeysError::EntryXattrsKey { source, .. } => Some(source),
@@ -364,7 +375,9 @@ impl<E: std::error::Error + 'static> std::error::Error for WalkError<E> {
 
 /// Returns the keys directly referenced by the object with key `k` and
 /// serialized bytes `data`, in encounter order. Blob and XattrSet objects are
-/// leaves and have no children.
+/// leaves and have no children. A Commit's children are its tree, then its
+/// parents in recorded order — so every walk built on `child_keys` follows
+/// history.
 pub fn child_keys(k: Key, data: &[u8]) -> Result<Vec<Key>, ChildKeysError> {
     match k.type_() {
         Type::Blob | Type::XattrSet => Ok(Vec::new()),
@@ -405,6 +418,14 @@ pub fn child_keys(k: Key, data: &[u8]) -> Result<Vec<Key>, ChildKeysError> {
                     out.push(xk);
                 }
             }
+            Ok(out)
+        }
+        Type::Commit => {
+            let c = crate::commit::Commit::decode(data)
+                .map_err(|source| ChildKeysError::DecodeCommit { key: k, source })?;
+            let mut out = Vec::with_capacity(1 + c.parents.len());
+            out.push(c.tree);
+            out.extend(c.parents);
             Ok(out)
         }
     }
@@ -934,6 +955,120 @@ mod tests {
         }]);
         let kids = child_keys(l.key, &l.bytes).unwrap();
         assert_eq!(kids, vec![blob.key]);
+    }
+
+    // --- ports of Go fstree/commit_test.go ---
+
+    /// A commit of `tree` with the given parents (Go `commitObj`).
+    fn commit_obj(msg: &str, tree: Key, parents: &[Key]) -> Object {
+        let id = crate::commit::Identity {
+            name: "Ann".into(),
+            email: "ann@example.com".into(),
+            when: 1,
+            tz_offset: 60,
+        };
+        let c = crate::commit::Commit {
+            tree,
+            parents: parents.to_vec(),
+            author: id.clone(),
+            committer: id,
+            message: msg.into(),
+            signature: Vec::new(),
+            public_key: Vec::new(),
+        };
+        let (key, bytes) = c.object().expect("commit encodes");
+        Object { key, bytes }
+    }
+
+    /// Two trees and a diamond of commits over them (Go `history`):
+    /// first(treeA) <- left(treeB), right(treeA) <- tip(treeB), a merge.
+    /// Returns every object plus the keys of `first` and `tip`.
+    fn history() -> (Vec<Object>, Key, Key) {
+        let mut all = complete_tree();
+        let root_a = all.last().unwrap().key;
+        let blob_c = encode_blob(b"gamma");
+        let root_b = leaf(&[Entry {
+            name: b"c.txt".to_vec(),
+            mode: 0o100644,
+            content_key: blob_c.key.as_bytes().to_vec(),
+            ..Default::default()
+        }]);
+        let first = commit_obj("first", root_a, &[]);
+        let left = commit_obj("left", root_b.key, &[first.key]);
+        let right = commit_obj("right", root_a, &[first.key]);
+        let tip = commit_obj("merge", root_b.key, &[left.key, right.key]);
+        let (first_key, tip_key) = (first.key, tip.key);
+        all.extend([blob_c, root_b, first, left, right, tip]);
+        (all, first_key, tip_key)
+    }
+
+    #[test]
+    fn child_keys_commit() {
+        let tree = leaf(&[]);
+        let p1 = commit_obj("p1", tree.key, &[]);
+        let p2 = commit_obj("p2", tree.key, &[]);
+        let c = commit_obj("merge", tree.key, &[p2.key, p1.key]);
+        // The tree, then the parents in recorded order.
+        let kids = child_keys(c.key, &c.bytes).unwrap();
+        assert_eq!(kids, vec![tree.key, p2.key, p1.key]);
+
+        let err = child_keys(c.key, b"not a commit").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "fstree: decoding Commit {}: decoding commit: unexpected EOF",
+                c.key
+            )
+        );
+    }
+
+    #[test]
+    fn reachable_keys_follows_history() {
+        let (all, _, tip) = history();
+        let store = MemStore::of(&all.iter().collect::<Vec<_>>());
+        let keys = reachable_keys(tip, store.get()).unwrap();
+        assert_eq!(keys[0], tip, "root first");
+        let mut count: HashMap<Key, usize> = HashMap::new();
+        for k in &keys {
+            *count.entry(*k).or_default() += 1;
+        }
+        for o in &all {
+            assert_eq!(
+                count.get(&o.key).copied().unwrap_or(0),
+                1,
+                "{} ({}) must be listed exactly once",
+                o.key,
+                o.key.type_()
+            );
+        }
+        assert_eq!(keys.len(), all.len());
+    }
+
+    #[test]
+    fn check_complete_follows_history() {
+        let (all, first, tip) = history();
+        let store = MemStore::of(&all.iter().collect::<Vec<_>>());
+        let visited = check_complete(tip, store.get(), store.has(), 4).unwrap();
+        assert_eq!(visited.len(), all.len());
+
+        // An ancestor commit is gone: a commit is an interior node, so this
+        // is the getter's error, not a MissingObjectError.
+        let rest: Vec<&Object> = all.iter().filter(|o| o.key != first).collect();
+        let store = MemStore::of(&rest);
+        match check_complete(tip, store.get(), store.has(), 4).unwrap_err() {
+            WalkError::Read { key, .. } => assert_eq!(key, first),
+            other => panic!("err = {other:?}, want Read of the missing ancestor"),
+        }
+
+        // A blob only the first commit's tree holds is gone: a missing leaf.
+        let blob_b = all[1].key;
+        let rest: Vec<&Object> = all.iter().filter(|o| o.key != blob_b).collect();
+        let store = MemStore::of(&rest);
+        let err = check_complete(tip, store.get(), store.has(), 4).unwrap_err();
+        assert_eq!(
+            err.missing_object().expect("MissingObjectError").key,
+            blob_b
+        );
     }
 
     // --- ports of Go collect_test.go ---

@@ -35,7 +35,7 @@ func run(outDir string) error {
 	// clean rebuild (stale packstore segments would otherwise be resumed).
 	owned := []string{
 		"keys.json", "ultracdc.json", "item_chunker.json", "filters.json",
-		"reference.json", "amberignore.json", "tar_go.tar",
+		"reference.json", "commit.json", "amberignore.json", "tar_go.tar",
 		"fstree", "amberpack", "segments_go",
 	}
 	for _, name := range owned {
@@ -74,6 +74,9 @@ func run(outDir string) error {
 	}
 	if err := genReference(outDir); err != nil {
 		return fmt.Errorf("reference.json: %w", err)
+	}
+	if err := genCommit(outDir); err != nil {
+		return fmt.Errorf("commit.json: %w", err)
 	}
 	return nil
 }

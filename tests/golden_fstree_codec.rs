@@ -145,10 +145,14 @@ fn golden_fstree_objects() {
                 assert_eq!(re.bytes, o.bytes, "object {i}: XattrSet re-encode bytes");
                 assert_eq!(re.key, o.key, "object {i}: XattrSet re-encode key");
             }
+            Type::Commit => {
+                panic!("object {i}: the golden tree holds no commits (see commit.json)")
+            }
         }
     }
 
-    // The golden tree exercises every object type.
+    // The golden tree exercises every filesystem object type; commits have
+    // their own vectors (`commit.json`, `golden_commit.rs`).
     for (t, n) in type_counts.iter().enumerate() {
         assert!(*n > 0, "no objects of type {t} in the golden tree");
     }
