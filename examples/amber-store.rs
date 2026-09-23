@@ -3,7 +3,8 @@
 //! (`<dir>/packstore` + `<dir>/refs`), same spec addressing
 //! (`KEY[/PATH]` | `ref:NAME[@PATH]`), same subcommand behavior and
 //! `ls -l`-style output. A commit key, or a reference to one, stands for the
-//! commit's tree wherever a directory is expected.
+//! commit's tree wherever a directory is expected, and so does a directory
+//! entry that holds a commit.
 
 use std::fs;
 use std::io::{self, Seek as _, SeekFrom, Write as _};
@@ -196,6 +197,10 @@ struct CommitCreateArgs {
     /// parent commit, KEY or ref:NAME; repeat for a merge, mainline first
     #[arg(long)]
     parent: Vec<String>,
+    /// change id as HEX, 1-64 bytes: an identity that follows the change when
+    /// the commit is rewritten
+    #[arg(long = "change-id", value_name = "HEX")]
+    change_id: Option<String>,
     /// point reference NAME at the new commit
     #[arg(long = "ref")]
     reference: Option<String>,
@@ -462,34 +467,31 @@ fn parse_hex_key(s: &str) -> Result<Key, CliError> {
     Ok(k)
 }
 
-/// Maps a Commit key to the directory root it records; any other key is
-/// returned unchanged. Only a spec's root can be a commit — directory entries
-/// never hold one (Go: `peelCommit`).
-fn peel_commit(objects: &packstore::Store, k: Key) -> Result<Key, CliError> {
-    if k.type_() != Type::Commit {
-        return Ok(k);
-    }
-    let data = objects
-        .get(k)
-        .map_err(|e| format!("reading commit {k}: {e}"))?;
-    let rec = Commit::decode(&data).map_err(|e| format!("commit {k}: {e}"))?;
-    Ok(rec.tree)
-}
-
 /// Resolves a slash-separated subpath from `root` and returns the target
-/// entry's content key. Every traversed segment must be an entry carrying a
-/// content key (a regular file or a directory). A Commit root stands for its
-/// tree.
+/// entry's content key, as stored. Every traversed segment must be an entry
+/// carrying a content key (a regular file or a directory). A Commit, as the
+/// root or as the content key of a directory entry on the way, stands for its
+/// tree: fstree's readers pass through it. The key returned may itself be a
+/// commit's; every reader takes it, and `fstree::dir_of` names its directory.
 fn descend(objects: &packstore::Store, root: Key, path: &str) -> Result<Key, CliError> {
-    let mut k = peel_commit(objects, root)?;
+    let mut k = root;
     for seg in path.split('/') {
         if seg.is_empty() {
             continue;
         }
         let e = fstree::lookup_entry(k, seg.as_bytes(), |kk| objects.get(kk))
             .map_err(|e| format!("resolving {path:?}: {e}"))?;
-        k = Key::parse(&e.content_key)
+        let ck = Key::parse(&e.content_key)
             .map_err(|_| format!("resolving {path:?}: {seg:?} is not a file or directory"))?;
+        // The codec does not hold an entry's content key to its mode. A
+        // commit under anything but a directory entry is a malformed tree.
+        if ck.type_() == Type::Commit && e.mode & S_IFMT != S_IFDIR {
+            return Err(format!(
+                "resolving {path:?}: {seg:?} holds a commit but is not a directory entry"
+            )
+            .into());
+        }
+        k = ck;
     }
     Ok(k)
 }
@@ -1149,13 +1151,22 @@ fn run_commit_create(cli: &Cli, a: &CommitCreateArgs) -> Result<(), CliError> {
     };
     (author.when, author.tz_offset) = (when, tz_offset);
     (committer.when, committer.tz_offset) = (when, tz_offset);
+    let mut change_id = Vec::new();
+    if let Some(h) = a.change_id.as_deref() {
+        change_id = go_hex_decode(h).map_err(|e| format!("--change-id: {e}"))?;
+        if change_id.is_empty() {
+            return Err(
+                "--change-id: empty; leave the flag out for a commit without a change id".into(),
+            );
+        }
+    }
     let ref_name = a.reference.as_deref().filter(|n| !n.is_empty());
     if let Some(name) = ref_name {
         reference::validate_name(name)?;
     }
 
     let st = open_store(cli)?;
-    let created = create_commit(cli, &st, a, author, committer, ref_name);
+    let created = create_commit(cli, &st, a, author, committer, change_id, ref_name);
     let closed = close_store(st);
     let (key, res) = match created {
         Ok(k) => (Some(k), Ok(())),
@@ -1176,10 +1187,14 @@ fn create_commit(
     a: &CommitCreateArgs,
     author: Identity,
     committer: Identity,
+    change_id: Vec<u8>,
     ref_name: Option<&str>,
 ) -> Result<Key, CliError> {
     let (root, path) = resolve_spec(&st.refs, &a.tree)?;
-    let tree = descend(&st.objects, root, &path)?;
+    let target = descend(&st.objects, root, &path)?;
+    // TREE may name a commit, as the root or through a directory entry that
+    // holds one: the new commit records that commit's tree.
+    let tree = fstree::dir_of(target, |kk| st.objects.get(kk))?;
     let mut parents = Vec::with_capacity(a.parent.len());
     for spec in &a.parent {
         let (pk, ppath) =
@@ -1199,6 +1214,9 @@ fn create_commit(
         message: a.message.clone(),
         signature: Vec::new(),
         public_key: Vec::new(),
+        change_id,
+        conflict_terms: Vec::new(),
+        conflict_labels: Vec::new(),
     };
     let (k, raw) = rec.object()?;
     // One write span from the check that the children are there to the
@@ -1226,6 +1244,13 @@ fn commit_in_span(
         if !st.objects.has(child)? {
             return Err(format!("{child} is not in the store").into());
         }
+    }
+    // A parent has to be a commit the graph walks accept. Bytes under a key of
+    // the first release's rule still decode, but no reference could ever be
+    // put on what is built on them.
+    for p in &rec.parents {
+        let data = st.objects.get(*p)?;
+        fstree::child_keys(*p, &data).map_err(|e| format!("parent {p}: {e}"))?;
     }
     st.objects.put(k, raw)?;
     let Some(name) = ref_name else {
@@ -1282,11 +1307,26 @@ fn commit_show_inner(st: &Stores, spec: &str) -> Result<(), CliError> {
 }
 
 /// Renders a commit in git's cat-file layout: headers, a blank line, then
-/// the message indented by four spaces (Go: `renderCommit`).
+/// the message indented by four spaces (Go: `renderCommit`). A conflicted
+/// tree shows its further terms after the tree, in recorded order (remove,
+/// add, remove, …), and the labels that are not empty, numbered from 0, the
+/// tree.
 fn render_commit(k: Key, c: &Commit) -> String {
     let mut b = format!("commit {k}\ntree {}\n", c.tree);
+    for (i, term) in c.conflict_terms.iter().enumerate() {
+        let side = if i % 2 == 1 { "add" } else { "remove" };
+        b.push_str(&format!("conflict-{side} {term}\n"));
+    }
+    for (i, label) in c.conflict_labels.iter().enumerate() {
+        if !label.is_empty() {
+            b.push_str(&format!("conflict-label {i} {label}\n"));
+        }
+    }
     for p in &c.parents {
         b.push_str(&format!("parent {p}\n"));
+    }
+    if !c.change_id.is_empty() {
+        b.push_str(&format!("change-id {}\n", hex::encode(&c.change_id)));
     }
     b.push_str(&format!(
         "author {}\ncommitter {}\n",
@@ -1311,9 +1351,48 @@ fn render_commit(k: Key, c: &Commit) -> String {
 fn identity_line(id: &Identity) -> String {
     let mut who = id.name.clone();
     if !id.email.is_empty() {
-        who.push_str(&format!(" <{}>", id.email));
+        if !who.is_empty() {
+            who.push(' ');
+        }
+        who.push_str(&format!("<{}>", id.email));
     }
-    format!("{who} {}", rfc3339_at(id.when, id.tz_offset))
+    let when = rfc3339_at(id.when, id.tz_offset);
+    if who.is_empty() {
+        // an identity may name nobody at all
+        return when;
+    }
+    format!("{who} {when}")
+}
+
+/// Decodes a hex string the way Go's `hex.DecodeString` does, its two error
+/// texts included: pairs are checked left to right, and a bad character is
+/// reported before an odd length.
+fn go_hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    fn nibble(c: u8) -> Result<u8, String> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            // Go formats the byte with %#U, as the code point of that value:
+            // the character is shown when strconv.IsPrint says so.
+            0x20..=0x7e | 0xa1..=0xac | 0xae..=0xff => Err(format!(
+                "encoding/hex: invalid byte: U+{c:04X} '{}'",
+                c as char
+            )),
+            _ => Err(format!("encoding/hex: invalid byte: U+{c:04X}")),
+        }
+    }
+    let src = s.as_bytes();
+    let mut out = Vec::with_capacity(src.len() / 2);
+    for pair in src.as_chunks::<2>().0 {
+        let hi = nibble(pair[0])?;
+        out.push(hi << 4 | nibble(pair[1])?);
+    }
+    if src.len() % 2 == 1 {
+        nibble(src[src.len() - 1])?;
+        return Err("encoding/hex: odd length hex string".into());
+    }
+    Ok(out)
 }
 
 /// Formats a ns-precision Unix timestamp at a fixed offset the way Go's

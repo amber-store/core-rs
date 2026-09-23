@@ -670,6 +670,9 @@ fn new_commit(tree: Key, parents: &[Key]) -> (Key, Vec<u8>) {
         message: "m".into(),
         signature: Vec::new(),
         public_key: Vec::new(),
+        change_id: Vec::new(),
+        conflict_terms: Vec::new(),
+        conflict_labels: Vec::new(),
     }
     .object()
     .unwrap()
@@ -727,6 +730,62 @@ fn commit_history_stays_live() {
     assert!(
         count_gone(&ts.objects, &keys_old) > 0,
         "no key of the old commit's tree was collected after the branch went"
+    );
+}
+
+/// A plain directory may hold a commit as the content key of a directory
+/// entry. Whatever keeps that directory alive keeps the commit, its tree and
+/// its ancestors alive; the walks follow content keys whatever their type
+/// (Go: `TestTreeHoldingACommitKeepsItsHistoryLive`).
+#[test]
+fn tree_holding_a_commit_keeps_its_history_live() {
+    let ts = new_test_store(4 << 10);
+    let c = open_collector(
+        &ts,
+        Options {
+            grace: HOUR,
+            ..Options::default()
+        },
+    );
+    let (tree_old, keys_old) = store_dir_tree(&ts.objects, "old", 40);
+    let (tree_new, keys_new) = store_dir_tree(&ts.objects, "new", 40);
+    let (_, keys_dead) = store_dir_tree(&ts.objects, "dead", 40); // never referenced
+    let first = store_commit(&ts.objects, tree_old, &[]);
+    let tip = store_commit(&ts.objects, tree_new, &[first]);
+    let holder = crate::fstree::encode_dir_leaf(&[crate::fstree::Entry {
+        name: b"vendor".to_vec(),
+        mode: 0o040755,
+        content_key: tip.as_bytes().to_vec(),
+        ..Default::default()
+    }])
+    .unwrap();
+    ts.objects.put(holder.key, &holder.bytes).unwrap();
+    // The completeness walk goes through the commit too.
+    put_test_ref(&c, &ts.refs, "site", holder.key);
+
+    backdate_packs(&ts);
+    let stats = c.run(0.0).unwrap();
+    assert!(!stats.reaped.is_empty(), "nothing reaped: {stats:?}");
+    for k in keys_old
+        .iter()
+        .chain(&keys_new)
+        .chain(&[first, tip, holder.key])
+    {
+        if let Err(e) = ts.objects.get(*k) {
+            panic!("key {k}, reachable through the commit the directory holds: {e}");
+        }
+    }
+    assert!(
+        count_gone(&ts.objects, &keys_dead) > 0,
+        "no unreferenced key was collected, so the test proves nothing"
+    );
+
+    rm_test_ref(&c, &ts.refs, "site", holder.key);
+    backdate_packs(&ts);
+    c.run(0.0).unwrap();
+    assert!(
+        count_gone(&ts.objects, &keys_old) > 0 && count_gone(&ts.objects, &keys_new) > 0,
+        "the held commit's history was not collected after the directory's reference went"
     );
 }
 

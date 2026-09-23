@@ -3,6 +3,12 @@
 //! `architecture/fstree.md`, and builds files and directories bottom-up by
 //! streaming. See `architecture/types.md` for the length-field semantics.
 //!
+//! The object-graph walks (`child_keys`, `reachable_keys`, `check_complete`)
+//! also follow Commit objects (module [`crate::commit`]), whose children are
+//! their trees — one, or every side of a conflict — and their parent commits.
+//! The directory readers take a commit for the directory it records
+//! ([`dir_of`]).
+//!
 //! Byte compatibility: every encoder in this module produces output identical
 //! to the Go implementation (fxamacker/cbor v2.9.2 core-deterministic options
 //! plus `NilContainerAsEmpty`), and every decoder accepts exactly what the Go
@@ -29,7 +35,7 @@ pub(crate) use fx::unmarshal_commit;
 pub use fx::{CborError, CborType};
 pub use read::{
     ChildKeysError, MissingObjectError, WalkError, check_complete, child_keys, collect_entries,
-    list_entries, lookup_entry, reachable_keys, resolve_entry, resolve_path, write_content,
+    dir_of, list_entries, lookup_entry, reachable_keys, resolve_entry, resolve_path, write_content,
 };
 
 /// A built CAS object: its key and its serialized bytes.

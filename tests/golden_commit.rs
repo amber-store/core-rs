@@ -3,8 +3,9 @@
 
 mod common;
 
-use amber_store_core::commit::{Commit, Identity};
-use amber_store_core::key::Key;
+use amber_store_core::commit::{self, Commit, Identity};
+use amber_store_core::fstree;
+use amber_store_core::key::{Key, Type};
 
 #[derive(serde::Deserialize)]
 struct CommitFile {
@@ -33,9 +34,18 @@ struct Case {
     signature_hex: Option<String>,
     #[serde(default)]
     public_key_hex: Option<String>,
+    #[serde(default)]
+    change_id_hex: Option<String>,
+    /// The terms of a conflicted tree after the first; absent when resolved.
+    #[serde(default)]
+    conflict_terms: Vec<String>,
+    /// One label per term counting the tree; absent when none is labelled.
+    #[serde(default)]
+    conflict_labels: Vec<String>,
     /// The canonical encoding.
     bytes_hex: String,
-    /// The commit's key: type 5, length = the encoding's byte length.
+    /// The commit's key: type 5, length = the footprint — the encoding's byte
+    /// length plus the length fields of the tree and of every conflict term.
     key: String,
     /// The encoding without the signature field.
     signature_payload_hex: String,
@@ -79,6 +89,13 @@ fn golden_commit() {
             message: c.message.clone(),
             signature: opt_hex(&c.signature_hex, "signature", i),
             public_key: opt_hex(&c.public_key_hex, "public key", i),
+            change_id: opt_hex(&c.change_id_hex, "change id", i),
+            conflict_terms: c
+                .conflict_terms
+                .iter()
+                .map(|t| key_of(t, "conflict term", i))
+                .collect(),
+            conflict_labels: c.conflict_labels.clone(),
         };
 
         // Encode and key must byte-match the Go implementation.
@@ -104,6 +121,36 @@ fn golden_commit() {
             c.name
         );
 
+        // The key carries the footprint: own bytes plus every tree, never a
+        // parent. The walks hold it to that, and list the trees, then the
+        // parents, as the commit's children.
+        assert_eq!(key.type_(), Type::Commit, "case {i} ({:?})", c.name);
+        let trees_len: u64 = commit.trees().iter().map(Key::length).sum();
+        assert_eq!(
+            key.length(),
+            enc.len() as u64 + trees_len,
+            "case {i} ({:?}): length field is not the footprint",
+            c.name
+        );
+        assert_eq!(
+            commit::footprint(enc.len() as u64, &commit.trees()),
+            Ok(key.length())
+        );
+        let mut children = commit.trees();
+        children.extend(&commit.parents);
+        assert_eq!(
+            fstree::child_keys(key, &enc).unwrap(),
+            children,
+            "case {i} ({:?}): children",
+            c.name
+        );
+        let old_rule = Key::new(Type::Commit, enc.len() as u64, &enc);
+        assert!(
+            fstree::child_keys(old_rule, &enc).is_err(),
+            "case {i} ({:?}): a key of the own-bytes rule was accepted",
+            c.name
+        );
+
         // Decode must accept the canonical bytes and recover every field.
         let want = hex::decode(&c.bytes_hex).unwrap();
         let dec = Commit::decode(&want)
@@ -114,4 +161,27 @@ fn golden_commit() {
             c.name
         );
     }
+
+    // The two vectors annotated in architecture/commits.md.
+    for (name, key) in [
+        (
+            "merge",
+            "50afd48693e2ae8418fb83d0459174df45ba5fdddef67376e74ac6893a5abbed",
+        ),
+        (
+            "conflicted",
+            "5201139f190aa234ad713392987671d47e7e3292a613c62e3d14a85d614b300b",
+        ),
+    ] {
+        let c = file
+            .cases
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("commit.json has no case {name:?}"));
+        assert_eq!(c.key, key, "the documented {name} vector");
+    }
+    assert!(
+        file.cases.iter().any(|c| c.conflict_terms.len() == 254),
+        "commit.json has no case with the maximum number of conflict terms"
+    );
 }

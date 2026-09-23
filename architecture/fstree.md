@@ -59,7 +59,8 @@ nothing (the key simply does not appear):
   4: int   mtime,       ; nanoseconds since the Unix epoch (may be negative)
 
   ; exactly one payload, selected by the type bits in `mode`:
-  5: bstr<32> contentKey,           ; S_IFREG / S_IFDIR
+  5: bstr<32> contentKey,           ; S_IFREG → Blob / FileNode
+  ;                                   S_IFDIR → DirLeaf / DirNode, or a Commit (below)
   6: bstr     linkTarget,           ; S_IFLNK  → inline target path
   7: [uint major, uint minor],      ; S_IFCHR / S_IFBLK → device numbers
   ;                                   S_IFIFO / S_IFSOCK → none of 5/6/7
@@ -69,6 +70,20 @@ nothing (the key simply does not appear):
   9: bstr<32> xattrsKey,            ; spilled XattrSet key (large)
 }
 ```
+
+**A directory entry may hold a commit.** The content key of an `S_IFDIR` entry
+is a `DirLeaf` or `DirNode` key, or the key of a [`Commit`](commits.md), which
+stands for the directory that commit records (its tree; the first side, when the
+tree is conflicted). Readers pass through it: `LookupEntry`, `ListEntries` and
+`CollectEntries` take a commit key wherever they take a directory key and
+continue with its tree, and `DirOf` names the directory a key stands for. A
+commit's tree is never a commit, so one step suffices. The commit is a child of
+the leaf like any content key, so its tree and its history are reachable,
+required for completeness, and kept alive through the directory. A commit
+stands nowhere else: not inside a directory's own index (the child of a
+`DirNode` is a `DirNode` or a `DirLeaf`), and not under an entry of another
+type. The codec does not hold a content key to its entry's mode, so the latter
+is a malformed tree that decodes; path resolution refuses it.
 
 Folding the file type into `mode` (the POSIX way) means there is no separate type
 field; the reader masks `mode & S_IFMT` to learn which payload key is present.
@@ -143,7 +158,9 @@ The writer fills each key's length field while building (see
 - `DirLeaf.length` = **own serialized bytes** + Σ over entries of `contentKey.length`
   (`S_IFREG`/`S_IFDIR`) + `xattrsKey.length` (entries with spilled xattrs). Other
   entry types add nothing beyond own bytes — their inline data is already counted in
-  the serialized leaf.
+  the serialized leaf. An entry that holds a `Commit` key adds that key's length
+  like any other: the commit's own bytes plus the trees it records, never its
+  parents ([commits.md](commits.md#the-key)).
 
 ## Read paths
 

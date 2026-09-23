@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use crate::amberpack::{REC_HEADER_SIZE, decode_payload, parse_record};
+use crate::commit::{self, Commit};
 use crate::key::{Key, Type};
 
 use super::footer::{IndexEntry, SealedSegment, build_index_section, filter_key};
@@ -124,11 +125,14 @@ impl SealedSegment {
 }
 
 /// Recomputes `k` from `data` and reports a verification-failure message on
-/// mismatch (the complete `ErrVerify`-prefixed text Go produces). For Blob,
-/// XattrSet and Commit — whose key length is the serialized byte length — it
-/// also checks the length field. Aggregate types (FileNode/DirLeaf/DirNode) carry
-/// a logical length the store cannot recompute without parsing, so only their
-/// hash is checked (Go: `verifyObject`).
+/// mismatch (the complete `ErrVerify`-prefixed text Go produces). For Blob
+/// and XattrSet, whose key length is the serialized byte length, it also
+/// checks the length field; and for Commit, whose length is a footprint — own
+/// bytes plus the trees it records — which the commit's own bytes suffice to
+/// recompute. A commit that does not decode fails verification. The other
+/// aggregate types (FileNode/DirLeaf/DirNode) carry a logical length the
+/// store does not recompute, so only their hash is checked (Go:
+/// `verifyObject`).
 pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
     let sum = *blake3::hash(data).as_bytes();
     let raw_type = k.as_bytes()[0] >> 4;
@@ -144,12 +148,30 @@ pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
             "packstore: object verification failed: payload hashes to {want}, not {k}"
         ));
     }
-    if matches!(t, Type::Blob | Type::XattrSet | Type::Commit) && k.length() != data.len() as u64 {
-        return Err(format!(
-            "packstore: object verification failed: {k} length field {} != payload {}",
-            k.length(),
-            data.len()
-        ));
+    match t {
+        Type::Blob | Type::XattrSet => {
+            if k.length() != data.len() as u64 {
+                return Err(format!(
+                    "packstore: object verification failed: {k} length field {} != payload {}",
+                    k.length(),
+                    data.len()
+                ));
+            }
+        }
+        Type::Commit => {
+            let c = Commit::decode(data)
+                .map_err(|e| format!("packstore: object verification failed: {k}: {e}"))?;
+            let want = commit::footprint(data.len() as u64, &c.trees())
+                .map_err(|e| format!("packstore: object verification failed: {k}: {e}"))?;
+            if k.length() != want {
+                return Err(format!(
+                    "packstore: object verification failed: {k} length field {} != footprint {want} (own {} bytes plus its trees)",
+                    k.length(),
+                    data.len()
+                ));
+            }
+        }
+        Type::FileNode | Type::DirLeaf | Type::DirNode => {}
     }
     Ok(())
 }
@@ -157,23 +179,88 @@ pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::verify_object;
-    use crate::key::{Key, Type};
+    use crate::commit::{Commit, Identity};
+    use crate::key::{Key, SIZE, Type};
 
-    /// Port of Go `TestVerifyObjectChecksCommitLength`.
+    /// Port of Go `TestVerifyObjectChecksCommitLength`. A commit's length
+    /// field is a footprint: its own bytes plus every tree it records. The
+    /// store checks it, decoding the commit to learn the trees.
     #[test]
     fn verify_object_checks_commit_length() {
-        // verify_object does not parse payloads, so any bytes serve.
-        let data = b"stand-in for a commit's canonical CBOR";
-        let good = Key::new(Type::Commit, data.len() as u64, data);
-        assert_eq!(verify_object(good, data), Ok(()));
-        // Same payload hash, but a length field that lies about the byte length.
-        let bad = Key::new(Type::Commit, data.len() as u64 + 1, data);
+        const PREFIX: &str = "packstore: object verification failed:";
+        let tree = Key::new(Type::DirLeaf, 1, &[0x80]);
+        let id = Identity {
+            name: "Ann".into(),
+            when: 1,
+            ..Default::default()
+        };
+        let resolved = Commit {
+            tree,
+            parents: Vec::new(),
+            author: id.clone(),
+            committer: id,
+            message: "m".into(),
+            signature: Vec::new(),
+            public_key: Vec::new(),
+            change_id: Vec::new(),
+            conflict_terms: Vec::new(),
+            conflict_labels: Vec::new(),
+        };
+        let (good, data) = resolved.object().unwrap();
+        assert_eq!(verify_object(good, &data), Ok(()), "an honest commit key");
+        // The rule of the first release: own bytes only. Same hash, wrong length.
+        let own = data.len();
+        let own_only = Key::new(Type::Commit, own as u64, &data);
         assert_eq!(
-            verify_object(bad, data),
+            verify_object(own_only, &data),
             Err(format!(
-                "packstore: object verification failed: {bad} length field {} != payload {}",
-                data.len() + 1,
-                data.len()
+                "{PREFIX} {own_only} length field {own} != footprint {} (own {own} bytes plus its trees)",
+                own + 1
+            )),
+            "a length that leaves the tree out"
+        );
+
+        let mut h = [0u8; SIZE];
+        h[0] = 1;
+        let remove = Key::new_from_hash(Type::DirLeaf, 300, h);
+        h[0] = 2;
+        let add = Key::new_from_hash(Type::DirNode, 70000, h);
+        let mut conflicted = resolved.clone();
+        conflicted.conflict_terms = vec![remove, add];
+        let (good_c, data_c) = conflicted.object().unwrap();
+        assert_eq!(
+            verify_object(good_c, &data_c),
+            Ok(()),
+            "an honest conflicted commit key"
+        );
+        let own = data_c.len();
+        let first_tree_only = Key::new(Type::Commit, own as u64 + tree.length(), &data_c);
+        assert_eq!(
+            verify_object(first_tree_only, &data_c),
+            Err(format!(
+                "{PREFIX} {first_tree_only} length field {} != footprint {} (own {own} bytes plus its trees)",
+                own + 1,
+                own + 1 + 300 + 70000
+            )),
+            "a length that leaves conflict terms out"
+        );
+
+        // Bytes that are no commit fail verification, whatever their length.
+        let junk = b"not a commit";
+        let k = Key::new(Type::Commit, junk.len() as u64, junk);
+        assert_eq!(
+            verify_object(k, junk),
+            Err(format!("{PREFIX} {k}: decoding commit: unexpected EOF"))
+        );
+
+        // A record that decodes but whose footprint no key can carry.
+        conflicted.conflict_terms = vec![Key::new_from_hash(Type::DirNode, u64::MAX, h), add];
+        let data_h = conflicted.encode().unwrap();
+        let k = Key::new(Type::Commit, data_h.len() as u64, &data_h);
+        assert_eq!(
+            verify_object(k, &data_h),
+            Err(format!(
+                "{PREFIX} {k}: commit footprint overflows the key's length field"
             ))
         );
     }

@@ -186,3 +186,12 @@ rules.
 - `apply_meta` chowns before chmodding, since chown(2) clears
   setuid/setgid. The ported setuid test, like Go's, only exercises the
   path as root (it returns early otherwise, Rust's nearest t.Skip).
+
+## Go PR #15 backport (2026-09-23)
+
+`write` accepts a Commit root, which stands for its tree, and a commit held
+by an `S_IFDIR` entry exports as a plain directory: both come from
+`fstree::collect_entries`, which takes a commit for the directory it records.
+The commit objects themselves never reach the archive. Port of Go
+`TestWrite_ReadsThroughACommit`; the differential run compared archive bytes
+for 28 roots (`port-notes/commit.md`).

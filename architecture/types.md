@@ -21,7 +21,8 @@ Keep these separate — it is the foundation of the whole model:
    **no CAS object at all**: their data is stored inline in the parent directory.
 
 A regular-file or subdirectory entry holds a **content key** (and that key's header
-reveals whether it is a `Blob`, `FileNode`, `DirLeaf`, or `DirNode`). A symlink,
+reveals whether it is a `Blob`, `FileNode`, `DirLeaf`, or `DirNode` — or, for a
+subdirectory, a `Commit`, which stands for the directory it records). A symlink,
 device, fifo, or socket entry holds its small data **inline** and references no key.
 
 ## CAS object types
@@ -32,10 +33,10 @@ The 4-bit type field has 16 slots; 6 are defined.
 |------|------------|------------------------------------------------------------------|---------------------------------|----------------------|
 | 0    | `Blob`     | Raw file-content byte chunk (a CDC leaf). A single-chunk file *is* one `Blob`. | own serialized byte length      | —                    |
 | 1    | `FileNode` | File chunk-index node, keyed by byte offset (file content tree).  | **total file content bytes (= file size)** | `FileNode` / `Blob`  |
-| 2    | `DirLeaf`  | A contiguous run of complete directory entries (prolly-tree leaf).| **own bytes + subtree footprint** | (entries are inline) |
+| 2    | `DirLeaf`  | A contiguous run of complete directory entries (prolly-tree leaf).| **own bytes + subtree footprint** | (entries are inline); their content keys: `Blob` / `FileNode`, `DirLeaf` / `DirNode` / `Commit`, `XattrSet` |
 | 3    | `DirNode`  | Directory index node, keyed by entry name (directory tree).      | **own bytes + subtree footprint** | `DirNode` / `DirLeaf`|
 | 4    | `XattrSet` | Spilled extended attributes, when too large to store inline.     | own serialized byte length      | —                    |
-| 5    | `Commit`   | Snapshot record: a directory root, parent commits, author, committer, message ([commits.md](commits.md)). | own serialized byte length      | `DirLeaf` / `DirNode` (tree), `Commit` (parents) |
+| 5    | `Commit`   | Snapshot record: a directory root (or the sides of a conflict), parent commits, author, committer, message, change id ([commits.md](commits.md)). | **own bytes + the footprints of its trees**; parents are not counted | `DirLeaf` / `DirNode` (tree and conflict terms), `Commit` (parents) |
 | 6–15 | reserved   | Must not be emitted.                                             | —                               | —                    |
 
 **Leaf and internal nodes are distinct types** (`Blob`/`FileNode`,
@@ -49,7 +50,7 @@ The key's hash always covers the object's **serialized bytes**. The key's
 **length field**, however, carries a *logical* size for the aggregate types — this
 extends the rule [keys.md](keys.md) already states for directories:
 
-- `Blob`, `XattrSet`, `Commit`: length = the object's own serialized byte length.
+- `Blob`, `XattrSet`: length = the object's own serialized byte length.
 - `FileNode`: length = total bytes of the file region it covers — i.e. the file's
   **content size**, *excluding* this node's own index bytes. This buys **O(1)
   `stat`** (a file's size is read from the `contentKey` already inline in its parent
@@ -58,12 +59,20 @@ extends the rule [keys.md](keys.md) already states for directories:
 - `DirLeaf`, `DirNode`: length = **own serialized bytes + the cumulative length of
   every child** → a true `du`-style footprint of the directory subtree, in O(1) from
   any node.
+- `Commit`: length = **own serialized bytes + the length of its tree and of every
+  conflict term** → the footprint of the snapshot it records. Its **parents are
+  not counted**, although they are children: a merge would count the history its
+  parents share twice, doubling the value at every merge until the 8-byte field
+  overflows, and a directory that holds a commit would report the size of a whole
+  history ([commits.md](commits.md#the-key)). The commit's own bytes name its
+  trees, so the store recomputes and verifies this length.
 
 For directories the cumulative therefore counts, across the whole subtree: every
 regular file's content bytes, every directory object's (`DirLeaf`/`DirNode`) own
 serialized bytes, and every spilled `XattrSet`'s bytes. It does **not** count
 `FileNode` index bytes — those belong to the file, whose key exposes only its
-content size. Concretely:
+content size. A commit held by an entry counts with its own footprint: its bytes
+and its trees, not its history. Concretely:
 
 - `DirNode.length` = own serialized bytes + Σ `childKey.length`.
 - `DirLeaf.length` = own serialized bytes + Σ over entries of `contentKey.length`
@@ -80,7 +89,7 @@ lives:
 | Entry type        | `S_IFMT`   | Payload                                   |
 |-------------------|------------|-------------------------------------------|
 | regular file      | `S_IFREG`  | content key → `Blob` or `FileNode`        |
-| directory         | `S_IFDIR`  | content key → `DirLeaf` or `DirNode`      |
+| directory         | `S_IFDIR`  | content key → `DirLeaf` or `DirNode`, or a `Commit`, which reads as its tree |
 | symbolic link     | `S_IFLNK`  | inline target path                        |
 | character device  | `S_IFCHR`  | inline `rdev` (major, minor)              |
 | block device      | `S_IFBLK`  | inline `rdev` (major, minor)              |
@@ -132,5 +141,12 @@ hold root ownership/mode/mtime later if needed.
 
 A [`Commit`](commits.md) is the snapshot record in content-addressed form: it
 names a root directory and carries who recorded it, when, why, and which
-commits it follows. Its children in the object graph are that tree and its
+commits it follows; for [jj](https://jj-vcs.github.io/jj/) it also carries a
+change id and, when the tree is conflicted, every side of the conflict. Its
+children in the object graph are its tree, the further conflict terms and its
 parent commits, so whatever keeps a commit alive keeps its history alive.
+
+A directory entry may hold a commit where a subdirectory's key would stand
+([commits.md](commits.md#commits-inside-directories)). Every file operation
+reads through it to the commit's tree, and the commit object itself is skipped;
+the object graph keeps the commit and its history alive with the directory.

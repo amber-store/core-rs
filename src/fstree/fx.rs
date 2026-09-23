@@ -687,8 +687,8 @@ pub(crate) fn unmarshal_commit(data: &[u8]) -> Result<WireCommit, CborError> {
     }
 }
 
-/// Go struct-field diagnostic names for `commit.wireCommit` keys 0–6.
-const WIRE_COMMIT_FIELDS: [&str; 7] = [
+/// Go struct-field diagnostic names for `commit.wireCommit` keys 0–9.
+const WIRE_COMMIT_FIELDS: [&str; 10] = [
     "commit.wireCommit.0",
     "commit.wireCommit.1",
     "commit.wireCommit.2",
@@ -696,6 +696,9 @@ const WIRE_COMMIT_FIELDS: [&str; 7] = [
     "commit.wireCommit.4",
     "commit.wireCommit.5",
     "commit.wireCommit.6",
+    "commit.wireCommit.7",
+    "commit.wireCommit.8",
+    "commit.wireCommit.9",
 ];
 
 /// Go struct-field diagnostic names for `commit.wireIdentity` keys 0–3.
@@ -2180,7 +2183,7 @@ impl<'a> Dec<'a> {
     fn parse_to_wire_commit(&mut self) -> (WireCommit, Option<CborError>) {
         self.parse_to_struct("commit.wireCommit", |d| {
             let mut w = WireCommit::default();
-            let err = d.parse_map_to_struct(7, |d, k| {
+            let err = d.parse_map_to_struct(10, |d, k| {
                 let err = match k {
                     0 => {
                         let (v, err) = d.parse_to_bytes("[]uint8");
@@ -2212,9 +2215,24 @@ impl<'a> Dec<'a> {
                         w.signature = v;
                         err
                     }
-                    _ => {
+                    6 => {
                         let (v, err) = d.parse_to_bytes("[]uint8");
                         w.public_key = v;
+                        err
+                    }
+                    7 => {
+                        let (v, err) = d.parse_to_bytes("[]uint8");
+                        w.change_id = v;
+                        err
+                    }
+                    8 => {
+                        let (v, err) = d.parse_to_byte_slices();
+                        w.conflict_terms = v;
+                        err
+                    }
+                    _ => {
+                        let (v, err) = d.parse_to_strings();
+                        w.conflict_labels = v;
                         err
                     }
                 };
@@ -2226,6 +2244,14 @@ impl<'a> Dec<'a> {
 
     fn parse_to_byte_slices(&mut self) -> (Vec<Vec<u8>>, Option<CborError>) {
         self.parse_to_slice_of("[][]uint8", |d| d.parse_to_bytes("[]uint8"))
+    }
+
+    /// Decodes into Go `[]string` (a commit's conflict labels). An element
+    /// that is not a text string is a type error against `string`, not
+    /// against the slice: `parseArrayToSlice` keeps the first element error
+    /// and decodes on.
+    fn parse_to_strings(&mut self) -> (Vec<String>, Option<CborError>) {
+        self.parse_to_slice_of("[]string", |d| d.parse_to_string())
     }
 
     fn parse_to_entries(&mut self) -> (Vec<Entry>, Option<CborError>) {
