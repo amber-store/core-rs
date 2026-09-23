@@ -127,16 +127,31 @@ impl Core {
         // a PUT in flight commits or aborts before the snapshot; every
         // later PUT greys its walked closure, every later ingest its
         // written keys.
-        let roots = {
+        //
+        // Other processes are held to the simpler safe policy, quiesce: from
+        // here to the end of the cycle the store's gate keeps their writers
+        // and their reference PUTs out (`packstore::Store::begin_sweep`), and
+        // the view taken now is complete and stable. The gate is taken and
+        // dropped under the reference lock, with no local span in flight,
+        // because a file lock cannot be turned from shared into exclusive
+        // atomically.
+        let (sweep, roots) = {
             let _ref = write_lock(&self.ref_lock);
+            let sweep =
+                self.objects
+                    .begin_sweep(&|| cancel.is_canceled())
+                    .map_err(|e| match e {
+                        crate::packstore::Error::GateCanceled => Error::Canceled,
+                        e => Error::Objects(e),
+                    })?;
             self.objects.begin_barrier();
-            self.roots()
-        };
-        let roots = match roots {
-            Ok(roots) => roots,
-            Err(e) => {
-                self.objects.abort_barrier();
-                return Err(e);
+            match self.roots() {
+                Ok(roots) => (sweep, roots),
+                Err(e) => {
+                    self.objects.abort_barrier();
+                    drop(sweep); // under the reference lock
+                    return Err(e);
+                }
             }
         };
 
@@ -147,24 +162,28 @@ impl Core {
         if let Some(hook) = hook {
             hook();
         }
+        if let Ok(live) = &live {
+            stats.marked = live.marked();
+            stats.mark_duration = t0.elapsed(); // includes the snapshot
+        }
+
+        // Sweep, excluding reference publication. Compact consumes the grey
+        // set, seals the active segment, rewrites the victims and deletes
+        // them once the copies are durable. A failed or cancelled mark comes
+        // through here as well: the gate goes under the reference lock.
+        let _ref = write_lock(&self.ref_lock);
+        let _sweep = sweep; // declared after `_ref`, so dropped before it
         let live = match live {
-            Ok(live) => live,
+            Ok(live) if !cancel.is_canceled() => live,
+            Ok(_) => {
+                self.objects.abort_barrier();
+                return Err(Error::Canceled);
+            }
             Err(e) => {
                 self.objects.abort_barrier();
                 return Err(e);
             }
         };
-        stats.marked = live.marked();
-        stats.mark_duration = t0.elapsed(); // includes the snapshot
-
-        // Sweep, excluding reference publication. Compact consumes the grey
-        // set, seals the active segment, rewrites the victims and deletes
-        // them once the copies are durable.
-        let _ref = write_lock(&self.ref_lock);
-        if cancel.is_canceled() {
-            self.objects.abort_barrier();
-            return Err(Error::Canceled);
-        }
         let mut opts = CompactOpts {
             min_dead_ratio: threshold,
             // Go's `time.Now().Add(-grace)` cannot fail; `SystemTime` can

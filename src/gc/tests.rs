@@ -17,7 +17,7 @@ use crate::refstore;
 
 use super::{Collector, Options, free_below, lock, throttle_owed};
 
-const HOUR: Duration = Duration::from_secs(60 * 60);
+pub(super) const HOUR: Duration = Duration::from_secs(60 * 60);
 
 // ---------------------------------------------------------------------------
 // Go math/rand/v2 PCG (test-only; go-spec §5.4). The oracle and the tree
@@ -150,15 +150,15 @@ fn pcg_matches_go_reference_draws() {
 
 /// An open packstore+refstore pair in one temp dir (Go: `testStore`; the
 /// stores drop-close after any collector, whose `Drop` closes it first).
-struct TestStore {
-    dir: PathBuf,
-    objects: Arc<packstore::Store>,
-    refs: Arc<refstore::Store>,
+pub(super) struct TestStore {
+    pub(super) dir: PathBuf,
+    pub(super) objects: Arc<packstore::Store>,
+    pub(super) refs: Arc<refstore::Store>,
     _tmp: TempDir,
 }
 
 /// Go: `newTestStore`. Packstore sync stays at its default (true), as in Go.
-fn new_test_store(seg_size: u64) -> TestStore {
+pub(super) fn new_test_store(seg_size: u64) -> TestStore {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().to_path_buf();
     let objects = Arc::new(
@@ -178,7 +178,7 @@ fn new_test_store(seg_size: u64) -> TestStore {
 }
 
 /// Go: `(*testStore).openCollector`.
-fn open_collector(ts: &TestStore, opts: Options) -> Collector {
+pub(super) fn open_collector(ts: &TestStore, opts: Options) -> Collector {
     Collector::open(
         ts.dir.join("closures"),
         Arc::clone(&ts.objects),
@@ -192,7 +192,7 @@ fn open_collector(ts: &TestStore, opts: Options) -> Collector {
 /// derived from `seed` and returns the root and every key. Incompressible
 /// payloads keep on-disk sizes predictable so small segment sizes actually
 /// rotate (Go: `storeTree`).
-fn store_tree(objects: &packstore::Store, seed: &str, n: usize) -> (Key, Vec<Key>) {
+pub(super) fn store_tree(objects: &packstore::Store, seed: &str, n: usize) -> (Key, Vec<Key>) {
     let base = u64::from(crc32_ieee(seed.as_bytes()));
     let mut children = Vec::new();
     let mut all = Vec::new();
@@ -212,7 +212,7 @@ fn store_tree(objects: &packstore::Store, seed: &str, n: usize) -> (Key, Vec<Key
 
 /// Writes a reference through the collector exactly as a CLI/daemon PUT
 /// does (Go: `putTestRef`).
-fn put_test_ref(c: &Collector, refs: &refstore::Store, name: &str, root: Key) {
+pub(super) fn put_test_ref(c: &Collector, refs: &refstore::Store, name: &str, root: Key) {
     let rec = Reference {
         name: name.to_string(),
         key: root.as_bytes().to_vec(),
@@ -247,14 +247,14 @@ fn put_test_ref(c: &Collector, refs: &refstore::Store, name: &str, root: Key) {
 }
 
 /// Go: `rmTestRef`.
-fn rm_test_ref(c: &Collector, refs: &refstore::Store, name: &str, root: Key) {
+pub(super) fn rm_test_ref(c: &Collector, refs: &refstore::Store, name: &str, root: Key) {
     refs.delete(name).unwrap();
     c.release_ref(root).unwrap();
 }
 
 /// Pushes every sealed pack's mtime behind any grace period (Go:
 /// `backdatePacks`, via `os.Chtimes`).
-fn backdate_packs(ts: &TestStore) {
+pub(super) fn backdate_packs(ts: &TestStore) {
     let dir = ts.dir.join("packstore");
     let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
     for entry in fs::read_dir(&dir).unwrap() {
@@ -681,7 +681,7 @@ fn store_commit(objects: &packstore::Store, tree: Key, parents: &[Key]) -> Key {
     k
 }
 
-fn count_gone(objects: &packstore::Store, keys: &[Key]) -> usize {
+pub(super) fn count_gone(objects: &packstore::Store, keys: &[Key]) -> usize {
     keys.iter()
         .filter(|k| matches!(objects.get(**k), Err(ref e) if e.is_not_found()))
         .count()

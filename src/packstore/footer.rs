@@ -11,6 +11,7 @@ use crate::amberpack::{REC_HEADER_SIZE, decode_payload};
 use crate::binaryfuse::{BinaryFuse16, SECTION_HEADER_SIZE};
 use crate::key::{self, Key};
 
+use super::view::FileIdent;
 use super::{Error, MAGIC_HEADER, MAGIC_TRAILER, TAG_SEAL, be_u32, corrupt};
 
 /// 256 cumulative u32 counts on the key's last byte.
@@ -321,6 +322,9 @@ pub(crate) fn parse_footer(mm: &[u8]) -> Result<FooterView, Error> {
 pub(crate) struct SealedSegment {
     pub id: u64,
     pub path: PathBuf,
+    /// Which file this is: a repair replaces a segment under its name, and
+    /// an id can come back (Go: `fi`).
+    pub ident: FileIdent,
     pub mm: Mmap,
     pub fv: FooterView,
 }
@@ -359,6 +363,7 @@ impl SealedSegment {
         Ok(SealedSegment {
             id,
             path: path.to_path_buf(),
+            ident: FileIdent::of(&st),
             mm,
             fv,
         })

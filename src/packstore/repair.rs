@@ -8,6 +8,7 @@ use crate::key::Key;
 use super::compact::all_entries;
 use super::footer::{IndexEntry, SealedSegment, build_footer};
 use super::verify::verify_object;
+use super::view::publish_sealed;
 use super::{Error, MAGIC_HEADER, Store, unpoison};
 
 fn valid_record(key: Key, bytes: &[u8]) -> bool {
@@ -48,7 +49,7 @@ impl Store {
     /// An error can leave some copies repaired; retrying is safe.
     pub fn put_verified(&self, key: Key, data: &[u8]) -> Result<(), Error> {
         verify_object(key, data).map_err(|msg| Error::Corrupt { msg, verify: true })?;
-        let _write_token = self.begin_write();
+        let _write_token = self.begin_write_token()?;
         self.observe(key);
         let mut ap = self.append_lock();
         {
@@ -88,12 +89,14 @@ impl Store {
         if !damaged {
             // A concurrent batch can publish a record before its final sync.
             if self.cfg.sync
-                && let Some(active) = &ap.active
+                && let Some(active) = ap.active.as_mut()
                 && unpoison(active.seg.index.read()).contains_key(&key)
-                && let Err(error) = active.seg.f.sync_all()
             {
-                self.set_failed(&error);
-                return Err(error.into());
+                if let Err(error) = active.seg.f.sync_all() {
+                    self.set_failed(&error);
+                    return Err(error.into());
+                }
+                active.sidecar_synced();
             }
             return Ok(());
         }
@@ -116,8 +119,8 @@ impl Store {
             let mut entries: Vec<_> = all_entries(&segment).collect();
             entries.sort_by_key(|entry| entry.off);
             let temporary = segment.path.with_extension("repair");
-            // The directory flock excludes another writer. A previous crash
-            // may have left an unpublished file with this ignored suffix.
+            // A previous crash may have left an unpublished file with this
+            // ignored suffix.
             match fs::remove_file(&temporary) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -166,13 +169,10 @@ impl Store {
                     self.set_failed(&error);
                     return Err(error.into());
                 }
+                // The replacement takes the segment's place by id. Readers
+                // that hold the old mapping keep it until they let go.
                 let mut shared = unpoison(self.shared.write());
-                let position = shared
-                    .sealed
-                    .iter()
-                    .position(|item| item.id == segment.id)
-                    .ok_or_else(|| super::corrupt("repair segment disappeared"))?;
-                shared.sealed[position] = Arc::new(ready);
+                publish_sealed(&mut shared, Arc::new(ready));
                 Ok(())
             })();
             if replace.is_err() {

@@ -95,12 +95,58 @@ live tree object (blobs are marked from the index alone, never read).
 The copy loop itself is the same job in both designs; here it re-verifies
 payloads while copying and batches its fsyncs at the end.
 
+## Across processes
+
+Everything above holds inside one process: the grey set and the reference
+lock are memory. Stores in other processes are held to the simpler policy the
+model also proves safe, *quiesce* (`specs/gc.qnt`). From before the roots
+snapshot until after the sweep the cycle holds the packstore's gate
+(`gc.lock`, [packstore.md](packstore.md#the-gate-writers-against-a-sweep))
+exclusively, and every write span and reference PUT elsewhere holds it shared.
+So while a cycle runs, writers and PUTs in other processes wait, readers never
+do, and writers in the collector's own process run through the mark behind
+the barrier exactly as described above.
+
+- The gate is taken under the cycle's first reference lock and dropped under
+  its last, with no local span in flight: a file lock cannot be turned from
+  shared into exclusive atomically, so it is never converted. The wait for
+  other processes' spans therefore happens with local writers stalled: the
+  "mark waits for ingests to drain" moment, extended to other processes.
+- Having taken the gate, the collector lists the store directory once more;
+  its view is then complete and stable. The mark set covers every active
+  segment, its own and others'.
+- The sweep seals the active segments no writer holds, besides the
+  collector's own, so that a small store, whose segments never fill, still
+  gets collected. A segment held by a live writer is left alone.
+- Whoever takes the gate exclusively moves a generation in `gc.lock` on,
+  counting from the file, before it deletes anything. A store that finds it
+  moved, and any store on its first write span, lists the directory before its
+  next duplicate check, which could otherwise hit a record in a segment that
+  was reaped under it.
+- Objects written by another process and not yet referenced when a cycle
+  starts are protected by the grace period alone. A writer that wants more
+  brackets its writes and the reference PUT in one span,
+  `Collector.BeginSpan`, as `amber-store ingest --ref` and `commit create
+  --ref` do. The span takes the reference lock and then the gate, the order a
+  cycle takes them in, and prepares references without taking either again
+  (`Span.PrepareRef`). A `packstore.BeginWrite` span held across
+  `Collector.PrepareRef` takes them the other way round and can deadlock
+  against a cycle of the same process.
+- Spans nest: a write inside an open span never waits for a sweep that is
+  waiting for that span.
+- `Status` looks at the store directory again before its advisory mark. The
+  references it marks from are everybody's; the view of the objects is its
+  own store's, as of that store's last look.
+- A store that just swept leaves the gate alone for 100 ms before sweeping
+  again; back-to-back sweeps would otherwise starve a writer that polls for
+  the lock from another process.
+
 ## Layout
 
 ```
-<store>/packstore/   unchanged
+<store>/packstore/   segments, the sidecar indexes of active ones, gc.lock (packstore.md)
 <store>/closures/    kept, empty: swept at open (simple-gc migration)
-<store>/refs/        unchanged
+<store>/refs/        refs.sqlite (references.md)
 ```
 
 A store previously run under simple-gc opens cleanly: closure files are

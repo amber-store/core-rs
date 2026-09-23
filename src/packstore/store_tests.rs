@@ -54,14 +54,14 @@ fn glob_suffix(dir: &Path, suffix: &str) -> Vec<std::path::PathBuf> {
     out
 }
 
-fn sealed_files(dir: &Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn sealed_files(dir: &Path) -> Vec<std::path::PathBuf> {
     glob_suffix(dir, ".seg")
         .into_iter()
         .filter(|p| !p.to_string_lossy().ends_with(".seg.active"))
         .collect()
 }
 
-fn active_files(dir: &Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn active_files(dir: &Path) -> Vec<std::path::PathBuf> {
     glob_suffix(dir, ".seg.active")
 }
 
@@ -305,33 +305,8 @@ fn reopen_truncates_corrupt_tail() {
     assert_eq!(s3.get(o.key).unwrap(), o.data, "get after second reopen");
 }
 
-#[test]
-fn second_open_fails() {
-    let dir = TempDir::new().unwrap();
-    let _s = Store::open(dir.path()).unwrap();
-    assert!(
-        Store::open(dir.path()).is_err(),
-        "second open must fail while the first holds the flock"
-    );
-}
-
-#[test]
-fn multiple_active_files_fail_open() {
-    let dir = TempDir::new().unwrap();
-    for name in ["0000000000000001.seg.active", "0000000000000002.seg.active"] {
-        fs::write(dir.path().join(name), MAGIC_HEADER).unwrap();
-    }
-    let err = Store::open(dir.path()).unwrap_err();
-    assert!(
-        err.is_corrupt(),
-        "want corrupt error for two active segments: {err}"
-    );
-    assert_eq!(
-        err.to_string(),
-        "amberpack: corrupt pack data: 2 active segments, want at most one: \
-         [0000000000000001.seg.active 0000000000000002.seg.active]"
-    );
-}
+// Go's `TestSecondOpenFails` and `TestMultipleActiveFilesFailOpen` went with
+// the single-owner store: see multi_tests.rs for what holds now.
 
 #[test]
 fn closed_store_errors() {
@@ -483,13 +458,25 @@ fn crash_between_footer_and_rename() {
     b.extend_from_slice(&footer);
     fs::write(&actives[0], &b).unwrap();
 
-    // Open must complete the rename and serve everything from the sealed file.
+    // Opening serves everything from the file as it is: a store that only
+    // reads finishes nobody's seal. Its first write takes the segment,
+    // completes the rename, and goes to a new active segment.
     let s2 = Store::open(dir.path()).unwrap();
     for o in &objs {
         assert_eq!(s2.get(o.key).unwrap(), o.data, "get({})", o.key);
     }
+    let extra = blob_obj(b"the write that takes the segment");
+    s2.put(extra.key, &extra.data).unwrap();
     assert_eq!(sealed_files(dir.path()).len(), 1);
-    assert_eq!(active_files(dir.path()).len(), 0);
+    assert_eq!(active_files(dir.path()).len(), 1);
+    for o in objs.iter().chain([&extra]) {
+        assert_eq!(
+            s2.get(o.key).unwrap(),
+            o.data,
+            "get({}) after the seal was finished",
+            o.key
+        );
+    }
 }
 
 #[test]

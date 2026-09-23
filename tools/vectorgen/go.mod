@@ -9,7 +9,7 @@ require (
 
 require (
 	github.com/PlakarKorp/go-cdc-chunkers v1.0.3 // indirect
-	github.com/amber-store/core v0.0.10-0.20260923125338-91da3cf24ab7
+	github.com/amber-store/core v0.0.10-0.20260923125444-1fb6953558f0
 	github.com/fxamacker/cbor/v2 v2.9.2 // indirect
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
 	github.com/go-git/go-billy/v5 v5.6.2 // indirect

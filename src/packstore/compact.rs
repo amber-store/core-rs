@@ -184,6 +184,17 @@ impl Store {
             }
             report.push(info);
         }
+        for fa in &sh.foreign {
+            // Other writers' active segments: never victims either.
+            let mut info = SegmentLiveness {
+                id: fa.id,
+                ..SegmentLiveness::default()
+            };
+            for (k, loc) in unpoison(fa.state.read()).scan.index.iter() {
+                info.add(live(*k), loc.slen);
+            }
+            report.push(info);
+        }
         Ok(report)
     }
 
@@ -203,6 +214,13 @@ impl Store {
             horizon,
             mut pace,
         } = opts;
+        // Other stores' writers wait for the whole pass and look at the
+        // directory again afterwards (gate.rs); inside a collector's
+        // begin_sweep the gate is held already. This store's own writes wait
+        // too: a duplicate check must not race the removal of a segment, and
+        // those that bypass the collector are held by nothing else.
+        let _sweep = self.sweep_gate()?;
+        let _pause = self.pause_local_writers();
         // The append lock is held for the entire pass: writers queue behind
         // the sweep (Go: appendMu for the whole call).
         let mut ap = self.append_lock();
@@ -227,6 +245,7 @@ impl Store {
             self.set_failed(&e);
             return Err(e);
         }
+        self.seal_idle(&mut ap)?;
 
         let victims = self.select_victims(&live, horizon, min_dead_ratio, &mut stats)?;
         if victims.is_empty() {
@@ -239,12 +258,14 @@ impl Store {
         // copies rotated the active segment away, the seal already fsynced;
         // a `None` active skips.
         if self.cfg.sync
-            && let Some(aw) = ap.active.as_ref()
-            && let Err(e) = aw.seg.f.sync_all()
+            && let Some(aw) = ap.active.as_mut()
         {
-            let e: Error = e.into();
-            self.set_failed(&e);
-            return Err(e);
+            if let Err(e) = aw.seg.f.sync_all() {
+                let e: Error = e.into();
+                self.set_failed(&e);
+                return Err(e);
+            }
+            aw.sidecar_synced();
         }
         self.remove_victims(&mut ap, &victims, &mut stats)?;
         Ok(stats)
@@ -298,9 +319,9 @@ impl Store {
         // working — so survivor probes must skip them by id.
         let survivor_has = |k: Key| -> bool {
             let sh = unpoison(self.shared.read());
-            if let Some(a) = &sh.active
-                && unpoison(a.index.read()).contains_key(&k)
-            {
+            // Not a copy a live writer has yet to sync: the victim's may be
+            // the durable one.
+            if Store::reliable_active(&sh, self.cfg.sync, k) {
                 return true;
             }
             sh.sealed
@@ -425,12 +446,21 @@ impl Store {
         stats: &mut CompactStats,
     ) -> Result<(), Error> {
         let victim_ids: HashSet<u64> = victims.iter().map(|g| g.id).collect();
+        // A lookup that finds nothing lists the directory (view.rs). Between
+        // the victims leaving the view and leaving the directory, such a
+        // listing would map them again, and the duplicate check would go on
+        // finding what is gone. No listing runs in between: the refresh lock
+        // is held until the files are gone.
+        let _no_refresh = unpoison(self.refresh_mu.lock());
         {
             // Concurrent readers hold Arc clones, never the Vec itself, so
             // retaining in place under the write lock is safe (Go rebuilds a
             // fresh slice because its readers may hold the backing array).
             let mut sh = unpoison(self.shared.write());
             sh.sealed.retain(|g| !victim_ids.contains(&g.id));
+        }
+        if let Some(hook) = unpoison(self.hooks.after_detach.lock()).as_ref() {
+            hook();
         }
         let mut first_err: Option<Error> = None;
         for g in victims {

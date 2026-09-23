@@ -45,6 +45,7 @@ pub(super) struct WriteToken<'a> {
 impl Drop for WriteToken<'_> {
     fn drop(&mut self) {
         unpoison(self.store.writes.lock()).inflight.remove(&self.id);
+        self.store.gate.end_shared();
     }
 }
 
@@ -63,14 +64,16 @@ pub struct SegmentInfo {
 }
 
 impl Store {
-    /// Registers one in-flight exported write for the GC horizon (Go:
-    /// `beginWrite`; the paired `endWrite` is the returned token's `Drop`).
-    pub(super) fn begin_write(&self) -> WriteToken<'_> {
+    /// Opens an exported write: a span of the gate, which keeps other stores'
+    /// sweeps out, and a token for this store's GC horizon (Go: `beginWrite`;
+    /// the paired `endWrite` is the returned token's `Drop`).
+    pub(super) fn begin_write_token(&self) -> Result<WriteToken<'_>, Error> {
+        self.gate.begin_shared(|| self.refresh())?;
         let mut w = unpoison(self.writes.lock());
         let id = w.next;
         w.next += 1;
         w.inflight.insert(id, Instant::now());
-        WriteToken { store: self, id }
+        Ok(WriteToken { store: self, id })
     }
 
     /// Returns the start time of the oldest [`Store::put`],
@@ -176,9 +179,7 @@ impl Store {
         if sh.closed {
             return Err(Error::Closed);
         }
-        if let Some(a) = &sh.active
-            && unpoison(a.index.read()).contains_key(&k)
-        {
+        if Store::reliable_active(&sh, self.cfg.sync, k) {
             return Ok(true);
         }
         for g in sh.sealed.iter().rev() {
@@ -201,6 +202,7 @@ impl Store {
     /// Re-appending a key already in the active index is a silent no-op
     /// (the append path's existing dedup) (Go: `AppendRecord`).
     pub fn append_record(&self, k: Key, raw: &[u8]) -> Result<(), Error> {
+        let _write_token = self.begin_write_token()?;
         check_record(k, raw, false)?;
         self.append(k, raw, false)
     }
@@ -219,9 +221,14 @@ impl Store {
     /// mapping is released when the last handle drops (Go: `Remove` +
     /// `waitScrubs`; see port-notes/packstore-gc.md).
     pub fn remove(&self, id: u64) -> Result<(), Error> {
+        let _sweep = self.sweep_gate()?; // other stores' writers wait, and look again afterwards
         // Lock order: append lock before shared lock, like every writer. The
         // append guard also protects the directory handle for the fsync.
         let ap = self.append_lock();
+        // Held until the file is gone: a lookup's listing between the segment
+        // leaving the view and leaving the directory would map it again
+        // (remove_victims has the whole story).
+        let _no_refresh = unpoison(self.refresh_mu.lock());
         let seg = {
             let mut sh = unpoison(self.shared.write());
             if sh.closed {
@@ -238,6 +245,9 @@ impl Store {
         // Go collects a firstErr across seg.close() (munmap), unlink, and
         // the dir fsync, attempting all three; the Rust munmap happens on
         // the last Arc drop and cannot report an error.
+        if let Some(hook) = unpoison(self.hooks.after_detach.lock()).as_ref() {
+            hook();
+        }
         let mut first_err: Option<Error> = None;
         if let Err(e) = fs::remove_file(&seg.path) {
             first_err.get_or_insert(e.into());

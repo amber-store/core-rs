@@ -38,9 +38,9 @@ fn load_manifest() -> Option<Manifest> {
     Some(m)
 }
 
-/// Copies the read-only fixture into `dst`: opening a store takes an
-/// exclusive flock and may truncate the active segment, so tests never open
-/// the committed directory itself.
+/// Copies the read-only fixture into `dst`: a store's first write takes the
+/// active segment for its own and may truncate it, and every open creates
+/// `gc.lock`, so tests never open the committed directory itself.
 fn copy_fixture(dst: &Path) {
     let src = common::golden_dir().join("segments_go");
     for entry in fs::read_dir(&src).expect("fixture dir") {
@@ -134,6 +134,45 @@ fn golden_segments_read_go_store() {
         "resumed-append object lost"
     );
     s2.verify(|| false).expect("verify after resumed append");
+}
+
+/// The Go-written active segment comes with its sidecar index
+/// (`architecture/packstore.md`), and Rust must accept it whole. Entries that
+/// a synced record covers are trusted, so their records are not read back at
+/// open, and a damaged first record hides nothing. Had the sidecar been
+/// refused, the fall-back scan would stop at the damage and index no record at
+/// all: that is how this test tells the two apart through the public API.
+#[test]
+fn golden_segments_go_sidecar_is_trusted() {
+    let Some(m) = load_manifest() else { return };
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    copy_fixture(dir.path());
+    let data = dir.path().join("0000000000000003.seg.active");
+    assert!(
+        dir.path().join("0000000000000003.seg.active.idx").is_file(),
+        "the fixture has no sidecar"
+    );
+    // The first payload byte of the first record: past the 8-byte segment
+    // header and the 46-byte record header.
+    let mut bytes = fs::read(&data).expect("read the active segment");
+    bytes[8 + 46] ^= 0xff;
+    fs::write(&data, &bytes).expect("write the active segment");
+
+    let s = Store::open_with(dir.path(), Options::new().segment_size(m.segment_size))
+        .expect("open Go-written store");
+    // The three tail objects, in the order they were put.
+    let tail = &m.objects[m.objects.len() - 3..];
+    for (i, o) in tail.iter().enumerate() {
+        let k = parse_key(&o.key, "tail object");
+        assert!(
+            s.has(k).expect("has"),
+            "tail object {i} is not indexed: the Go-written sidecar was not trusted"
+        );
+        if i > 0 {
+            // The first one is the damaged one; reads do not check CRCs.
+            assert_eq!(s.get(k).expect("get"), o.payload.bytes(), "tail object {i}");
+        }
+    }
 }
 
 /// A fresh Rust store over the golden objects with a small segment size: the

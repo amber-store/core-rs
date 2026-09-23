@@ -39,7 +39,7 @@ fn seg_files(dir: &Path) -> Vec<PathBuf> {
 
 /// A store with objs[0..2] and objs[2..4] in two sealed segments and objs[4]
 /// in the active one (Go: `compactStore`).
-fn compact_store() -> (TempDir, Store, Vec<Object>) {
+pub(crate) fn compact_store() -> (TempDir, Store, Vec<Object>) {
     let dir = TempDir::new().unwrap();
     let s = Store::open_with(dir.path(), Options::new().segment_size(8 << 10).sync(false)).unwrap();
     let objs: Vec<Object> = (0..5)

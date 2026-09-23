@@ -124,6 +124,29 @@ Port of the `cmd/amber-store/ref.go` delta at Go `91da3cf` and of
   `compare_and_delete` and releases the expected key. `ingest --ref` and
   `commit create --ref` stay unconditional, as in Go.
 
+## Write spans (Go PR #14)
+
+- `RefGate` is Go's `refGate`: `prepare_ref` and `release_ref`, implemented
+  for `gc::Collector` (which opens a span for the one put) and for `gc::Span`
+  (a span already open around the writes the reference names). `put_ref`
+  takes `&dyn RefGate`; `rm_ref` keeps the collector, as in Go.
+- `open_span` is Go's `openSpan`: the collector's span (`begin_span`,
+  reference lock before the gate) when a reference is to be put, the store's
+  own (`packstore::Store::begin_write`) otherwise, and then no collector is
+  opened at all. One difference is forced by borrowing: Go's `cliSpan` opens
+  and closes the collector itself, while a `gc::Span<'c>` borrows its
+  collector. So the caller opens the collector first (`collector_for`), runs
+  the part inside the span as a function of its own (`ingest_in_span`,
+  `commit_in_span`) and closes the collector afterwards (`close_collector`).
+  Order on the way out: span, collector, stores.
+- `ingest` brackets `ingest::dir` and the reference put; `commit create`
+  brackets the `has` checks on the tree and the parents, the put and the
+  reference put. `ref set` needs no span of its own: `Collector::prepare_ref`
+  opens one for the put.
+- A failed collector close is reported when the command otherwise succeeded
+  and dropped behind the command's own error; Go's `defer span.end()` drops
+  it either way.
+
 ## For later waves
 
 - The bench (`cmd/amber-bench`) duplicates `putRef`; the reference Rust

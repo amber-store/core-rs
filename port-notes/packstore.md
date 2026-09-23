@@ -140,3 +140,13 @@ cross-check.
 `verify_object` checks the length field of `Commit` keys too: like `Blob` and
 `XattrSet`, a commit's length is its own serialized byte length. Port of Go
 `TestVerifyObjectChecksCommitLength` in `verify.rs`.
+
+## Go PR #14 backport (2026-09-23)
+
+Any number of stores, in any number of processes, on one directory: sidecar
+index, segment ownership, refreshing views, the `gc.lock` gate. Notes,
+deviations and the live cross-check are in `port-notes/packstore-multi.md`.
+Two statements above no longer hold and are kept for the record only: the
+store is not single-owner any more, and `open` recovers nothing (recovery
+moved to the writer that takes a segment), so "tail-scan at open" now reads
+"at adoption".
