@@ -19,7 +19,7 @@
 //! | [`gc`] | Mark-and-sweep garbage collection: mark from the references, sweep by rewriting mostly-dead packs. |
 //! | [`amberpack`] | The flat pack stream format: records + wire packs. |
 //! | [`packstore`] | Append-only segment object store. |
-//! | [`refstore`] | Name → reference-record map (redb-backed; see PORTING.md). |
+//! | [`refstore`] | Name → reference-record map in SQLite (WAL, multi-process, optimistic updates); the file is shared with Go. |
 //! | [`reference`] | The reference record: canonical CBOR encoding and validation. |
 //! | [`commit`] | The commit record (object type 5): canonical CBOR encoding and validation. |
 //! | [`inbox`] | Durable pack receiving. |

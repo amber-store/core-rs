@@ -2,7 +2,8 @@
 //! `cmd/amber-store/e2e_test.go`'s pin..HEAD delta
 //! (`TestE2E_RefSetChecksCompleteness`, `TestE2E_RefLifecycle`,
 //! `TestE2E_GC`) plus the pre-existing `TestE2E_MissingStoreFlag`, which
-//! had no Rust counterpart yet, and `TestE2E_Commit` (Go PR #12). The Go
+//! had no Rust counterpart yet, `TestE2E_Commit` (Go PR #12) and
+//! `TestE2E_RefExpect` (Go PR #13). The Go
 //! unit tests of `parseIdentity` and `renderCommit` are covered through the
 //! CLI in `commit_identity_and_rendering`: the example carries no unit
 //! tests. Go drives `newApp()` in-process; here each
@@ -517,4 +518,148 @@ fn commit_identity_and_rendering() {
             "{name}: command succeeded"
         );
     }
+}
+
+// Port of Go TestE2E_RefExpect, with the messages asserted as well and one
+// case Go's test cannot tell apart: a misplaced --expect carrying the RIGHT
+// key, which must fail the argument count rather than be honoured.
+#[test]
+fn ref_expect() {
+    let store = TempDir::new().unwrap();
+    let store_s = store.path().display().to_string();
+    let ingest = |extra: &str| -> String {
+        let src = TempDir::new().unwrap();
+        write_fixture(src.path());
+        fs::write(src.path().join("extra.txt"), extra).unwrap();
+        let src_s = src.path().display().to_string();
+        match run_app(&["--store", &store_s, "ingest", "--no-progress", &src_s]) {
+            Ok(out) => out.trim().to_string(),
+            Err(e) => panic!("ingest: {e}"),
+        }
+    };
+    let (root1, root2) = (ingest("one"), ingest("two"));
+    let (root1, root2) = (root1.as_str(), root2.as_str());
+    let rf = |args: &[&str]| -> Result<String, String> {
+        let mut all = vec!["--store", store_s.as_str(), "ref"];
+        all.extend_from_slice(args);
+        run_app(&all).map(|out| out.trim().to_string())
+    };
+    // The command must fail, and say why.
+    let refused = |args: &[&str], why: &str, what: &str| match rf(args) {
+        Ok(_) => panic!("{what}"),
+        Err(e) => assert!(
+            e.contains(why),
+            "{what}: failed, but with {e:?}; want {why:?}"
+        ),
+    };
+    let want_at = |want: &str| {
+        let got = rf(&["get", "r"]);
+        assert_eq!(got.as_deref(), Ok(want), "ref get r");
+    };
+
+    if let Err(e) = rf(&["set", "--expect", "none", "r", root1]) {
+        panic!("create with --expect none: {e}");
+    }
+    refused(
+        &["set", "--expect", "none", "r", root2],
+        "already exists: refstore: reference is not at the expected key",
+        "--expect none overwrote an existing reference",
+    );
+    want_at(root1);
+    refused(
+        &["set", "--expect", root2, "r", root2],
+        "does not point at",
+        "a stale --expect moved the reference",
+    );
+    want_at(root1);
+    // A flag after the positionals is not parsed as a flag; it must fail
+    // rather than turn into an unconditional set.
+    refused(
+        &["set", "r", root2, "--expect", root2],
+        "ref set requires NAME KEY arguments, got 4",
+        "a misplaced --expect was accepted",
+    );
+    want_at(root1);
+    refused(
+        &["set", "r", root2, "--expect", root1],
+        "ref set requires NAME KEY arguments, got 4",
+        "a misplaced --expect with the current key was honoured",
+    );
+    want_at(root1);
+    // An empty expectation, a script's unset variable, must fail as well.
+    refused(
+        &["set", "--expect", "", "r", root2],
+        "--expect is empty",
+        "an empty --expect was accepted by ref set",
+    );
+    want_at(root1);
+    refused(
+        &["set", "--expect", "zz", "r", root2],
+        "--expect: ",
+        "a malformed --expect was accepted",
+    );
+    want_at(root1);
+    if let Err(e) = rf(&["set", "--expect", root1, "r", root2]) {
+        panic!("set with the right --expect: {e}");
+    }
+    want_at(root2);
+
+    refused(
+        &["rm", "--expect", "none", "r"],
+        "a delete cannot expect the reference to be absent",
+        "ref rm accepted --expect none",
+    );
+    refused(
+        &["rm", "--expect", "", "r"],
+        "--expect is empty",
+        "an empty --expect was accepted by ref rm",
+    );
+    refused(
+        &["rm", "r", "--expect", root2],
+        "ref rm requires exactly one NAME argument, got 3",
+        "ref rm honoured a misplaced --expect",
+    );
+    want_at(root2);
+    refused(
+        &["rm", "--expect", root1, "r"],
+        "does not point at",
+        "a stale --expect deleted the reference",
+    );
+    want_at(root2);
+    if let Err(e) = rf(&["rm", "--expect", root2, "r"]) {
+        panic!("rm with the right --expect: {e}");
+    }
+    assert!(rf(&["get", "r"]).is_err(), "the reference survived ref rm");
+    refused(
+        &["set", "--expect", root1, "gone", root1],
+        "does not exist, expected it at",
+        "--expect KEY created a reference that did not exist",
+    );
+    refused(
+        &["rm", "--expect", root1, "gone"],
+        "does not exist, expected it at",
+        "ref rm --expect deleted a reference that did not exist",
+    );
+    assert!(rf(&["get", "gone"]).is_err());
+
+    // A NAME that begins with a dash is a flag, to Go's parser and to this
+    // one; after `--` it is a name.
+    refused(
+        &["set", "-lead", root1],
+        "unexpected argument",
+        "a name that looks like a flag was accepted",
+    );
+    if let Err(e) = rf(&["set", "--", "-lead", root1]) {
+        panic!("ref set -- -lead: {e}");
+    }
+    assert!(rf(&["list"]).unwrap().contains("-lead"));
+    refused(
+        &["rm", "-lead"],
+        "unexpected argument",
+        "ref rm took a flag for a name",
+    );
+    if let Err(e) = rf(&["rm", "--", "-lead"]) {
+        panic!("ref rm -- -lead: {e}");
+    }
+    assert!(!rf(&["list"]).unwrap().contains("-lead"));
 }

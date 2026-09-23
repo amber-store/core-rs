@@ -1,6 +1,6 @@
 [package]
 name = "amber-store-core"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "LGPL-3.0-only"
 description = "Content-addressable store for filesystem trees — Rust port of github.com/jobs-build/amber-store-core"
@@ -13,6 +13,7 @@ blake3 = "1"
 crc32c = "0.6"
 zstd = "0.13"
 redb = "2"
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache"] }
 thiserror = "2"
 memmap2 = "0.9"
 libc = "0.2"

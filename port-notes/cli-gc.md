@@ -90,6 +90,40 @@ everything else passes `--store`). The Go shape is kept: `--segment-size
 cross `--grace 1ms`, `--garbage 0` forced runs. 5/5 repeat runs green,
 ~1 s each.
 
+## `--expect` on `ref set` and `ref rm` (Go PR #13)
+
+Port of the `cmd/amber-store/ref.go` delta at Go `91da3cf` and of
+`TestE2E_RefExpect` (`ref_expect` in `tests/cli_e2e.rs`).
+
+- `Expectation` is an enum (`Unconditional` / `Absent` / `At(Key)`) where Go
+  has a struct of two booleans and a key; `parse_expect` and `explain` carry
+  Go's rules and texts: `--expect` given but empty is an error (a script's
+  unset variable must not turn the write into an unconditional one),
+  `--expect none` is refused by `ref rm`, a malformed key is wrapped as
+  `--expect: …`; a conflict reads `reference "r" already exists: …` or
+  `… does not point at KEY: …`, an absent reference `… does not exist,
+  expected it at KEY: …`, each followed by the store's own message.
+- **Flags go before the positionals**, as urfave/cli parses them. clap
+  accepts options anywhere by default, so `ref set` and `ref rm` take their
+  positionals as one `Vec<String>` (the device `gc why` uses to get Go's
+  argument-count error out of the normal error path, exit 1) marked
+  `trailing_var_arg`: whatever follows the first positional is a positional,
+  so a misplaced flag fails the count (`ref set requires NAME KEY arguments,
+  got 4`). The first version also set `allow_hyphen_values`, which with clap
+  4.6 has the same effect on its own; the review found what else it does:
+  `ref set -lead KEY` created a reference called `-lead`, where Go refuses
+  the unknown flag. Without it clap refuses too (`unexpected argument`), and
+  as in Go a name that begins with a dash goes after `--`; `ref_expect` pins
+  both. The Rust test adds the case Go's cannot tell apart: a misplaced `--expect`
+  carrying the *current* key, which a parser that honoured it would let
+  through.
+- `put_ref`: `Unconditional` → `put`, `Absent` → `create`, `At` →
+  `compare_and_swap`; on failure `abort` and `explain`. After a conditional
+  put what is released is the expected key (or nothing, for `Absent`),
+  whatever the earlier read saw. `rm_ref` likewise deletes with
+  `compare_and_delete` and releases the expected key. `ingest --ref` and
+  `commit create --ref` stay unconditional, as in Go.
+
 ## For later waves
 
 - The bench (`cmd/amber-bench`) duplicates `putRef`; the reference Rust

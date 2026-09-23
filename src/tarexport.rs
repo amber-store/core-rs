@@ -803,6 +803,10 @@ fn fmt_quoted_char(f: &mut fmt::Formatter<'_>, c: char) -> fmt::Result {
         '\n' => write!(f, "\\n"),
         '\r' => write!(f, "\\r"),
         '\t' => write!(f, "\\t"),
+        '\x07' => write!(f, "\\a"),
+        '\x08' => write!(f, "\\b"),
+        '\x0b' => write!(f, "\\v"),
+        '\x0c' => write!(f, "\\f"),
         c if (c as u32) < 0x20 || c as u32 == 0x7f => write!(f, "\\x{:02x}", c as u32),
         c => write!(f, "{c}"),
     }
@@ -1369,6 +1373,15 @@ impl<W: io::Write> io::Write for TarWriter<W> {
 
 #[cfg(test)]
 mod tests {
+    /// Every ASCII byte, against what Go's `fmt.Sprintf("%q", ...)` printed
+    /// for the same string.
+    #[test]
+    fn go_quote_is_exact_for_ascii() {
+        let ascii: Vec<u8> = (0..0x80).collect();
+        let want = r##""\x00\x01\x02\x03\x04\x05\x06\a\b\t\n\v\f\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\x7f""##;
+        assert_eq!(super::GoQuote(&ascii).to_string(), want);
+    }
+
     use std::collections::HashMap;
 
     use super::*;

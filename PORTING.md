@@ -2,13 +2,14 @@
 
 This crate is a port of `github.com/amber-store/core` (Go; formerly
 `jobs-build/amber-store-core`), pinned at commit
-`e318780544694a2047ca167b44ad49a62f3e156b` (tag `v0.0.9`, the merge of
-PR #12, the `Commit` object type). Not yet ported from that
-range: Go PR #8's gc write-span gate (`Collector.BeginWrite`) and
-`inbox.WithGate`. The Go sources are the normative reference wherever this
-document or `architecture/` is silent; clone the parent fresh when porting
-(the checkout at `/Users/dragan/jobs-build/amber-store-core` lags GitHub).
-The CI interop job pins the same Go commit in `.github/workflows/ci.yml`.
+`91da3cf24ab72ddac32e67677f7382011a76393c` (the merge of PR #13, the
+reference store on SQLite, between tags `v0.0.9` and `v0.0.10`). Not yet
+ported from that range: Go PR #8's gc write-span gate
+(`Collector.BeginWrite`) and `inbox.WithGate`. The Go sources are the
+normative reference wherever this document or `architecture/` is silent;
+clone the parent fresh when porting (the checkout at
+`/Users/dragan/jobs-build/amber-store-core` lags GitHub). The CI interop job
+pins the same Go commit in `.github/workflows/ci.yml`.
 
 ## Compatibility contract
 
@@ -37,12 +38,21 @@ The CI interop job pins the same Go commit in `.github/workflows/ci.yml`.
 - Segment *files* additionally depend on write order (Go's parallel writer is
   scheduling-dependent), so they are not reproducible run-to-run even in Go.
 
-**Different, by design** (documented for the user's decision):
+**One shared file** (both implementations open the same file, at the same
+time if need be):
 
-- `refstore`: Go uses Pebble; there is no Rust Pebble. This port uses **redb**
-  with identical semantics (name → canonical record bytes verbatim, blind
-  overwrite, lexicographic iteration, sync flag). A `refs/` directory written
-  by one implementation is not openable by the other.
+- `refstore`: references live in `<dir>/refs.sqlite`, a SQLite database whose
+  format and concurrency rules are specified in `architecture/references.md`
+  ("Storage" and "Rules for implementations"): application id `0x616D6272`,
+  `user_version` = number of migrations applied, WAL mandatory, the `refs`
+  table of BLOB names and BLOB records. The migration files in
+  `src/refstore/migrations/` are byte-identical copies of Go's
+  `refstore/migrations/` and never change once released; the statements are
+  Go's `queries.sql`. The database *file* is not byte-reproducible (its page
+  layout follows the write history); the contract is the schema and the
+  rules. Nothing about the store is implementation-specific any more: until
+  Go PR #13 Go kept references in Pebble and this crate in redb, and neither
+  could open the other's directory.
 
 ## Dependency mapping
 
@@ -54,7 +64,10 @@ The CI interop job pins the same Go commit in `.github/workflows/ci.yml`.
 | `FastFilter/xorfilter` BinaryFuse[uint16] | ported in `src/binaryfuse.rs` |
 | `PlakarKorp/go-cdc-chunkers` ultracdc | ported in `src/chunkers.rs` |
 | `fxamacker/cbor` (core deterministic) | hand-rolled in `src/cbor.rs` |
-| `cockroachdb/pebble` | `redb` (semantic port only) |
+| `modernc.org/sqlite` (pure-Go SQLite) | `rusqlite` with `bundled` (SQLite compiled in) |
+| `sqlc` (generated query code) | none: the statements sqlc renders, verbatim as constants in `src/refstore/queries.rs` |
+| `cockroachdb/pebble` (import of pre-SQLite Go stores only) | none: a Pebble directory is refused, only Go imports it |
+| — | `redb` (import of this crate's own pre-SQLite stores only; goes with migration support) |
 | `archive/tar` (PAX write subset) | ported in `src/tarexport.rs` |
 | `unix.Mmap` | `memmap2` |
 | xattr syscalls | `xattr` crate |
@@ -198,10 +211,28 @@ Rust's `Arc`-held mmaps make Go's munmap-wait unnecessary.
 
 ### `refstore` (Go: `refstore/`)
 
-Semantic port on redb (see contract above). Same validation and API shape:
-put/get/delete/list (lexicographic), records stored verbatim, `sync` flag
-honored (redb durability settings). Read `refstore.go` for exact behaviors
-(missing-name errors, empty-store list, etc.).
+The shared SQLite store (see the contract above; `architecture/references.md`
+is normative and its "Rules for implementations" are followed to the
+letter). Port `sqlite.go` (every connection: busy timeout first, then the
+journal mode, then the durability pragmas of the sync flag; WAL verified at
+open; the busy retry around connecting, because SQLite does not run the busy
+handler for the switch into WAL), `schema.go` (the migration runner: fresh
+or foreign, negative and newer versions refused, the lock-free fast path,
+one `BEGIN IMMEDIATE` transaction that ends by setting `user_version`, the
+re-read after taking the lock) and `cas.go` (`compare_and_swap`, `create`,
+`compare_and_delete`: read, decode, compare the key, change guarded by the
+bytes just read, all in one IMMEDIATE transaction; typed `Conflict` and
+`NotFound`) exactly, error messages included. Every write transaction rolls
+back on every early exit and on a panic. `migrate.go` has no literal
+counterpart: this crate's legacy is its own redb database, imported by the
+same design (commit point = publishing `refs.sqlite`, by a link, which
+replaces nothing), and what keeps older binaries out is a poison file at
+`refs.redb`. Unlike Go's import it never takes a `refs.sqlite` that is
+already there for proof of an import, because Go creates one in a redb
+directory: the legacy records are merged into it, under the names it lacks.
+A Pebble directory is
+refused, never imported, and never given an empty `refs.sqlite`. See
+`port-notes/refstore.md`.
 
 ### `gc` (Go: `gc/`)
 
@@ -282,7 +313,8 @@ dir mtimes applied after children, path-safety checks).
 
 Dev-only mirror of `cmd/amber-store` (ingest/ls/export/restore/ref/commit/gc,
 --store, --segment-size, ref:NAME[@PATH] addressing, a commit standing for
-its tree wherever a directory spec is expected) for interop testing;
+its tree wherever a directory spec is expected, `ref set --expect OLD|none`
+and `ref rm --expect OLD` with Go's parsing rules) for interop testing;
 uses only the public crate API + clap. No progress UI needed. The gc
 subcommands' output format strings are byte-compatible with Go (the bench
 and tests parse them); reference writes route through the collector.
@@ -314,7 +346,7 @@ This preserves later records after payload damage during an interrupted seal.
 Each batch uses one transaction with the configured durability.
 The final record wins when names repeat. Empty batches are accepted.
 `all` reads one snapshot and cannot see a partial batch.
-Reference database files remain implementation-specific.
+Both implementations keep them in the same `refs.sqlite` (see `refstore`).
 
 Regression tests live in `src/packstore/repair_tests.rs` and `tests/refstore.rs`.
 They cover corruption, duplicate copies, restart recovery, reader lifetime,
@@ -324,5 +356,7 @@ CI runs `interop/check.sh` against a pinned Go parity revision.
 The check compares ingestion keys, cross-reads stores, and compares exported archives.
 It creates the same commits with both CLIs and requires identical commit keys.
 Each CLI then shows and lists the commits the other one wrote.
+Each CLI reads the references the other one wrote into the same store,
+moves them with `--expect`, and is refused with a stale expectation.
 It also corrupts each implementation's pack and repairs it with the other.
 The original implementation then verifies and reads the repaired pack.

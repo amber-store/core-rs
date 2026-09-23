@@ -7,7 +7,7 @@ its content.
 
 This crate is the Rust port of
 [`github.com/amber-store/core`](https://github.com/amber-store/core)
-(pinned at v0.0.9, see [`PORTING.md`](PORTING.md)), intended to be embedded as a **library** in other Rust
+(pinned at Go `91da3cf`, after v0.0.9, see [`PORTING.md`](PORTING.md)), intended to be embedded as a **library** in other Rust
 projects. The format is specified in [`architecture/`](architecture/).
 
 ## Compatibility with the Go implementation
@@ -26,18 +26,22 @@ The port is **byte-compatible** at the content-addressing layer and
   the other's frames, but pack/segment files containing compressed records
   differ byte-wise — content addressing is unaffected because keys hash the
   uncompressed bytes).
-- **Different by design**: `refstore` is backed by [redb] here and Pebble in
-  Go (Pebble has no Rust implementation). Reference *records* are
-  byte-identical; the `refs/` database directory is not cross-openable.
+- **One shared file**: references live in `refs/refs.sqlite`, a SQLite
+  database in WAL mode that both implementations open — at the same time, if
+  need be. Its format and the rules for sharing it are specified in
+  [`architecture/references.md`](architecture/references.md). A store
+  written by an earlier release of this crate (a redb database) is imported
+  on first open, so open it with this crate before the Go implementation
+  touches it: Go knows nothing of `refs.redb` and would start an empty
+  database next to it. One written by an earlier Go release (Pebble) has to
+  be opened once by the Go implementation, which imports it.
 
 See [`PORTING.md`](PORTING.md) for the full contract,
 [`VECTORS.md`](VECTORS.md) for the Go-generated golden vectors that gate the
 test suite, and [`interop/check.sh`](interop/check.sh) for a live
 cross-implementation check (identical ingest roots and commit keys,
-cross-reading each other's store directories and commits, byte-identical
-exports).
-
-[redb]: https://github.com/cberner/redb
+cross-reading each other's store directories, commits and references,
+byte-identical exports).
 
 ## Library
 
@@ -51,7 +55,7 @@ The modules mirror the Go packages; see the crate docs (`cargo doc --open`).
 | `ingest` | Build a tree from a local directory; honors `.amberignore`; `Opts::exclude` skips names at the root (a working copy's metadata directory). |
 | `amberignore` | `.gitignore`-semantics exclusion for ingestion. |
 | `packstore` | Append-only pack segments with parallel, deduplicating, verifying writers. |
-| `refstore` | Name → record map for references (redb-backed). |
+| `refstore` | SQLite-backed (WAL, multi-process) name → record map for references, with optimistic updates; the file is shared with the Go implementation. |
 | `reference` | The reference record: canonical CBOR encoding and validation. |
 | `commit` | The commit record (object type 5): canonical CBOR encoding and validation; signature fields carried opaquely. See [`architecture/commits.md`](architecture/commits.md). |
 | `amberpack` | The flat pack stream format for transfer and storage. |
