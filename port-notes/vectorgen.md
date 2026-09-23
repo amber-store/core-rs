@@ -2,7 +2,7 @@
 
 `tools/vectorgen` (Go) generates every vector file in `tests/golden/` per
 VECTORS.md, driving the pinned Go library (`github.com/amber-store/core`
-at the version in `tools/vectorgen/go.mod` — Go `1fb6953` since the Go PR #14
+at the version in `tools/vectorgen/go.mod` — v0.0.10 since the Go PR #15
 backport; originally `jobs-build/amber-store-core@e4fcb60`; no replace
 directive). Regenerate with `cd tools/vectorgen && go run . ../../tests/golden`
 — the generator first deletes exactly the files it owns, so a rerun is a clean
@@ -103,3 +103,22 @@ creates and which holds nothing a reader needs. `golden_segments_go_sidecar_is_t
 proves through the public API that Rust accepts the Go-written sidecar rather
 than falling back to a scan; it was seen failing with the sidecar removed from
 the fixture.
+
+## Go PR #15 backport (2026-09-23)
+
+`commit.go` writes 13 cases now: the seven from before — whose keys all
+changed, the length field being a footprint, and whose bytes changed wherever
+a parent's key is recorded — and six new ones (VECTORS.md): the conflicted
+commit annotated in `architecture/commits.md`, a one-byte change id, every
+key 0–9 at once, a conflict without labels whose term repeats, 254 terms with
+255 labels, and identities with neither name nor email. The case struct
+gained `change_id_hex`, `conflict_terms` and `conflict_labels`, omitted when
+absent.
+
+The pin moved on to `v0.0.10`, the release that contains PR #15; `commit.go`
+needs `commit.Commit`'s new fields and does not build against anything
+older. `commit.json` was first generated before that release existed,
+through a temporary copy of `go.mod`/`go.sum` carrying `replace
+github.com/amber-store/core => <a worktree at the PR's head>` and passed
+with `go run -modfile=…`. At the `v0.0.10` pin a plain `go run .` into a
+scratch directory reproduced it, and every other vector file, byte for byte.

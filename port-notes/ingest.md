@@ -127,6 +127,11 @@ byte-identical PAX export. Differences:
   in-process pipe: the workspace toolchain floor (rustc 1.86) predates
   `std::io::pipe`. Memory stays flat; an export error surfaces before
   extraction begins, like the Go pipe's `CloseWithError`.
+  One visible consequence (found by the review of the Go PR #15 backport,
+  which made more specs fail late): a failed `restore` leaves nothing at
+  the destination, because the export fails before extraction starts. Go
+  extracts while it exports and leaves the destination with whatever was
+  written before the failure. Exit code, stdout and stderr are the same.
 - Argument arity/usage errors come from clap instead of hand-rolled checks;
   store/spec/resolution errors print as `amber-store: <err>` with exit 1,
   matching Go's shape.

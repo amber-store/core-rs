@@ -182,3 +182,22 @@ than guessed, then verified two ways:
 `Commit` arm (tree, then parents in order) and
 `ChildKeysError::DecodeCommit`. Rationale and the differential results are
 in `port-notes/commit.md`.
+
+## Go PR #15 backport (2026-09-23)
+
+`fx.rs`: `commit.wireCommit` has ten fields now. Key 7 decodes through the
+existing `[]uint8` target, key 8 through the existing `[][]uint8` target
+(`parse_to_byte_slices`, which parents already used), key 9 through a new
+`parse_to_strings`, which is `parse_to_slice_of("[]string",
+parse_to_string)`: both halves existed and were verified, so no decode logic
+is new. The rule worth knowing: a type error inside an array leaves with the
+**element's** Go type (`string`, `[]uint8`) under the array's struct field
+name, one against the array itself with the slice type (`[]string`,
+`[][]uint8`); `parseArrayToSlice` keeps the first element error and decodes
+on. The `Entry` decoder is untouched.
+
+Read paths (`read.rs`): `dir_of`, the private `decode_commit` behind it and
+`child_keys`, the readers' single call to `dir_of` on entry, and
+`ChildKeysError::{CommitFootprint, CommitLength}`. `child_keys` of a commit
+returns the tree, the conflict terms, then the parents. Rationale, the ported
+Go quirks and the differential results are in `port-notes/commit.md`.

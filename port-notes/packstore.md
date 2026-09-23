@@ -150,3 +150,18 @@ Two statements above no longer hold and are kept for the record only: the
 store is not single-owner any more, and `open` recovers nothing (recovery
 moved to the writer that takes a segment), so "tail-scan at open" now reads
 "at adoption".
+
+## Go PR #15 backport (2026-09-23)
+
+A commit's length field is no longer its own byte length but a footprint: own
+bytes plus the length field of every tree it records (`commit::footprint`).
+`verify_object` therefore decodes a Commit and checks the key against that
+sum: `… K length field N != footprint M (own L bytes plus its trees)`. Two
+consequences carried over from Go: bytes under a Commit key that do not decode
+strictly fail verification whatever their length (`… K: decoding commit: …`,
+the `ErrVerify` class), and so does a record whose footprint overflows 64
+bits. The hash is still checked first. `packstore` now depends on `commit`
+(which depends only on `key`, `cbor` and `fstree::fx`). A store that holds a
+live commit written under the v0.0.9 rule fails every scrub and every gc copy
+of that record; `architecture/commits.md` states the remedy. The Go test was
+rewritten and so was its port.

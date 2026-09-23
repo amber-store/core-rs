@@ -28,6 +28,9 @@ type commitCase struct {
 	Message             string         `json:"message"`
 	SignatureHex        string         `json:"signature_hex,omitempty"`
 	PublicKeyHex        string         `json:"public_key_hex,omitempty"`
+	ChangeIDHex         string         `json:"change_id_hex,omitempty"`
+	ConflictTerms       []string       `json:"conflict_terms,omitempty"`
+	ConflictLabels      []string       `json:"conflict_labels,omitempty"`
 	BytesHex            string         `json:"bytes_hex"`
 	Key                 string         `json:"key"`
 	SignaturePayloadHex string         `json:"signature_payload_hex"`
@@ -35,6 +38,16 @@ type commitCase struct {
 
 type commitFile struct {
 	Cases []commitCase `json:"cases"`
+}
+
+// fabKey fabricates a key of the given type and length whose hash bytes are
+// all fill: the commit codec never fetches a tree, so any canonical key serves.
+func fabKey(typ key.Type, length uint64, fill byte) (key.Key, error) {
+	var h [32]byte
+	for i := range h {
+		h[i] = fill
+	}
+	return key.NewFromHash(typ, length, h)
 }
 
 // genCommit writes commit.json: canonical Commit encodings with their keys
@@ -98,6 +111,68 @@ func genCommit(outDir string) error {
 		Tree: emptyDir, Author: bob, Committer: bob, Message: "",
 	}})
 
+	// What a jj commit carries besides (Go PR #15): a change id, the further
+	// terms of a conflicted tree and their labels, identities without a name.
+	removed, err := fabKey(key.DirLeaf, 300, 0x11)
+	if err != nil {
+		return err
+	}
+	added, err := fabKey(key.DirNode, 70000, 0x22)
+	if err != nil {
+		return err
+	}
+	changeID := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	bot := commit.Identity{Name: "", Email: "bot@example.com", When: bob.When, TZOffset: bob.TZOffset}
+	// The second vector annotated in architecture/commits.md.
+	conflicted := commit.Commit{
+		Tree: emptyDir, Parents: []key.Key{keyOf(rootA)}, Author: ann, Committer: bot, Message: "conflict\n",
+		ChangeID: changeID, ConflictTerms: []key.Key{removed, added}, ConflictLabels: []string{"ours", "", "theirs"},
+	}
+	cases = append(cases, named{"conflicted", conflicted})
+
+	withID := rootA
+	withID.ChangeID = []byte{0xab}
+	cases = append(cases, named{"change id, one byte", withID})
+
+	everything := conflicted
+	everything.ChangeID = smData(33, commit.MaxChangeIDLen)
+	everything.Signature, everything.PublicKey = smData(31, 64), smData(32, 68)
+	cases = append(cases, named{"every key 0-9: signed, 64-byte change id, conflict with labels", everything})
+
+	// No labels, a term that repeats, a DirNode tree.
+	cases = append(cases, named{"conflict without labels, a repeated term", commit.Commit{
+		Tree: dirNode, Author: ann, Committer: bob, Message: "unlabelled",
+		ConflictTerms: []key.Key{removed, removed, added, removed},
+	}})
+
+	// 254 terms and 255 labels: both array heads grow a length byte. Only the
+	// last label is set; one is 300 bytes of text past the one-byte string
+	// length, with code points the character rule lets through (U+0085,
+	// U+2028).
+	var terms []key.Key
+	for i := 0; i < commit.MaxConflictTerms; i++ {
+		typ := key.DirLeaf
+		if i%2 == 1 {
+			typ = key.DirNode
+		}
+		k, err := fabKey(typ, uint64(i)*1000, byte(i))
+		if err != nil {
+			return err
+		}
+		terms = append(terms, k)
+	}
+	labels := make([]string, 1+len(terms))
+	labels[len(labels)-1] = "wqnwkozp 2768b0b9 \"" + strings.Repeat("subject ✓ ", 28) + "\u0085\u2028\" (rebased revision)"
+	cases = append(cases, named{"max terms, all labels but the last empty", commit.Commit{
+		Tree: emptyDir, Parents: []key.Key{keyOf(rootA), keyOf(rootB)}, Author: ann, Committer: bob, Message: "octopus conflict",
+		ChangeID: changeID, ConflictTerms: terms, ConflictLabels: labels,
+	}})
+
+	nobody := commit.Identity{When: 0, TZOffset: 0}
+	cases = append(cases, named{"identities without name or email", commit.Commit{
+		Tree: emptyDir, Author: nobody, Committer: nobody, Message: "anonymous",
+	}})
+
 	out := commitFile{Cases: make([]commitCase, 0, len(cases))}
 	for _, n := range cases {
 		k, enc, err := n.c.Object()
@@ -136,6 +211,13 @@ func genCommit(outDir string) error {
 		if len(n.c.PublicKey) > 0 {
 			cc.PublicKeyHex = hex.EncodeToString(n.c.PublicKey)
 		}
+		if len(n.c.ChangeID) > 0 {
+			cc.ChangeIDHex = hex.EncodeToString(n.c.ChangeID)
+		}
+		for _, t := range n.c.ConflictTerms {
+			cc.ConflictTerms = append(cc.ConflictTerms, t.String())
+		}
+		cc.ConflictLabels = n.c.ConflictLabels
 		out.Cases = append(out.Cases, cc)
 	}
 	return writeJSON(filepath.Join(outDir, "commit.json"), out)

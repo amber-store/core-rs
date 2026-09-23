@@ -140,6 +140,13 @@ should run `cargo fmt` on it — no semantic change needed.
 
 `Type::Commit = 5` (Go `key.Commit`); the reserved range is now 6..=15.
 `is_valid`, `from_u8` and `Display` follow; the tests that used 5 as "a
-reserved type" use 6. A `Commit` key's length field is the object's own
-serialized byte length, the `Blob`/`XattrSet` rule. `keys.json` needed no
+reserved type" use 6. A `Commit` key's length field was the object's own
+serialized byte length, the `Blob`/`XattrSet` rule, until Go PR #15 (below). `keys.json` needed no
 regeneration: it never pinned 5 as reserved. See `port-notes/commit.md`.
+
+## Go PR #15 backport (2026-09-23)
+
+Only `new_from_hash`'s doc comment changed, as in Go: a `Commit`'s length
+field is a logical size, like a directory's — the commit's own bytes plus the
+length fields of its tree and conflict terms (`commit::footprint`). `key`
+itself still takes the length verbatim. `keys.json` is unaffected.

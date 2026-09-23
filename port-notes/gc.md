@@ -222,3 +222,15 @@ refreshes the view first. Details and deviations:
 is the test binary re-executed with `--exact gc::multi_tests::child_process_entry`.
 `collect_while_another_store_ingests` brackets with the collector's span where
 Go's test opens the span on the store: the pattern the documents recommend.
+
+## Go PR #15 backport (2026-09-23)
+
+No production change again. `tree_holding_a_commit_keeps_its_history_live`
+ports Go's new test: a reference on a plain directory whose `S_IFDIR` entry
+holds a commit keeps that commit's tree and ancestry alive through a cycle,
+because a DirLeaf's children are its entries' content keys whatever their
+type, and dropping the reference reclaims them. The completeness walk behind
+`prepare_ref` goes through the commit too, and with `fstree`'s key check it
+now refuses a root that reaches a commit keyed by v0.0.9's own-bytes rule
+(`gc: walking root K: fstree: Commit K: length field … is not the commit's
+footprint …`), before a gc pass could meet it as "corrupt pack data".

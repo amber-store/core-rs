@@ -198,14 +198,16 @@ impl<E> Error<E> {
 }
 
 /// Streams a PAX tar of the directory tree rooted at `root` to `w`. `root`
-/// must be a directory object (DirLeaf or DirNode). `get` fetches the bytes
-/// stored under a key.
+/// must be a directory object (DirLeaf or DirNode) or a Commit, which stands
+/// for its tree; so does a commit held by a directory entry anywhere beneath.
+/// The commit objects themselves are skipped: the archive holds plain
+/// directories. `get` fetches the bytes stored under a key.
 pub fn write<W, G, E>(w: &mut W, root: Key, get: G) -> Result<(), Error<E>>
 where
     W: io::Write + ?Sized,
     G: FnMut(Key) -> Result<Vec<u8>, E>,
 {
-    if root.type_() != Type::DirLeaf && root.type_() != Type::DirNode {
+    if !matches!(root.type_(), Type::DirLeaf | Type::DirNode | Type::Commit) {
         return Err(Error::NotDirectory { key: root });
     }
     let mut e = Exporter {
@@ -1472,6 +1474,92 @@ mod tests {
                 blob.key
             )
         );
+    }
+
+    /// A commit is skipped over: where a directory entry holds one, and where
+    /// one is the root, the archive contains the commit's tree as a plain
+    /// directory (Go: `TestWrite_ReadsThroughACommit`).
+    #[test]
+    fn write_reads_through_a_commit() {
+        let mut store = MemStore::default();
+        let mut put = |o: fstree::Object| {
+            store.put(&o);
+            o
+        };
+        let file = |name: &str, k: Key| Entry {
+            name: name.as_bytes().to_vec(),
+            mode: 0o100644,
+            content_key: k.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let dir = |name: &str, k: Key| Entry {
+            name: name.as_bytes().to_vec(),
+            mode: 0o040755,
+            content_key: k.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let inner_file = put(encode_blob(b"inner file"));
+        let sub = put(encode_dir_leaf(&[file("file", inner_file.key)]).unwrap());
+        let readme = put(encode_blob(b"readme"));
+        let inner =
+            put(encode_dir_leaf(&[file("README", readme.key), dir("sub", sub.key)]).unwrap());
+        let id = crate::commit::Identity {
+            name: "Ann".into(),
+            when: 1,
+            ..Default::default()
+        };
+        let (vendored, vendored_bytes) = crate::commit::Commit {
+            tree: inner.key,
+            parents: Vec::new(),
+            author: id.clone(),
+            committer: id,
+            message: "vendored".into(),
+            signature: Vec::new(),
+            public_key: Vec::new(),
+            change_id: Vec::new(),
+            conflict_terms: Vec::new(),
+            conflict_labels: Vec::new(),
+        }
+        .object()
+        .unwrap();
+        let main = put(encode_blob(b"package main"));
+        let top = put(encode_dir_leaf(&[
+            file("main.go", main.key),
+            dir("vendor", vendored), // a directory entry holding a commit
+        ])
+        .unwrap());
+        store.0.insert(vendored, vendored_bytes);
+
+        let mut buf = Vec::new();
+        write(&mut buf, top.key, store.get()).expect("Write(a tree that holds a commit)");
+        let entries = read_all(&buf);
+        let types: HashMap<Vec<u8>, u8> = entries.iter().map(|(n, t, _)| (n.clone(), *t)).collect();
+        let contents: HashMap<Vec<u8>, Vec<u8>> =
+            entries.into_iter().map(|(n, _, d)| (n, d)).collect();
+        assert_eq!(
+            types[&b"vendor/".to_vec()],
+            TYPE_DIR,
+            "vendor/ is a directory"
+        );
+        for (name, want) in [
+            (&b"main.go"[..], &b"package main"[..]),
+            (b"vendor/README", b"readme"),
+            (b"vendor/sub/file", b"inner file"),
+        ] {
+            assert_eq!(
+                contents.get(name).map(Vec::as_slice),
+                Some(want),
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
+
+        let mut buf = Vec::new();
+        write(&mut buf, vendored, store.get()).expect("Write(a commit)");
+        let contents: HashMap<Vec<u8>, Vec<u8>> =
+            read_all(&buf).into_iter().map(|(n, _, d)| (n, d)).collect();
+        assert_eq!(contents[&b"README".to_vec()], b"readme");
+        assert_eq!(contents[&b"sub/file".to_vec()], b"inner file");
     }
 
     #[test]

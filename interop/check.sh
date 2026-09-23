@@ -12,8 +12,9 @@
 #   3. a Rust restore of the Go-written store re-ingests (with Go) to the
 #      same root key.
 #   4. identical commit keys from both implementations for identical
-#      inputs, and each implementation shows and lists the commits the OTHER
-#      one wrote.
+#      inputs — with and without a change id, the tree named directly and
+#      through another commit — and each implementation shows and lists the
+#      commits the OTHER one wrote, `commit show` byte for byte.
 #   5. references live in one shared SQLite file: each implementation reads
 #      (ref get, ref list, ls ref:NAME@PATH) the references the OTHER one
 #      wrote into the same store directory, moves them with --expect, is
@@ -167,6 +168,30 @@ cmp "$WORK/ls-commit-go.txt" "$WORK/ls-commit-rs.txt"
 [ "$("$RS" --store "$WORK/store-rs" ref get main)" = "$C2_RS" ]
 [ "$("$GO" --store "$WORK/store-rs" ref get main)" = "$C2_RS" ]
 [ "$("$RS" --store "$WORK/store-go" ref get main)" = "$C2_GO" ]
+# A change id travels in the record, and TREE may be named through a commit
+# (here a path below the child commit): the key's length field is the
+# footprint, own bytes plus the tree, so both sides must agree on that too.
+CID=000102030405060708090a0b0c0d0e0f
+C3_GO=$("$GO" --store "$WORK/store-go" commit create --author 'Ann <ann@example.com>' --date "$DATE" \
+  --parent "$C2_GO" --change-id "$CID" -m 'with a change id' "$C2_GO/deep")
+C3_RS=$("$RS" --store "$WORK/store-rs" commit create --author 'Ann <ann@example.com>' --date "$DATE" \
+  --parent "$C2_RS" --change-id "$CID" -m 'with a change id' "$C2_RS/deep")
+echo "   go:   $C3_GO"
+echo "   rust: $C3_RS"
+[ "$C3_GO" = "$C3_RS" ] || { echo "FAIL: change-id commit keys differ" >&2; exit 1; }
+"$GO" --store "$WORK/store-go" commit show "$C3_GO" > "$WORK/show3-go-own.txt"
+"$RS" --store "$WORK/store-go" commit show "$C3_GO" > "$WORK/show3-rs-cross.txt"
+cmp "$WORK/show3-go-own.txt" "$WORK/show3-rs-cross.txt"
+"$RS" --store "$WORK/store-rs" commit show "$C3_RS" > "$WORK/show3-rs-own.txt"
+"$GO" --store "$WORK/store-rs" commit show "$C3_RS" > "$WORK/show3-go-cross.txt"
+cmp "$WORK/show3-rs-own.txt" "$WORK/show3-go-cross.txt"
+cmp "$WORK/show3-go-own.txt" "$WORK/show3-rs-own.txt"
+grep -qx "change-id $CID" "$WORK/show3-rs-own.txt" || { echo "FAIL: commit show prints no change id" >&2; exit 1; }
+# Each side accepts the other's commit as a parent: the walks hold a parent's
+# key to the footprint rule before a child is stored.
+C4_GO=$("$GO" --store "$WORK/store-rs" commit create --author 'Ann <ann@example.com>' --date "$DATE" --parent "$C3_RS" -m child "$C3_RS")
+C4_RS=$("$RS" --store "$WORK/store-go" commit create --author 'Ann <ann@example.com>' --date "$DATE" --parent "$C3_GO" -m child "$C3_GO")
+[ "$C4_GO" = "$C4_RS" ] || { echo "FAIL: cross-store child commit keys differ ($C4_GO vs $C4_RS)" >&2; exit 1; }
 
 echo "== two processes, two implementations, one store (concurrent ingest)"
 # Both CLIs write into the same store directory at the same time: each owns

@@ -6,8 +6,13 @@
 //! `TestE2E_RefExpect` (Go PR #13). The Go
 //! unit tests of `parseIdentity` and `renderCommit` are covered through the
 //! CLI in `commit_identity_and_rendering`: the example carries no unit
-//! tests. Go drives `newApp()` in-process; here each
-//! case spawns the compiled example binary.
+//! tests. Go PR #15 added `TestE2E_CommitInsideADirectory`,
+//! `TestE2E_CommitKeyedByTheOldRuleIsRefused` and
+//! `TestE2E_CommitUnderARegularFileEntryIsRefused`, which build through the
+//! library what no command can, and `TestRenderCommitConflicted` /
+//! `TestIdentityLineWithoutNameOrEmail`, covered here by `commit show` of
+//! commits stored through the library. Go drives `newApp()` in-process; here
+//! each case spawns the compiled example binary.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -18,6 +23,11 @@ use std::thread;
 use std::time::Duration;
 
 use tempfile::TempDir;
+
+use amber_store_core::commit::{Commit, Identity};
+use amber_store_core::fstree::{self, Entry};
+use amber_store_core::key::{Key, Type};
+use amber_store_core::{packstore, tarextract};
 
 // ---------------------------------------------------------------------------
 // Harness (Go: e2e_test.go's runApp / writeFixture).
@@ -83,6 +93,25 @@ fn run_seg(store: &Path, rest: &[&str]) -> Result<String, String> {
     ];
     args.extend(rest.iter().map(|s| s.to_string()));
     run_app(&args)
+}
+
+/// Runs the CLI with only `--store <dir>` ahead of `rest`, as the Go tests
+/// of commits inside directories do; the output comes back trimmed.
+fn run_store(store: &Path, rest: &[&str]) -> Result<String, String> {
+    let mut args = vec!["--store".to_string(), store.display().to_string()];
+    args.extend(rest.iter().map(|s| s.to_string()));
+    run_app(&args).map(|out| out.trim().to_string())
+}
+
+/// Opens the store's objects through the library, where the CLI keeps them.
+/// No command builds a tree that holds a commit (ingest reads a filesystem,
+/// which has none), so the tests do, as Go's do.
+fn open_objects(store: &Path) -> packstore::Store {
+    packstore::Store::open(store.join("packstore")).expect("open the packstore")
+}
+
+fn parse_key(printed: &str) -> Key {
+    Key::parse(&hex::decode(printed).expect("hex key")).expect("canonical key")
 }
 
 /// Builds a small source tree: files, a subdirectory, a symlink (Go:
@@ -296,7 +325,42 @@ fn commit_end_to_end() {
 
     fs::write(src.path().join("a.txt"), "alpha, revised").unwrap();
     let root2 = run(&["ingest", "--no-progress", &src_s]);
-    let c2 = create(&["--parent", "ref:main", "-m", "second", &root2]);
+    let c2 = create(&[
+        "--parent",
+        "ref:main",
+        "--change-id",
+        "00ff10",
+        "-m",
+        "second",
+        &root2,
+    ]);
+    // A change id that is given has to be hex, and not empty; the error text
+    // is Go's, encoding/hex's included.
+    for (bad, want) in [
+        ("xyz", "--change-id: encoding/hex: invalid byte: U+0078 'x'"),
+        ("abc", "--change-id: encoding/hex: odd length hex string"),
+        (
+            "",
+            "--change-id: empty; leave the flag out for a commit without a change id",
+        ),
+    ] {
+        let err = run_seg(
+            store.path(),
+            &[
+                "commit",
+                "create",
+                "--author",
+                "Ann <ann@example.com>",
+                "--change-id",
+                bad,
+                "-m",
+                "bad",
+                &root2,
+            ],
+        )
+        .expect_err("commit create accepted a bad change id");
+        assert!(err.contains(want), "change id {bad:?}: {err}");
+    }
     assert!(c1 != c2 && c2 != root2, "c1 {c1}, c2 {c2}, root2 {root2}");
     assert_eq!(run(&["ref", "get", "main"]), c2, "ref get main");
 
@@ -305,6 +369,7 @@ fn commit_end_to_end() {
         format!("commit {c2}"),
         format!("tree {root2}"),
         format!("parent {c1}"),
+        "change-id 00ff10".to_string(),
         "author Ann <ann@example.com> 2026-01-02T03:04:05+01:00".to_string(),
         "    second".to_string(),
     ] {
@@ -662,4 +727,333 @@ fn ref_expect() {
         panic!("ref rm -- -lead: {e}");
     }
     assert!(!rf(&["list"]).unwrap().contains("-lead"));
+}
+
+// ---------------------------------------------------------------------------
+// Commits inside directories, the footprint rule, conflicts (Go PR #15).
+// ---------------------------------------------------------------------------
+
+/// A directory entry may hold a commit. Every file operation reads through it
+/// to the commit's tree: the commit object itself is skipped (Go:
+/// `TestE2E_CommitInsideADirectory`).
+#[test]
+fn commit_inside_a_directory() {
+    let src = TempDir::new().unwrap();
+    write_fixture(src.path()); // a.txt, sub/b.txt, link
+    let store = TempDir::new().unwrap();
+    let src_s = src.path().display().to_string();
+    let run = |args: &[&str]| -> String {
+        run_store(store.path(), args).unwrap_or_else(|e| panic!("{args:?}: {e}"))
+    };
+    let root = run(&["ingest", "--no-progress", &src_s]);
+    let author = ["--author", "Ann <ann@example.com>"];
+    let vendored = run(&[
+        "commit", "create", author[0], author[1], "-m", "vendored", &root,
+    ]);
+
+    let ck = parse_key(&vendored);
+    let objects = open_objects(store.path());
+    let main_blob = fstree::encode_blob(b"package main");
+    let holder = fstree::encode_dir_leaf(&[
+        Entry {
+            name: b"main.go".to_vec(),
+            mode: 0o100644,
+            content_key: main_blob.key.as_bytes().to_vec(),
+            ..Default::default()
+        },
+        Entry {
+            name: b"vendor".to_vec(),
+            mode: 0o040755,
+            content_key: ck.as_bytes().to_vec(),
+            ..Default::default()
+        },
+    ])
+    .unwrap();
+    for o in [&main_blob, &holder] {
+        objects.put(o.key, &o.bytes).unwrap();
+    }
+    objects.close().unwrap();
+    let top = holder.key.to_string();
+
+    for (spec, want) in [
+        (top.clone(), "vendor"),
+        (format!("{top}/vendor"), "a.txt"),
+        (format!("{top}/vendor/sub"), "b.txt"),
+    ] {
+        let out = run(&["ls", &spec]);
+        assert!(out.contains(want), "ls {spec} output {out:?} lacks {want}");
+    }
+
+    // The archive holds the commit's tree under vendor/, as a plain directory.
+    let tmp = TempDir::new().unwrap();
+    let tar_path = tmp.path().join("top.tar");
+    run(&["export", "-o", &tar_path.display().to_string(), &top]);
+    let unpacked = tmp.path().join("unpacked");
+    tarextract::extract(&mut fs::File::open(&tar_path).unwrap(), &unpacked).unwrap();
+    let dest = tmp.path().join("restored");
+    run(&["restore", &top, &dest.display().to_string()]);
+    for dir in [&unpacked, &dest] {
+        for (name, want) in [
+            ("main.go", "package main"),
+            ("vendor/a.txt", "alpha"),
+            ("vendor/sub/b.txt", "beta"),
+        ] {
+            let got = fs::read_to_string(dir.join(name))
+                .unwrap_or_else(|e| panic!("{}: {e}", dir.join(name).display()));
+            assert_eq!(got, want, "{}", dir.join(name).display());
+        }
+        assert!(dir.join("vendor").is_dir());
+    }
+
+    // TREE may name a commit through such an entry: the new commit records
+    // that commit's tree, not the commit.
+    let regraft = run(&[
+        "commit",
+        "create",
+        author[0],
+        author[1],
+        "-m",
+        "regraft",
+        &format!("{top}/vendor"),
+    ]);
+    let show = run(&["commit", "show", &regraft]);
+    assert!(
+        show.contains(&format!("tree {root}")),
+        "commit show {show:?} does not record the vendored commit's tree {root}"
+    );
+    // So it does when it is named directly.
+    let again = run(&[
+        "commit", "create", author[0], author[1], "-m", "again", &vendored,
+    ]);
+    let show = run(&["commit", "show", &again]);
+    assert!(show.contains(&format!("tree {root}")), "{show:?}");
+}
+
+/// A commit keyed by the first release's rule, its own bytes alone, is not a
+/// commit any more. Nothing may be built on it: not a child commit, not a
+/// reference, not a listing. `commit show` still prints it, which is how its
+/// tree is found again (Go: `TestE2E_CommitKeyedByTheOldRuleIsRefused`).
+#[test]
+fn commit_keyed_by_the_old_rule_is_refused() {
+    let src = TempDir::new().unwrap();
+    write_fixture(src.path());
+    let store = TempDir::new().unwrap();
+    let src_s = src.path().display().to_string();
+    let root = run_store(store.path(), &["ingest", "--no-progress", &src_s]).unwrap();
+    let id = Identity {
+        name: "Ann".into(),
+        when: 1,
+        ..Default::default()
+    };
+    let (good, data) = Commit {
+        tree: parse_key(&root),
+        parents: Vec::new(),
+        author: id.clone(),
+        committer: id,
+        message: "from the first release".into(),
+        signature: Vec::new(),
+        public_key: Vec::new(),
+        change_id: Vec::new(),
+        conflict_terms: Vec::new(),
+        conflict_labels: Vec::new(),
+    }
+    .object()
+    .unwrap();
+    let old = Key::new(Type::Commit, data.len() as u64, &data);
+    assert_ne!(old, good);
+    let objects = open_objects(store.path());
+    objects.put(old, &data).unwrap(); // put trusts its caller, as it did then
+    objects.close().unwrap();
+    let old = old.to_string();
+
+    let out = run_store(store.path(), &["commit", "show", &old])
+        .expect("commit show should still print the commit, and so its tree");
+    assert!(out.contains(&format!("tree {root}")), "{out:?}");
+
+    let rule = format!(
+        "length field {own} is not the commit's footprint {} (its own {own} bytes plus its trees); a commit keyed by an older rule has to be created again",
+        good.length(),
+        own = data.len()
+    );
+    for args in [
+        vec![
+            "commit",
+            "create",
+            "--author",
+            "Ann <ann@example.com>",
+            "--parent",
+            &old,
+            "-m",
+            "child",
+            &root,
+        ],
+        vec!["ref", "set", "old", &old],
+        vec!["ls", &old],
+    ] {
+        let err = run_store(store.path(), &args)
+            .expect_err("a commit keyed by the old rule was built on");
+        assert!(
+            err.contains(&rule),
+            "{args:?}: want an error that names the footprint rule, got {err}"
+        );
+    }
+    // commit create names the parent it refuses, as Go does.
+    let err = run_store(
+        store.path(),
+        &[
+            "commit",
+            "create",
+            "--author",
+            "Ann <ann@example.com>",
+            "--parent",
+            &old,
+            "-m",
+            "child",
+            &root,
+        ],
+    )
+    .unwrap_err();
+    assert!(
+        err.contains(&format!("parent {old}: fstree: Commit {old}: length field")),
+        "{err}"
+    );
+}
+
+/// Only a directory entry may hold a commit. Under an entry of another type
+/// it is a malformed tree, which path resolution refuses (Go:
+/// `TestE2E_CommitUnderARegularFileEntryIsRefused`).
+#[test]
+fn commit_under_a_regular_file_entry_is_refused() {
+    let src = TempDir::new().unwrap();
+    write_fixture(src.path());
+    let store = TempDir::new().unwrap();
+    let src_s = src.path().display().to_string();
+    let root = run_store(store.path(), &["ingest", "--no-progress", &src_s]).unwrap();
+    let vendored = run_store(
+        store.path(),
+        &[
+            "commit",
+            "create",
+            "--author",
+            "Ann <ann@example.com>",
+            "-m",
+            "vendored",
+            &root,
+        ],
+    )
+    .unwrap();
+    let holder = fstree::encode_dir_leaf(&[Entry {
+        name: b"odd".to_vec(),
+        mode: 0o100644,
+        content_key: parse_key(&vendored).as_bytes().to_vec(),
+        ..Default::default()
+    }])
+    .unwrap();
+    let objects = open_objects(store.path());
+    objects.put(holder.key, &holder.bytes).unwrap();
+    objects.close().unwrap();
+
+    let err = run_store(store.path(), &["ls", &format!("{}/odd/sub", holder.key)])
+        .expect_err("ls through a regular-file entry that holds a commit");
+    assert!(
+        err.contains("\"odd\" holds a commit but is not a directory entry"),
+        "{err}"
+    );
+}
+
+/// Go's `TestRenderCommitConflicted` and `TestIdentityLineWithoutNameOrEmail`,
+/// byte for byte, through `commit show`: no command creates a conflicted
+/// commit or a nameless identity, so the commits are stored through the
+/// library. `commit show` prints a commit without looking at its trees or
+/// parents, so fabricated keys serve, as in Go.
+#[test]
+fn commit_show_conflicted_and_nameless() {
+    let store = TempDir::new().unwrap();
+    // Any command creates the store's layout; ref list is the cheapest.
+    run_store(store.path(), &["ref", "list"]).unwrap();
+    let hash = |first: u8| {
+        let mut h = [0u8; 32];
+        h[0] = first;
+        h
+    };
+    let tree = Key::new(Type::DirLeaf, 1, &[0x80]);
+    let remove = Key::new_from_hash(Type::DirLeaf, 300, hash(1));
+    let add = Key::new_from_hash(Type::DirNode, 70000, hash(2));
+    let parent = Key::new_from_hash(Type::Commit, 7, hash(1));
+    let when = 1_767_323_045_000_000_000;
+    let conflicted = Commit {
+        tree,
+        parents: vec![parent],
+        author: Identity {
+            name: "Ann".into(),
+            email: String::new(),
+            when,
+            tz_offset: 60,
+        },
+        committer: Identity {
+            name: String::new(),
+            email: "bot@example.com".into(),
+            when,
+            tz_offset: 60,
+        },
+        message: "m".into(),
+        signature: Vec::new(),
+        public_key: Vec::new(),
+        change_id: vec![0xab, 0xcd],
+        conflict_terms: vec![remove, add],
+        conflict_labels: vec!["ours".into(), String::new(), "theirs".into()],
+    };
+    let nobody = Commit {
+        tree,
+        parents: Vec::new(),
+        author: Identity::default(),
+        committer: Identity::default(),
+        message: String::new(),
+        signature: Vec::new(),
+        public_key: Vec::new(),
+        change_id: Vec::new(),
+        conflict_terms: Vec::new(),
+        conflict_labels: Vec::new(),
+    };
+    let (ck, cbytes) = conflicted.object().unwrap();
+    let (nk, nbytes) = nobody.object().unwrap();
+    let objects = open_objects(store.path());
+    objects.put(ck, &cbytes).unwrap();
+    objects.put(nk, &nbytes).unwrap();
+    objects.close().unwrap();
+
+    // run_app, not run_store: the output is compared untrimmed.
+    let show = |k: Key| {
+        run_app(&[
+            "--store".to_string(),
+            store.path().display().to_string(),
+            "commit".to_string(),
+            "show".to_string(),
+            k.to_string(),
+        ])
+        .unwrap()
+    };
+    assert_eq!(
+        show(ck),
+        format!(
+            "commit {ck}\n\
+             tree {tree}\n\
+             conflict-remove {remove}\n\
+             conflict-add {add}\n\
+             conflict-label 0 ours\n\
+             conflict-label 2 theirs\n\
+             parent {parent}\n\
+             change-id abcd\n\
+             author Ann 2026-01-02T04:04:05+01:00\n\
+             committer <bot@example.com> 2026-01-02T04:04:05+01:00\n\
+             \n    m\n"
+        )
+    );
+    // An identity may name nobody at all: no stray space before the time.
+    assert_eq!(
+        show(nk),
+        format!(
+            "commit {nk}\ntree {tree}\nauthor 1970-01-01T00:00:00Z\ncommitter 1970-01-01T00:00:00Z\n"
+        )
+    );
 }

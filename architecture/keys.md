@@ -26,7 +26,7 @@ A Big-Endian encoding of the total byte length of the content.
 
 Several combinations of length value and length-field size are semantically equivalent, so a canonical encoding is enforced: the first byte of the payload-length field must never be `0` (no leading-zero padding).
 
-There is a special case when the object type is a directory, the payload length will represent cumulative length of data in the whole subtree.
+There is a special case when the object type is a directory, the payload length will represent cumulative length of data in the whole subtree. A commit follows the same idea: its payload length is its own byte length plus the lengths of the trees it records, and its parent commits are not counted ([commits.md](commits.md#the-key)). [types.md](types.md#length-field-logical-size-not-serialized-size) states the rule for every type.
 
 ## Payload hash
 

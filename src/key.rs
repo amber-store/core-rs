@@ -126,8 +126,8 @@ impl Key {
     /// Assembles a canonical key from a CAS object type, a logical payload
     /// length, and a precomputed full 256-bit BLAKE3 digest. The digest is
     /// truncated to its leading bytes to fill the key. `length` is used
-    /// verbatim: for `Blob`/`XattrSet`/`Commit` it is the serialized byte length; for
-    /// `FileNode`/`DirLeaf`/`DirNode` it is the logical size (see
+    /// verbatim: for `Blob`/`XattrSet` it is the serialized byte length; for
+    /// `FileNode`/`DirLeaf`/`DirNode` and `Commit` it is a logical size (see
     /// `architecture/types.md`).
     ///
     /// Infallible, unlike Go's `NewFromHash`: its only error

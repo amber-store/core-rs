@@ -2,13 +2,13 @@
 
 This crate is a port of `github.com/amber-store/core` (Go; formerly
 `jobs-build/amber-store-core`), pinned at commit
-`1fb6953558f0977bc95857ef05a4a970543d4765` (the merge of PR #14, the
-packstore shared by many processes, between tags `v0.0.9` and `v0.0.10`).
-Not yet ported from that range: Go PR #8's `inbox.WithGate`. The Go sources
-are the normative reference wherever this document or `architecture/` is
-silent; clone the parent fresh when porting (the checkout at
-`/Users/dragan/jobs-build/amber-store-core` lags GitHub). The CI interop job
-pins the same Go commit in `.github/workflows/ci.yml`.
+`9026f423c13fb49cde8b3148dc98cb2a25411c01` (tag `v0.0.10`, the merge of PR
+#15, the jj fields of the `Commit` object). Not yet ported from that range:
+Go PR #8's `inbox.WithGate`. The Go sources are the normative reference
+wherever this document or `architecture/` is silent; clone the parent fresh
+when porting (the checkout at `/Users/dragan/jobs-build/amber-store-core`
+lags GitHub). The CI interop job pins the same Go commit in
+`.github/workflows/ci.yml`.
 
 ## Compatibility contract
 
@@ -172,6 +172,19 @@ if observable behavior matches). `check_complete` returns the visited keys
 (root first, BFS discovery order, each once; `Err` returns no partial list) —
 the collector hands them to the write barrier.
 
+A Commit key may stand where a directory's key is expected (Go PR #15,
+`dirof.go`): `dir_of(k, get)` names the directory a key stands for — a
+DirLeaf/DirNode key itself, a Commit's tree — and `lookup_entry`,
+`list_entries` and `collect_entries` call it **once, on entry**. So a commit
+reads as its tree as the root handed to a reader and as the content key of an
+`S_IFDIR` entry (the path walks re-enter the readers per component), and is
+refused like any non-directory key as the child of a `DirNode`. `child_keys`
+and `dir_of` decode a commit through one private `decode_commit`, which also
+holds the key's length field to the commit's footprint, with Go's error text:
+a commit keyed by v0.0.9's own-bytes rule is refused by every walk and reader.
+A DirLeaf's children are its entries' content keys whatever their type, so a
+directory that holds a commit keeps the commit, its tree and its history.
+
 ### `amberpack` (Go: `amberpack/`)
 
 Record codec per `architecture/amberpack.md`: 46-byte header, CRC-32C over
@@ -287,20 +300,31 @@ including whether Decode re-encodes-and-compares or validates structurally.
 ### `commit` (Go: `commit/`)
 
 The Commit object, CAS type 5 (`architecture/commits.md`): canonical record
-codec (keys 0–6, two nested identity maps with keys 0–3), the validation
-rules and bounds in Go's check order, `object` (key = type 5, length field =
-the encoding's own byte length), `signature_payload`, and Decode's four
-stages in Go's order — lax unmarshal, wire conversion, validation, canonical
-re-encode comparison — so the accept set is exactly "canonical encodings of
-valid commits" on both sides and every rejection is classified alike. The
-lax unmarshal lives in `fstree::fx` (a Go `string` target, generic
-`keyasint`-struct helpers, `unmarshal_commit`), so decode-stage diagnostics
-are fxamacker's byte for byte — including its rule that a type error inside
-a nested identity leaves carrying the **outer** field name with the inner Go
-type. Around it: `key::Type::Commit`; `fstree::child_keys` returns a
-commit's tree, then its parents in order, which is all the walks
+codec (keys 0–9: git's fields under 0–6, then what a jj commit carries
+besides — `7 change_id`, `8 conflict_terms`, `9 conflict_labels`, Go PR #15;
+two nested identity maps with keys 0–3, whose name may be empty), the
+validation rules and bounds in Go's check order, `trees` (the tree, then the
+conflict terms) and `conflicted`, `footprint` (own bytes plus the length
+field of every tree; a sum past 64 bits is an error), `object` (key = type 5,
+length field = the footprint; **parents are not counted**),
+`signature_payload` (the encoding without key 5, so it covers the new keys),
+and Decode's four stages in Go's order — lax unmarshal, wire conversion,
+validation, canonical re-encode comparison — so the accept set is exactly
+"canonical encodings of valid commits" on both sides and every rejection is
+classified alike: an empty array under key 8 or 9 and an empty byte string
+under key 7 decode, convert, validate and then fail the comparison, as in Go.
+The lax unmarshal lives in `fstree::fx` (a Go `string` target, generic
+`keyasint`-struct helpers, `[]string` and `[][]uint8` slice targets,
+`unmarshal_commit`), so decode-stage diagnostics are fxamacker's byte for
+byte — including its rules that a type error inside a nested identity leaves
+carrying the **outer** field name with the inner Go type, and that one inside
+an array names the **element's** Go type under the array's field. Around it:
+`key::Type::Commit`; `fstree::child_keys` returns a commit's tree, then its
+conflict terms, then its parents in order, which is all the walks
 (`reachable_keys`, `check_complete`, the gc mark, `why`) need to follow
-history; `packstore`'s `verify_object` checks a commit's length field.
+history and keep every side of a conflict; `packstore`'s `verify_object`
+decodes a commit and checks its length field against the footprint, so bytes
+under a Commit key that do not decode fail verification.
 
 ### `inbox` (Go: `inbox/`)
 
@@ -342,8 +366,13 @@ dir mtimes applied after children, path-safety checks).
 
 Dev-only mirror of `cmd/amber-store` (ingest/ls/export/restore/ref/commit/gc,
 --store, --segment-size, ref:NAME[@PATH] addressing, a commit standing for
-its tree wherever a directory spec is expected, `ref set --expect OLD|none`
-and `ref rm --expect OLD` with Go's parsing rules) for interop testing;
+its tree wherever a directory spec is expected — as the spec's root and as a
+directory entry on its path, never under an entry that is not `S_IFDIR` —,
+`commit create --change-id`, a parent verified through `child_keys` before
+the commit is stored, `commit show`'s `conflict-remove`/`conflict-add`/
+`conflict-label`/`change-id` lines byte for byte, `ref set --expect
+OLD|none` and `ref rm --expect OLD` with Go's parsing rules) for interop
+testing;
 uses only the public crate API + clap. No progress UI needed. The gc
 subcommands' output format strings are byte-compatible with Go (the bench
 and tests parse them); reference writes route through the collector, and
@@ -385,8 +414,10 @@ concurrency, GC observation, storage errors, and batch snapshot visibility.
 
 CI runs `interop/check.sh` against a pinned Go parity revision.
 The check compares ingestion keys, cross-reads stores, and compares exported archives.
-It creates the same commits with both CLIs and requires identical commit keys.
-Each CLI then shows and lists the commits the other one wrote.
+It creates the same commits with both CLIs and requires identical commit keys,
+with and without a change id, the tree named directly and through a commit.
+Each CLI then shows and lists the commits the other one wrote, `commit show`
+byte for byte, and accepts them as parents.
 Each CLI reads the references the other one wrote into the same store,
 moves them with `--expect`, and is refused with a stale expectation.
 It also corrupts each implementation's pack and repairs it with the other.

@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{Entry, Error, decode_dir_leaf, decode_dir_node, decode_file_node};
+use crate::commit::{self, Commit};
 use crate::key::{self, Key, Type};
 
 /// POSIX file-type mask/dir bits (Go uses `unix.S_IFMT` / `unix.S_IFDIR`;
@@ -65,6 +66,27 @@ pub enum ChildKeysError {
         /// The decode failure.
         source: crate::commit::Error,
     },
+    /// `fstree: Commit <key>: <err>` — the commit's footprint does not fit
+    /// the key's length field, so no key could carry it.
+    CommitFootprint {
+        /// The Commit object's key.
+        key: Key,
+        /// The footprint failure.
+        source: crate::commit::Error,
+    },
+    /// `fstree: Commit <key>: length field <n> is not the commit's footprint
+    /// <want> (its own <own> bytes plus its trees); a commit keyed by an
+    /// older rule has to be created again` — the key does not follow the key
+    /// rule. The first release keyed commits by their own bytes alone; those
+    /// are what this finds in practice.
+    CommitLength {
+        /// The Commit object's key.
+        key: Key,
+        /// The footprint the key's length field has to carry.
+        want: u64,
+        /// The commit's own serialized byte length.
+        own: usize,
+    },
     /// `fstree: "<name>": content key: <err>`
     EntryContentKey {
         /// The entry's name (rendered with `%q` semantics).
@@ -99,6 +121,16 @@ impl fmt::Display for ChildKeysError {
             ChildKeysError::DecodeCommit { key, source } => {
                 write!(f, "fstree: decoding Commit {key}: {source}")
             }
+            ChildKeysError::CommitFootprint { key, source } => {
+                write!(f, "fstree: Commit {key}: {source}")
+            }
+            ChildKeysError::CommitLength { key, want, own } => {
+                write!(
+                    f,
+                    "fstree: Commit {key}: length field {} is not the commit's footprint {want} (its own {own} bytes plus its trees); a commit keyed by an older rule has to be created again",
+                    key.length()
+                )
+            }
             ChildKeysError::EntryContentKey { name, source } => {
                 write!(
                     f,
@@ -123,7 +155,9 @@ impl std::error::Error for ChildKeysError {
             ChildKeysError::DecodeFileNode { source, .. }
             | ChildKeysError::DecodeDirNode { source, .. }
             | ChildKeysError::DecodeDirLeaf { source, .. } => Some(source),
-            ChildKeysError::DecodeCommit { source, .. } => Some(source),
+            ChildKeysError::DecodeCommit { source, .. }
+            | ChildKeysError::CommitFootprint { source, .. } => Some(source),
+            ChildKeysError::CommitLength { .. } => None,
             ChildKeysError::DirNodeChildKey { source, .. }
             | ChildKeysError::EntryContentKey { source, .. }
             | ChildKeysError::EntryXattrsKey { source, .. } => Some(source),
@@ -228,7 +262,9 @@ pub enum WalkError<E> {
         /// The rejected limit.
         limit: usize,
     },
-    /// A [`child_keys`] failure, returned unwrapped as in Go.
+    /// A [`child_keys`] failure, returned unwrapped as in Go. [`dir_of`]
+    /// reports a commit that does not decode, or whose key does not carry its
+    /// footprint, through the same variants, with the same text.
     Children(ChildKeysError),
     /// A leaf object is absent ([`check_complete`]), returned unwrapped.
     Missing(MissingObjectError),
@@ -375,9 +411,11 @@ impl<E: std::error::Error + 'static> std::error::Error for WalkError<E> {
 
 /// Returns the keys directly referenced by the object with key `k` and
 /// serialized bytes `data`, in encounter order. Blob and XattrSet objects are
-/// leaves and have no children. A Commit's children are its tree, then its
-/// parents in recorded order — so every walk built on `child_keys` follows
-/// history.
+/// leaves and have no children. A Commit's children are its tree, the further
+/// terms of a conflicted tree, then its parents, all in recorded order — so
+/// every walk built on `child_keys` follows history and keeps every side of a
+/// conflict. A DirLeaf's children are its entries' content keys whatever
+/// their type, so a directory entry that holds a Commit is followed too.
 pub fn child_keys(k: Key, data: &[u8]) -> Result<Vec<Key>, ChildKeysError> {
     match k.type_() {
         Type::Blob | Type::XattrSet => Ok(Vec::new()),
@@ -421,14 +459,61 @@ pub fn child_keys(k: Key, data: &[u8]) -> Result<Vec<Key>, ChildKeysError> {
             Ok(out)
         }
         Type::Commit => {
-            let c = crate::commit::Commit::decode(data)
-                .map_err(|source| ChildKeysError::DecodeCommit { key: k, source })?;
-            let mut out = Vec::with_capacity(1 + c.parents.len());
-            out.push(c.tree);
+            let c = decode_commit(k, data)?; // and hold k to the key rule: see there
+            let mut out = c.trees();
             out.extend(c.parents);
             Ok(out)
         }
     }
+}
+
+// A Commit key may stand where a directory's key is expected: as the key
+// handed to a reader, and as the content key of an S_IFDIR directory entry.
+// It reads as the directory the commit records — its tree; for a conflicted
+// commit, the first side. lookup_entry, list_entries and collect_entries take
+// one (through dir_of), and so does everything built on them. A commit's tree
+// is never a commit, so one step always suffices. Inside a directory's own
+// index, as the child of a DirNode, a commit is a malformed tree, and the
+// readers reject it like any other key that is not a directory's.
+
+/// Returns the directory object `k` stands for: `k` itself when it is a
+/// DirLeaf or DirNode, the tree of the commit when it is a Commit (Go:
+/// `DirOf`). `get` fetches the bytes stored under a key.
+pub fn dir_of<G, E>(k: Key, mut get: G) -> Result<Key, WalkError<E>>
+where
+    G: FnMut(Key) -> Result<Vec<u8>, E>,
+{
+    match k.type_() {
+        Type::DirLeaf | Type::DirNode => Ok(k),
+        Type::Commit => {
+            let data = get(k).map_err(|source| WalkError::Read { key: k, source })?;
+            let c = decode_commit(k, &data).map_err(WalkError::Children)?;
+            Ok(c.tree)
+        }
+        _ => Err(WalkError::NotDirObject { key: k }),
+    }
+}
+
+/// Decodes the commit stored under `k` and holds `k` to the key rule: its
+/// length field is the commit's footprint, its own bytes plus its trees. The
+/// store verifies the same on its checked paths, and so on every record a gc
+/// pass copies; its plain `put` trusts the caller. Checking here keeps a
+/// reference from being put on a commit — or on history built on one — that a
+/// later gc pass would refuse as corrupt. The first release keyed commits by
+/// their own bytes alone; those are what this finds in practice.
+fn decode_commit(k: Key, data: &[u8]) -> Result<Commit, ChildKeysError> {
+    let c =
+        Commit::decode(data).map_err(|source| ChildKeysError::DecodeCommit { key: k, source })?;
+    let want = commit::footprint(data.len() as u64, &c.trees())
+        .map_err(|source| ChildKeysError::CommitFootprint { key: k, source })?;
+    if k.length() != want {
+        return Err(ChildKeysError::CommitLength {
+            key: k,
+            want,
+            own: data.len(),
+        });
+    }
+    Ok(c)
 }
 
 /// Returns the entry called `name` in the directory object `dir`. It descends
@@ -436,11 +521,13 @@ pub fn child_keys(k: Key, data: &[u8]) -> Result<Vec<Key>, ChildKeysError> {
 /// entry name in that child's subtree), then scans the one DirLeaf that could
 /// hold the name — O(log n) objects for an n-entry directory. A missing name
 /// is [`WalkError::NotFound`]; `get` fetches the bytes stored under a key.
+/// `dir` may be the key of a Commit, which stands for its tree ([`dir_of`]).
 pub fn lookup_entry<G, E>(dir: Key, name: &[u8], mut get: G) -> Result<Entry, WalkError<E>>
 where
     G: FnMut(Key) -> Result<Vec<u8>, E>,
 {
-    let mut k = dir;
+    // A commit stands for its tree: here, and nowhere further down.
+    let mut k = dir_of(dir, &mut get)?;
     loop {
         let data = get(k).map_err(|source| WalkError::Read { key: k, source })?;
         match k.type_() {
@@ -476,7 +563,9 @@ where
 }
 
 /// Descends from the directory object `root` along the slash-separated path
-/// and returns the key of the directory it names. Empty components and `"."`
+/// and returns the content key of the directory entry it names, as stored: a
+/// DirLeaf or DirNode key, or the key of a Commit that stands for its tree
+/// ([`dir_of`]), which every reader here takes. Empty components and `"."`
 /// are ignored, so `""`, `"."`, and paths with leading/trailing slashes are
 /// accepted; `".."` is rejected (a CAS tree has no parent links). A missing
 /// component is [`WalkError::NotFound`], a non-directory component
@@ -558,6 +647,8 @@ pub fn collect_entries<G, E>(k: Key, mut get: G) -> Result<Vec<Entry>, WalkError
 where
     G: FnMut(Key) -> Result<Vec<u8>, E>,
 {
+    // A commit stands for its tree: here, and nowhere further down.
+    let k = dir_of(k, &mut get)?;
     let mut out = Vec::new();
     collect_inner(k, &mut get, &mut out)?;
     Ok(out)
@@ -619,6 +710,8 @@ where
     if limit == 0 {
         return Err(WalkError::BadLimit { limit });
     }
+    // A commit stands for its tree: here, and nowhere further down.
+    let dir = dir_of(dir, &mut get)?;
     let mut out = Vec::new();
     let more = list_into(&mut out, dir, after, limit, &mut get)?;
     Ok((out, more))
@@ -975,6 +1068,9 @@ mod tests {
             message: msg.into(),
             signature: Vec::new(),
             public_key: Vec::new(),
+            change_id: Vec::new(),
+            conflict_terms: Vec::new(),
+            conflict_labels: Vec::new(),
         };
         let (key, bytes) = c.object().expect("commit encodes");
         Object { key, bytes }
@@ -1069,6 +1165,452 @@ mod tests {
             err.missing_object().expect("MissingObjectError").key,
             blob_b
         );
+    }
+
+    // --- ports of Go fstree/commit_test.go and commit_keyed_test.go (PR #15) ---
+
+    /// A directory holding one regular file, and that file's blob (Go
+    /// `oneFileTree`).
+    fn one_file_tree(name: &str, content: &str) -> (Object, Object) {
+        let blob = encode_blob(content.as_bytes());
+        let tree = leaf(&[Entry {
+            name: name.as_bytes().to_vec(),
+            mode: 0o100644,
+            content_key: blob.key.as_bytes().to_vec(),
+            ..Default::default()
+        }]);
+        (tree, blob)
+    }
+
+    /// A commit of the conflicted tree: tree, then terms (Go `conflictedObj`).
+    fn conflicted_obj(tree: Key, terms: &[Key], parents: &[Key]) -> Object {
+        let id = crate::commit::Identity {
+            name: "Ann".into(),
+            email: "ann@example.com".into(),
+            when: 1,
+            tz_offset: 60,
+        };
+        let c = Commit {
+            tree,
+            parents: parents.to_vec(),
+            author: id.clone(),
+            committer: id,
+            message: "conflict".into(),
+            signature: Vec::new(),
+            public_key: Vec::new(),
+            change_id: Vec::new(),
+            conflict_terms: terms.to_vec(),
+            conflict_labels: Vec::new(),
+        };
+        let (key, bytes) = c.object().expect("commit encodes");
+        Object { key, bytes }
+    }
+
+    fn without(all: &[Object], drop: Key) -> Vec<&Object> {
+        all.iter().filter(|o| o.key != drop).collect()
+    }
+
+    fn dir_entry(name: &str, k: Key) -> Entry {
+        Entry {
+            name: name.as_bytes().to_vec(),
+            mode: 0o040755,
+            content_key: k.as_bytes().to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn file_entry(name: &str, k: Key) -> Entry {
+        Entry {
+            name: name.as_bytes().to_vec(),
+            mode: 0o100644,
+            content_key: k.as_bytes().to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn child_keys_conflicted_commit() {
+        let (a, _) = one_file_tree("f", "ours");
+        let (r, _) = one_file_tree("f", "base");
+        let (b, _) = one_file_tree("f", "theirs");
+        let p = commit_obj("p", a.key, &[]);
+        let c = conflicted_obj(a.key, &[r.key, b.key], &[p.key]);
+        // The tree, the conflict's other terms, then the parents.
+        let kids = child_keys(c.key, &c.bytes).unwrap();
+        assert_eq!(kids, vec![a.key, r.key, b.key, p.key]);
+    }
+
+    /// Every side of a conflict is transferred, required and kept alive with
+    /// the commit that records it.
+    #[test]
+    fn reachability_covers_every_conflict_term() {
+        let (a, blob_a) = one_file_tree("f", "ours");
+        let (r, blob_r) = one_file_tree("f", "base");
+        let (b, blob_b) = one_file_tree("f", "theirs");
+        let c = conflicted_obj(a.key, &[r.key, b.key], &[]);
+        let all = vec![a, blob_a, r, blob_r, b, blob_b.clone(), c.clone()];
+        let store = MemStore::of(&all.iter().collect::<Vec<_>>());
+
+        let keys = reachable_keys(c.key, store.get()).unwrap();
+        assert_eq!(keys.len(), all.len(), "all keys reachable");
+        check_complete(c.key, store.get(), store.has(), 4).expect("check_complete");
+
+        let rest = MemStore::of(&without(&all, blob_b.key));
+        let err = check_complete(c.key, rest.get(), rest.has(), 4).unwrap_err();
+        assert_eq!(
+            err.missing_object()
+                .expect("MissingObjectError for the last term's blob")
+                .key,
+            blob_b.key
+        );
+    }
+
+    /// A tree whose "vendor" entry is a directory entry holding a commit:
+    /// top/{main.go, vendor -> commit(inner/{README, sub/{file}})}, the commit
+    /// having one parent (Go `vendored`).
+    struct Vendored {
+        all: Vec<Object>,
+        top: Object,
+        inner: Object,
+        sub: Object,
+        blob_file: Object,
+        base: Object,
+        commit: Object,
+        blob_m: Object,
+    }
+
+    fn vendored_tree() -> Vendored {
+        let (sub, blob_file) = one_file_tree("file", "inner file");
+        let blob_r = encode_blob(b"readme");
+        let inner = leaf(&[file_entry("README", blob_r.key), dir_entry("sub", sub.key)]);
+        let base = commit_obj("base", inner.key, &[]);
+        let commit = commit_obj("vendored", inner.key, &[base.key]);
+        let blob_m = encode_blob(b"package main");
+        let top = leaf(&[
+            file_entry("main.go", blob_m.key),
+            dir_entry("vendor", commit.key), // a directory entry, a commit's key
+        ]);
+        let all = vec![
+            sub.clone(),
+            blob_file.clone(),
+            blob_r,
+            inner.clone(),
+            base.clone(),
+            commit.clone(),
+            blob_m.clone(),
+            top.clone(),
+        ];
+        Vendored {
+            all,
+            top,
+            inner,
+            sub,
+            blob_file,
+            base,
+            commit,
+            blob_m,
+        }
+    }
+
+    #[test]
+    fn dir_of_cases() {
+        let v = vendored_tree();
+        let node = complete_tree();
+        let node_root = node.last().unwrap().key;
+        let (a, _) = one_file_tree("f", "ours");
+        let (r, _) = one_file_tree("f", "base");
+        let conflict = conflicted_obj(a.key, &[r.key, v.inner.key], &[]);
+        let mut store = MemStore::of(&v.all.iter().collect::<Vec<_>>());
+        for o in node.iter().chain([&a, &r, &conflict]) {
+            store.insert(o);
+        }
+        for (name, input, want) in [
+            ("a leaf", v.inner.key, v.inner.key),
+            ("a node", node_root, node_root),
+            ("a commit", v.commit.key, v.inner.key),
+            ("a conflicted commit", conflict.key, a.key), // its first side
+        ] {
+            assert_eq!(dir_of(input, store.get()).unwrap(), want, "{name}");
+        }
+
+        let err = dir_of(v.blob_m.key, store.get()).unwrap_err();
+        assert!(matches!(err, WalkError::NotDirObject { .. }), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "fstree: {} is not a directory object (type Blob)",
+                v.blob_m.key
+            )
+        );
+
+        // A commit that is not there.
+        let rest = MemStore::of(&without(&v.all, v.commit.key));
+        let err = dir_of(v.commit.key, rest.get()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "fstree: reading {k}: object {k} not in store",
+                k = v.commit.key
+            )
+        );
+
+        // Bytes under a commit key that are no commit.
+        let junk = Key::new(Type::Commit, 12, b"not a commit");
+        store.0.insert(junk, b"not a commit".to_vec());
+        let err = dir_of(junk, store.get()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("fstree: decoding Commit {junk}: decoding commit: unexpected EOF")
+        );
+    }
+
+    /// A commit key reads as the directory it records, wherever a directory
+    /// key can stand: as the root of a walk and as the content key of a
+    /// directory entry, in the middle of a path and at its end.
+    #[test]
+    fn readers_pass_through_a_commit() {
+        let v = vendored_tree();
+        let store = MemStore::of(&v.all.iter().collect::<Vec<_>>());
+
+        let e = lookup_entry(v.commit.key, b"README", store.get()).unwrap();
+        assert_eq!(e.name, b"README");
+        let (page, more) = list_entries(v.commit.key, b"", 10, store.get()).unwrap();
+        assert!(!more);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[1].name, b"sub");
+        let all = collect_entries(v.commit.key, store.get()).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let k = resolve_path(v.top.key, "vendor/sub", store.get()).unwrap();
+        assert_eq!(k, v.sub.key, "resolve_path through the entry");
+        let e = resolve_entry(v.top.key, "vendor/sub/file", store.get())
+            .unwrap()
+            .expect("an entry");
+        assert_eq!(e.name, b"file");
+        assert_eq!(e.content_key, v.blob_file.key.as_bytes());
+        // The entry's key is returned as stored: the caller can tell a commit.
+        let k = resolve_path(v.top.key, "vendor", store.get()).unwrap();
+        assert_eq!(k, v.commit.key, "resolve_path to the entry");
+    }
+
+    /// A directory's length counts a commit entry like any other: by its
+    /// key's length field, which is the snapshot's footprint.
+    #[test]
+    fn dir_leaf_length_counts_a_commit_entry() {
+        let v = vendored_tree();
+        assert_eq!(
+            v.commit.key.length(),
+            v.commit.bytes.len() as u64 + v.inner.key.length(),
+            "commit key length is own bytes plus its tree"
+        );
+        assert_eq!(
+            v.top.key.length(),
+            v.top.bytes.len() as u64 + v.blob_m.key.length() + v.commit.key.length()
+        );
+    }
+
+    #[test]
+    fn check_complete_through_a_commit_entry() {
+        let v = vendored_tree();
+        let store = MemStore::of(&v.all.iter().collect::<Vec<_>>());
+        let visited = check_complete(v.top.key, store.get(), store.has(), 4).unwrap();
+        assert_eq!(
+            visited.len(),
+            v.all.len(),
+            "the commit, its tree and its history"
+        );
+        for (name, drop) in [
+            ("the commit", v.commit.key),
+            ("its tree", v.inner.key),
+            ("its parent", v.base.key),
+        ] {
+            let rest = MemStore::of(&without(&v.all, drop));
+            assert!(
+                check_complete(v.top.key, rest.get(), rest.has(), 4).is_err(),
+                "check_complete accepted a tree that holds a commit without {name}"
+            );
+        }
+        let rest = MemStore::of(&without(&v.all, v.blob_file.key));
+        let err = check_complete(v.top.key, rest.get(), rest.has(), 4).unwrap_err();
+        assert_eq!(
+            err.missing_object()
+                .expect("MissingObjectError for the file beneath the commit")
+                .key,
+            v.blob_file.key
+        );
+    }
+
+    /// A small stored tree and a commit of it: the commit's honest key, its
+    /// bytes, and the store.
+    fn committed_tree() -> (Key, Vec<u8>, Object, MemStore) {
+        let blob = encode_blob(b"content");
+        let tree = leaf(&[file_entry("a", blob.key)]);
+        let id = crate::commit::Identity {
+            name: "Ann".into(),
+            when: 1,
+            ..Default::default()
+        };
+        let c = Commit {
+            tree: tree.key,
+            parents: Vec::new(),
+            author: id.clone(),
+            committer: id,
+            message: "m".into(),
+            signature: Vec::new(),
+            public_key: Vec::new(),
+            change_id: Vec::new(),
+            conflict_terms: Vec::new(),
+            conflict_labels: Vec::new(),
+        };
+        let (good, data) = c.object().unwrap();
+        let mut store = MemStore::of(&[&blob, &tree]);
+        store.0.insert(good, data.clone());
+        (good, data, tree, store)
+    }
+
+    /// A commit's key carries its footprint. Bytes stored under another
+    /// length — the first release's rule was the commit's own bytes — are not
+    /// a commit the walks and readers accept: a reference could otherwise be
+    /// put on history that the store's verification, and with it every gc
+    /// copy, rejects.
+    #[test]
+    fn commit_keyed_without_its_footprint_is_rejected() {
+        let (good, data, _, mut store) = committed_tree();
+        let old = Key::new(Type::Commit, data.len() as u64, &data); // own bytes only
+        store.0.insert(old, data.clone());
+
+        child_keys(good, &data).expect("child_keys of an honest commit");
+        check_complete(good, store.get(), store.has(), 1)
+            .expect("check_complete of an honest commit");
+
+        let want = format!(
+            "fstree: Commit {old}: length field {own} is not the commit's footprint {} (its own {own} bytes plus its trees); a commit keyed by an older rule has to be created again",
+            good.length(),
+            own = data.len()
+        );
+        let err = child_keys(old, &data).unwrap_err();
+        assert!(
+            matches!(err, ChildKeysError::CommitLength { .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), want, "child_keys");
+        assert_eq!(
+            dir_of(old, store.get()).unwrap_err().to_string(),
+            want,
+            "dir_of"
+        );
+        assert_eq!(
+            collect_entries(old, store.get()).unwrap_err().to_string(),
+            want,
+            "collect_entries"
+        );
+        assert_eq!(
+            lookup_entry(old, b"a", store.get())
+                .unwrap_err()
+                .to_string(),
+            want,
+            "lookup_entry"
+        );
+        assert_eq!(
+            list_entries(old, b"", 10, store.get())
+                .unwrap_err()
+                .to_string(),
+            want,
+            "list_entries"
+        );
+        // A reference could be put on it otherwise.
+        assert_eq!(
+            check_complete(old, store.get(), store.has(), 1)
+                .unwrap_err()
+                .to_string(),
+            want,
+            "check_complete"
+        );
+        assert_eq!(
+            reachable_keys(old, store.get()).unwrap_err().to_string(),
+            want,
+            "reachable_keys"
+        );
+    }
+
+    /// A record whose trees' lengths do not fit 64 bits encodes and decodes,
+    /// but no key can carry its footprint, so no key is accepted for it.
+    #[test]
+    fn commit_whose_footprint_overflows_is_rejected() {
+        let (_, _, tree, _) = committed_tree();
+        let huge = Key::new_from_hash(Type::DirNode, u64::MAX, [0x33; key::SIZE]);
+        let small = Key::new_from_hash(Type::DirLeaf, 5, [0x44; key::SIZE]);
+        let c = conflicted_obj_unkeyed(tree.key, &[huge, small]);
+        let data = c.encode().expect("the record itself is sound");
+        let k = Key::new(Type::Commit, data.len() as u64, &data);
+        let err = child_keys(k, &data).unwrap_err();
+        assert!(
+            matches!(err, ChildKeysError::CommitFootprint { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("fstree: Commit {k}: commit footprint overflows the key's length field")
+        );
+    }
+
+    fn conflicted_obj_unkeyed(tree: Key, terms: &[Key]) -> Commit {
+        let id = crate::commit::Identity {
+            name: "Ann".into(),
+            when: 1,
+            ..Default::default()
+        };
+        Commit {
+            tree,
+            parents: Vec::new(),
+            author: id.clone(),
+            committer: id,
+            message: "huge".into(),
+            signature: Vec::new(),
+            public_key: Vec::new(),
+            change_id: Vec::new(),
+            conflict_terms: terms.to_vec(),
+            conflict_labels: Vec::new(),
+        }
+    }
+
+    /// A commit stands for a directory where a directory's key is expected:
+    /// handed to a reader, or in an S_IFDIR entry. Inside a directory's own
+    /// index, as the child of a DirNode, it is a malformed tree.
+    #[test]
+    fn commit_as_a_dir_node_child_is_rejected() {
+        let (ck, _, _, mut store) = committed_tree();
+        let node = encode_dir_node(&[DirPair {
+            sep_name: b"a".to_vec(),
+            child_key: ck.as_bytes().to_vec(),
+        }])
+        .unwrap();
+        store.insert(&node);
+
+        let want = format!("fstree: {ck} is not a directory object (type Commit)");
+        assert_eq!(
+            lookup_entry(node.key, b"a", store.get())
+                .unwrap_err()
+                .to_string(),
+            want,
+            "lookup_entry read through a commit inside a directory's index"
+        );
+        assert_eq!(
+            list_entries(node.key, b"", 10, store.get())
+                .unwrap_err()
+                .to_string(),
+            want,
+            "list_entries"
+        );
+        assert_eq!(
+            collect_entries(node.key, store.get())
+                .unwrap_err()
+                .to_string(),
+            want,
+            "collect_entries"
+        );
+        // As a root it still reads as its tree.
+        assert_eq!(collect_entries(ck, store.get()).unwrap().len(), 1);
     }
 
     // --- ports of Go collect_test.go ---

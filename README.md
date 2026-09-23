@@ -7,7 +7,7 @@ its content.
 
 This crate is the Rust port of
 [`github.com/amber-store/core`](https://github.com/amber-store/core)
-(pinned at Go `1fb6953`, after v0.0.9, see [`PORTING.md`](PORTING.md)), intended to be embedded as a **library** in other Rust
+(pinned at v0.0.10, see [`PORTING.md`](PORTING.md)), intended to be embedded as a **library** in other Rust
 projects. The format is specified in [`architecture/`](architecture/).
 
 ## Compatibility with the Go implementation
@@ -50,14 +50,14 @@ The modules mirror the Go packages; see the crate docs (`cargo doc --open`).
 | Module | Role |
 |--------|------|
 | `key` | The 32-byte content key: type, length, truncated BLAKE3 hash. |
-| `fstree` | Tree objects (encode/decode), bottom-up builders, read paths. |
+| `fstree` | Tree objects (encode/decode), bottom-up builders, read paths. A commit key reads as its tree, as a root and as the content key of a directory entry. |
 | `chunkers` | UltraCDC byte chunking and BLAKE3 item chunking. |
 | `ingest` | Build a tree from a local directory; honors `.amberignore`; `Opts::exclude` skips names at the root (a working copy's metadata directory). |
 | `amberignore` | `.gitignore`-semantics exclusion for ingestion. |
 | `packstore` | Append-only pack segments with parallel, deduplicating, verifying writers. Any number of processes may read and write one store at once; see [`architecture/packstore.md`](architecture/packstore.md). |
 | `refstore` | SQLite-backed (WAL, multi-process) name → record map for references, with optimistic updates; the file is shared with the Go implementation. |
 | `reference` | The reference record: canonical CBOR encoding and validation. |
-| `commit` | The commit record (object type 5): canonical CBOR encoding and validation; signature fields carried opaquely. See [`architecture/commits.md`](architecture/commits.md). |
+| `commit` | The commit record (object type 5): canonical CBOR encoding and validation; a change id and conflicted trees for jj; a key whose length field is the footprint of the snapshot (own bytes plus its trees); signature fields carried opaquely. See [`architecture/commits.md`](architecture/commits.md). |
 | `amberpack` | The flat pack stream format for transfer and storage. |
 | `inbox` | Durable pack receiving. |
 | `tarexport` / `tarextract` | PAX tar streaming out of / into the store. |
@@ -76,6 +76,11 @@ tarexport::write(&mut out, root, |k| store.get(k))?;
 
 A dev CLI mirroring the Go `amber-store` commands
 (ingest/ls/export/restore/ref/commit/gc) ships as an example: `cargo run --example amber-store -- --store ./store ingest DIR`.
+A commit key, or a reference to one, works wherever a directory `KEY` does — it
+stands for the commit's tree. So does a directory entry that holds a commit:
+`ls`, `export` and `restore` skip the commit object and continue with its tree.
+`commit create --change-id HEX` carries a change id; `commit show` prints it,
+and the sides and labels of a conflicted tree.
 
 ## Development
 
