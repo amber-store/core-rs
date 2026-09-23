@@ -14,6 +14,10 @@
 #   4. identical commit keys from both implementations for identical
 #      inputs, and each implementation shows and lists the commits the OTHER
 #      one wrote.
+#   5. references live in one shared SQLite file: each implementation reads
+#      (ref get, ref list, ls ref:NAME@PATH) the references the OTHER one
+#      wrote into the same store directory, moves them with --expect, is
+#      refused with a stale expectation, and both see the final state.
 set -euo pipefail
 
 RS_REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -79,10 +83,60 @@ echo "== restore (rust, from the go store) -> re-ingest (go) -> same root"
 ROOT_AGAIN=$("$GO" --store "$WORK/store-check" ingest "$WORK/restored")
 [ "$ROOT_GO" = "$ROOT_AGAIN" ] || { echo "FAIL: restored tree re-ingests to $ROOT_AGAIN" >&2; exit 1; }
 
-echo "== refs (per-implementation; DB formats intentionally differ, see PORTING.md)"
-"$RS" --store "$WORK/store-rs" ref set nightly "$ROOT_RS"
-[ "$("$RS" --store "$WORK/store-rs" ref get nightly)" = "$ROOT_RS" ]
-"$RS" --store "$WORK/store-rs" ls "ref:nightly@docs" > /dev/null
+echo "== refs (one shared refs.sqlite: each side reads and moves what the OTHER wrote)"
+fail() { echo "FAIL: $*" >&2; exit 1; }
+# A second root in each store, so a reference has somewhere to move to.
+mkdir -p "$WORK/tree2"
+printf 'second tree\n' > "$WORK/tree2/two.txt"
+ROOT2_GO=$("$GO" --store "$WORK/store-go" ingest "$WORK/tree2")
+ROOT2_RS=$("$RS" --store "$WORK/store-rs" ingest "$WORK/tree2")
+[ "$ROOT2_GO" = "$ROOT2_RS" ] || fail "second root keys differ"
+ROOT2=$ROOT2_GO
+# In each round WRITER created the store and writes the reference; READER is
+# the other implementation, working in the same store directory.
+for writer in go rust; do
+  if [ "$writer" = go ]; then
+    WRITER="$GO"; READER="$RS"; STORE="$WORK/store-go"
+  else
+    WRITER="$RS"; READER="$GO"; STORE="$WORK/store-rs"
+  fi
+  "$WRITER" --store "$STORE" ref set nightly "$ROOT_GO"
+  "$WRITER" --store "$STORE" ref set --expect none other "$ROOT2"
+  # The other side reads them: get, list, and a path through the reference.
+  [ "$("$READER" --store "$STORE" ref get nightly)" = "$ROOT_GO" ] || fail "$writer wrote nightly; the other side does not read it back"
+  "$WRITER" --store "$STORE" ref list > "$WORK/refs-$writer-own.txt"
+  "$READER" --store "$STORE" ref list > "$WORK/refs-$writer-cross.txt"
+  [ "$(wc -l < "$WORK/refs-$writer-own.txt")" -eq 2 ] || fail "$writer lists $(cat "$WORK/refs-$writer-own.txt")"
+  cmp "$WORK/refs-$writer-own.txt" "$WORK/refs-$writer-cross.txt"
+  "$WRITER" --store "$STORE" ls --keys "ref:nightly@docs" > "$WORK/ls-ref-$writer-own.txt"
+  "$READER" --store "$STORE" ls --keys "ref:nightly@docs" > "$WORK/ls-ref-$writer-cross.txt"
+  cmp "$WORK/ls-ref-$writer-own.txt" "$WORK/ls-ref-$writer-cross.txt"
+  # The other side moves the reference optimistically. A stale expectation
+  # and "must not exist" are refused and change nothing ...
+  if "$READER" --store "$STORE" ref set --expect "$ROOT2" nightly "$ROOT2" 2> /dev/null; then
+    fail "a stale --expect moved the reference $writer wrote"
+  fi
+  if "$READER" --store "$STORE" ref set --expect none nightly "$ROOT2" 2> /dev/null; then
+    fail "--expect none overwrote the reference $writer wrote"
+  fi
+  if "$READER" --store "$STORE" ref rm --expect "$ROOT2" nightly 2> /dev/null; then
+    fail "a stale --expect deleted the reference $writer wrote"
+  fi
+  [ "$("$WRITER" --store "$STORE" ref get nightly)" = "$ROOT_GO" ] || fail "a refused write changed nightly"
+  # ... the right one moves it, and both sides see the move.
+  "$READER" --store "$STORE" ref set --expect "$ROOT_GO" nightly "$ROOT2"
+  [ "$("$WRITER" --store "$STORE" ref get nightly)" = "$ROOT2" ] || fail "$writer does not see the other side's move"
+  [ "$("$READER" --store "$STORE" ref get nightly)" = "$ROOT2" ] || fail "the mover does not see its own move"
+  # And back again by the writer, expecting what the other side stored.
+  "$WRITER" --store "$STORE" ref set --expect "$ROOT2" nightly "$ROOT_GO"
+  "$READER" --store "$STORE" ref rm --expect "$ROOT2" other
+  # Both sides see the same final state: nightly alone, at the first root.
+  "$WRITER" --store "$STORE" ref list > "$WORK/refs-$writer-own.txt"
+  "$READER" --store "$STORE" ref list > "$WORK/refs-$writer-cross.txt"
+  cmp "$WORK/refs-$writer-own.txt" "$WORK/refs-$writer-cross.txt"
+  [ "$(cut -d' ' -f1,2 "$WORK/refs-$writer-own.txt")" = "nightly $ROOT_GO" ] || fail "final references in the $writer store: $(cat "$WORK/refs-$writer-own.txt")"
+  "$READER" --store "$STORE" ls "ref:nightly@docs" > /dev/null
+done
 
 echo "== commits (identical keys for identical inputs; cross-read)"
 DATE=2026-01-02T03:04:05+01:00
@@ -109,7 +163,10 @@ cmp "$WORK/show-go-own.txt" "$WORK/show-rs-own.txt"
 "$GO" --store "$WORK/store-rs" ls --keys "$C2_RS/deep" > "$WORK/ls-commit-go.txt"
 "$RS" --store "$WORK/store-go" ls --keys "$C2_GO/deep" > "$WORK/ls-commit-rs.txt"
 cmp "$WORK/ls-commit-go.txt" "$WORK/ls-commit-rs.txt"
+# commit create --ref wrote a reference; each side resolves the OTHER's.
 [ "$("$RS" --store "$WORK/store-rs" ref get main)" = "$C2_RS" ]
+[ "$("$GO" --store "$WORK/store-rs" ref get main)" = "$C2_RS" ]
+[ "$("$RS" --store "$WORK/store-go" ref get main)" = "$C2_GO" ]
 
 echo "== repairing packs across implementations"
 (cd "$RS_REPO" && cargo build -q --example repair-interop)

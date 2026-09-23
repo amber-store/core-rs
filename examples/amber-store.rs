@@ -145,9 +145,27 @@ enum RefCmd {
     /// print the key a reference points at
     Get { name: String },
     /// create or overwrite reference NAME pointing at KEY
-    Set { name: String, key: String },
+    Set {
+        /// only if NAME currently points at OLD; 'none': only if NAME does
+        /// not exist
+        #[arg(long, value_name = "OLD")]
+        expect: Option<String>,
+        /// NAME KEY. Flags go before them, as in Go (urfave/cli): whatever
+        /// follows the first positional is a positional, so a misplaced
+        /// --expect fails the argument count instead of being honoured.
+        /// A NAME that begins with a dash goes after `--`, as in Go.
+        #[arg(value_name = "NAME KEY", trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// delete reference NAME
-    Rm { name: String },
+    Rm {
+        /// only if NAME currently points at OLD
+        #[arg(long, value_name = "OLD")]
+        expect: Option<String>,
+        /// NAME; flags go before it
+        #[arg(value_name = "NAME", trailing_var_arg = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -461,7 +479,14 @@ fn run_ingest(cli: &Cli, a: &IngestArgs) -> Result<(), CliError> {
             // after ingest (Go: runIngest's openCollector + putRef +
             // coll.Close join).
             let coll = open_collector(cli, &st, gc::Options::default())?;
-            let res = put_ref(&coll, &st.refs, name, root, &raw);
+            let res = put_ref(
+                &coll,
+                &st.refs,
+                name,
+                root,
+                &raw,
+                Expectation::Unconditional,
+            );
             let closed = coll.close().map_err(CliError::from);
             join_errs([res, closed])
         });
@@ -731,6 +756,56 @@ fn restore_inner(st: &Stores, a: &RestoreArgs) -> Result<(), CliError> {
 // ref (Go: ref.go).
 // ---------------------------------------------------------------------------
 
+/// The precondition of an optimistic reference write: the reference must
+/// not have moved since the caller last looked (Go: `expectation`).
+#[derive(Clone, Copy)]
+enum Expectation {
+    /// Write unconditionally.
+    Unconditional,
+    /// The reference must not exist.
+    Absent,
+    /// The reference must point here.
+    At(Key),
+}
+
+/// Parses --expect (Go: `parseExpect`). `given` is `None` when the flag was
+/// not passed at all.
+fn parse_expect(given: Option<&str>, allow_none: bool) -> Result<Expectation, CliError> {
+    let Some(s) = given else {
+        return Ok(Expectation::Unconditional);
+    };
+    match s {
+        // A script's unset variable. It must not quietly turn the write
+        // into an unconditional one.
+        "" => Err("--expect is empty: it takes the key the reference must point at".into()),
+        "none" if allow_none => Ok(Expectation::Absent),
+        "none" => Err("--expect none: a delete cannot expect the reference to be absent".into()),
+        _ => match parse_hex_key(s) {
+            Ok(k) => Ok(Expectation::At(k)),
+            Err(e) => Err(format!("--expect: {e}").into()),
+        },
+    }
+}
+
+impl Expectation {
+    /// Turns the store's typed errors into what the user expected (Go:
+    /// `expectation.explain`).
+    fn explain(&self, name: &str, err: refstore::Error) -> CliError {
+        match self {
+            Expectation::Absent if err.is_conflict() => {
+                format!("reference {name:?} already exists: {err}").into()
+            }
+            Expectation::At(k) if err.is_conflict() => {
+                format!("reference {name:?} does not point at {k}: {err}").into()
+            }
+            Expectation::At(k) if err.is_not_found() => {
+                format!("reference {name:?} does not exist, expected it at {k}: {err}").into()
+            }
+            _ => err.into(),
+        }
+    }
+}
+
 fn run_ref(cli: &Cli, cmd: &RefCmd) -> Result<(), CliError> {
     match cmd {
         RefCmd::List => {
@@ -748,8 +823,15 @@ fn run_ref(cli: &Cli, cmd: &RefCmd) -> Result<(), CliError> {
             println!("{k}");
             close
         }
-        RefCmd::Set { name, key } => {
-            let k = parse_hex_key(key)?;
+        RefCmd::Set { expect, args } => {
+            if args.len() != 2 {
+                return Err(
+                    format!("ref set requires NAME KEY arguments, got {}", args.len()).into(),
+                );
+            }
+            let name = &args[0];
+            let k = parse_hex_key(&args[1])?;
+            let exp = parse_expect(expect.as_deref(), true)?;
             let rec = Reference {
                 name: name.clone(),
                 key: k.as_bytes().to_vec(),
@@ -765,12 +847,21 @@ fn run_ref(cli: &Cli, cmd: &RefCmd) -> Result<(), CliError> {
                     return Err(e);
                 }
             };
-            let res = put_ref(&coll, &st.refs, name, k, &raw);
+            let res = put_ref(&coll, &st.refs, name, k, &raw, exp);
             let closed = coll.close().map_err(CliError::from);
             drop(coll); // release the collector's store handles first
             join_errs([res, closed, close_store(st)])
         }
-        RefCmd::Rm { name } => {
+        RefCmd::Rm { expect, args } => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "ref rm requires exactly one NAME argument, got {}",
+                    args.len()
+                )
+                .into());
+            }
+            let name = &args[0];
+            let exp = parse_expect(expect.as_deref(), false)?;
             let st = open_store(cli)?;
             let coll = match open_collector(cli, &st, gc::Options::default()) {
                 Ok(c) => c,
@@ -779,7 +870,7 @@ fn run_ref(cli: &Cli, cmd: &RefCmd) -> Result<(), CliError> {
                     return Err(e);
                 }
             };
-            let res = rm_ref(&coll, &st.refs, name);
+            let res = rm_ref(&coll, &st.refs, name, exp);
             let closed = coll.close().map_err(CliError::from);
             drop(coll);
             join_errs([res, closed, close_store(st)])
@@ -810,15 +901,18 @@ fn ref_list(st: &Stores) -> Result<(), CliError> {
 /// optimistic reference PUT: on a 404 the caller re-sends the missing
 /// objects and retries (Go: `putRef`).
 ///
-/// Calls for one name must be serialized by the caller (the one-shot CLI
-/// is); the read-old -> prepare -> put -> release sequence is not atomic
-/// against a concurrent writer of the same name.
+/// Unconditional calls for one name must be serialized by the caller (the
+/// one-shot CLI is); the read-old -> prepare -> put -> release sequence is
+/// not atomic against a concurrent writer of the same name. With an
+/// expectation the store itself refuses the write if the reference moved
+/// meanwhile.
 fn put_ref(
     coll: &gc::Collector,
     refs: &refstore::Store,
     name: &str,
     root: Key,
     raw: &[u8],
+    exp: Expectation,
 ) -> Result<(), CliError> {
     let mut old: Option<Key> = None;
     match refs.get(name) {
@@ -833,11 +927,23 @@ fn put_ref(
         Err(e) => return Err(e.into()),
     }
     let prepared = coll.prepare_ref(root)?;
-    if let Err(e) = refs.put(name, raw) {
+    let put = match exp {
+        Expectation::Unconditional => refs.put(name, raw),
+        Expectation::Absent => refs.create(name, raw),
+        Expectation::At(expected) => refs.compare_and_swap(name, expected, raw),
+    };
+    if let Err(e) = put {
         prepared.abort();
-        return Err(e.into());
+        return Err(exp.explain(name, e));
     }
     prepared.commit();
+    // With an expectation, what was overwritten is what the store compared
+    // against, whatever the read above saw: the expected key, or nothing.
+    let old = match exp {
+        Expectation::Unconditional => old,
+        Expectation::Absent => None,
+        Expectation::At(expected) => Some(expected),
+    };
     if let Some(old) = old {
         coll.release_ref(old)?;
     }
@@ -847,11 +953,21 @@ fn put_ref(
 /// Deletes a reference and releases its root: the tails leave the union;
 /// the closure file goes if no other name shares the root. No walk (Go:
 /// `rmRef`).
-fn rm_ref(coll: &gc::Collector, refs: &refstore::Store, name: &str) -> Result<(), CliError> {
-    let prev = refs.get(name)?;
+fn rm_ref(
+    coll: &gc::Collector,
+    refs: &refstore::Store,
+    name: &str,
+    exp: Expectation,
+) -> Result<(), CliError> {
+    let prev = refs.get(name).map_err(|e| exp.explain(name, e))?;
     let rec = Reference::decode(&prev).map_err(|e| format!("reference {name:?}: {e}"))?;
     let root = Key::parse(&rec.key).map_err(|e| format!("reference {name:?}: {e}"))?;
-    refs.delete(name)?;
+    let (deleted, root) = match exp {
+        // What was deleted pointed at the expected key, whatever prev said.
+        Expectation::At(expected) => (refs.compare_and_delete(name, expected), expected),
+        _ => (refs.delete(name), root),
+    };
+    deleted.map_err(|e| exp.explain(name, e))?;
     coll.release_ref(root)?;
     Ok(())
 }
@@ -1009,7 +1125,14 @@ fn create_commit(
         .map_err(CliError::from)
         .and_then(|ref_raw| {
             let coll = open_collector(cli, st, gc::Options::default())?;
-            let res = put_ref(&coll, &st.refs, name, k, &ref_raw);
+            let res = put_ref(
+                &coll,
+                &st.refs,
+                name,
+                k,
+                &ref_raw,
+                Expectation::Unconditional,
+            );
             let closed = coll.close().map_err(CliError::from);
             join_errs([res, closed])
         });
