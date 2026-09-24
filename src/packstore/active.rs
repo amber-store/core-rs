@@ -153,7 +153,12 @@ impl Store {
             drop_foreign(&mut sh, id);
             sh.active = Some(seg.clone());
         }
-        ap.active = Some(ActiveWriter { seg, size, sc });
+        ap.active = Some(ActiveWriter {
+            seg,
+            size,
+            reserved: size,
+            sc,
+        });
         Ok(true)
     }
 
@@ -239,6 +244,7 @@ impl Store {
             ap.active = Some(ActiveWriter {
                 seg,
                 size: MAGIC_HEADER.len() as u64,
+                reserved: MAGIC_HEADER.len() as u64,
                 sc,
             });
             return Ok(());
@@ -315,7 +321,9 @@ impl Store {
                 continue;
             }
             if let Err(e) = self.seal_active(ap) {
-                self.set_failed(&e);
+                if !e.is_capacity() {
+                    self.set_failed(&e);
+                }
                 return Err(e);
             }
             if ap.active.is_some() {

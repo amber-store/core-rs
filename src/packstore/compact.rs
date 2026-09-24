@@ -242,7 +242,9 @@ impl Store {
             }
         }
         if let Err(e) = self.seal_active(&mut ap) {
-            self.set_failed(&e);
+            if !e.is_capacity() {
+                self.set_failed(&e);
+            }
             return Err(e);
         }
         self.seal_idle(&mut ap)?;

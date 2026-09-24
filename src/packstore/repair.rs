@@ -103,7 +103,9 @@ impl Store {
         // Seal from the live index before replacement. Reopening a corrupt
         // active tail would otherwise discard records after the damaged one.
         if let Err(error) = self.seal_active(&mut ap) {
-            self.set_failed(&error);
+            if !error.is_capacity() {
+                self.set_failed(&error);
+            }
             return Err(error);
         }
         let replacement = encode_record(key, data).map_err(Error::Pack)?;
