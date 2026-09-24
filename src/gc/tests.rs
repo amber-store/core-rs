@@ -804,3 +804,44 @@ fn prepare_ref_missing_ancestor_fails() {
         "err = {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rust-only: advisory reachability.
+
+#[test]
+fn unreachable_from_separates_reached_from_unreached() {
+    let ts = new_test_store(1 << 20);
+    let c = open_collector(&ts, Options::default());
+    let (root_a, keys_a) = store_tree(&ts.objects, "a", 4);
+    let (root_b, keys_b) = store_tree(&ts.objects, "b", 4);
+
+    let candidates: Vec<Key> = keys_a.iter().chain(keys_b.iter()).copied().collect();
+    let dead = c.unreachable_from(&[root_a], &candidates).unwrap();
+    for k in &keys_a {
+        assert!(!dead.contains(k), "a-key reported unreachable from root a");
+    }
+    for k in &keys_b {
+        assert!(dead.contains(k), "b-key reported reachable from root a");
+    }
+
+    // Both roots reach everything, so nothing is left over.
+    let dead = c.unreachable_from(&[root_a, root_b], &candidates).unwrap();
+    assert!(dead.is_empty(), "dead = {dead:?}, want none");
+
+    // No roots reach nothing, so every candidate is left over, in order.
+    let dead = c.unreachable_from(&[], &candidates).unwrap();
+    assert_eq!(dead, candidates, "with no roots");
+}
+
+#[test]
+fn unreachable_from_takes_no_references_into_account() {
+    let ts = new_test_store(1 << 20);
+    let c = open_collector(&ts, Options::default());
+    let (root, keys) = store_tree(&ts.objects, "a", 4);
+    put_test_ref(&c, &ts.refs, "held", root);
+
+    // A published reference protects the tree from a cycle, but it is not a
+    // root the caller passed, so it does not enter this answer.
+    let dead = c.unreachable_from(&[], &keys).unwrap();
+    assert_eq!(dead, keys, "a reference must not act as a root here");
+}
