@@ -66,6 +66,19 @@ impl Collector {
     pub fn why(&self, k: Key) -> Result<Vec<String>, Error> {
         self.core.why(k)
     }
+
+    /// Returns the `candidates` that `roots` does not reach, in the order they
+    /// were given. Advisory: the walk takes no barrier and no reference lock,
+    /// so the caller must keep `roots`, and anything published since, alive
+    /// while it acts on the answer. Deletes nothing (Rust-only).
+    pub fn unreachable_from(&self, roots: &[Key], candidates: &[Key]) -> Result<Vec<Key>, Error> {
+        let live = self.core.mark_live(Cancel::NONE, roots)?;
+        Ok(candidates
+            .iter()
+            .copied()
+            .filter(|key| !live.contains(*key))
+            .collect())
+    }
 }
 
 impl Core {
