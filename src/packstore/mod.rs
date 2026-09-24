@@ -1236,3 +1236,6 @@ mod gate_tests;
 
 #[cfg(test)]
 mod prealloc_tests;
+
+#[cfg(test)]
+mod budget_tests;

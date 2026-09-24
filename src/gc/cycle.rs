@@ -53,7 +53,19 @@ impl Collector {
     /// the context maps to an internal cancel flag tripped by
     /// [`Collector::close`] / [`Collector::wipe`]).
     pub fn run(&self, garbage: f64) -> Result<CycleStats, Error> {
-        self.core.run(garbage, None)
+        self.core.run(garbage, None, u64::MAX)
+    }
+
+    /// [`Collector::run`] with a cap on the live record bytes the sweep will
+    /// copy, for a collector running under a storage budget: see
+    /// [`crate::packstore::CompactOpts::max_copy_bytes`], which it sets. At
+    /// `0` the cycle still reclaims fully dead segments. No Go counterpart.
+    pub fn run_with_copy_budget(
+        &self,
+        garbage: f64,
+        max_copy_bytes: u64,
+    ) -> Result<CycleStats, Error> {
+        self.core.run(garbage, None, max_copy_bytes)
     }
 }
 
@@ -64,6 +76,7 @@ impl Core {
         &self,
         garbage: f64,
         parent: Option<&AtomicBool>,
+        max_copy_bytes: u64,
     ) -> Result<CycleStats, Error> {
         let _cycle = match self.cycle_mu.try_lock() {
             Ok(g) => g,
@@ -72,7 +85,7 @@ impl Core {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         lock(&self.mu).cancel_cycle = Some(Arc::clone(&cancel));
-        let (stats, res) = self.cycle(Cancel::new(&cancel, parent), garbage);
+        let (stats, res) = self.cycle(Cancel::new(&cancel, parent), garbage, max_copy_bytes);
         // Recorded on success and failure, then the cancel slot is cleared —
         // all before the cycle lock is released (Go: the mu block + defers).
         let mut st = lock(&self.mu);
@@ -85,7 +98,12 @@ impl Core {
 
     /// One cycle body with the total-duration accounting (Go: `cycle` and
     /// its deferred `stats.Duration` store).
-    fn cycle(&self, cancel: Cancel<'_>, garbage: f64) -> (CycleStats, Result<(), Error>) {
+    fn cycle(
+        &self,
+        cancel: Cancel<'_>,
+        garbage: f64,
+        max_copy_bytes: u64,
+    ) -> (CycleStats, Result<(), Error>) {
         let t0 = Instant::now();
         let mut stats = CycleStats {
             start: SystemTime::now(),
@@ -100,7 +118,7 @@ impl Core {
             copied_bytes: 0,
             freed_bytes: 0,
         };
-        let res = self.cycle_body(cancel, garbage, t0, &mut stats);
+        let res = self.cycle_body(cancel, garbage, t0, &mut stats, max_copy_bytes);
         stats.duration = t0.elapsed();
         (stats, res)
     }
@@ -111,6 +129,7 @@ impl Core {
         garbage: f64,
         t0: Instant,
         stats: &mut CycleStats,
+        max_copy_bytes: u64,
     ) -> Result<(), Error> {
         let mut threshold = garbage;
         if threshold < 0.0 {
@@ -195,6 +214,7 @@ impl Core {
                     .unwrap_or(UNIX_EPOCH),
             ),
             pace: None,
+            max_copy_bytes,
         };
         if self.opts.rate > 0 {
             let mut throttle = Throttle::new(self.opts.rate); // clock starts here

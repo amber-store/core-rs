@@ -57,6 +57,14 @@ pub struct CompactOpts {
     /// When set, called with each copied record's size; the collector uses
     /// it to cap copy bandwidth (Go: `Pace`).
     pub pace: Option<Box<dyn FnMut(usize) + Send>>,
+    /// Caps the live record bytes this pass will copy. Victim selection stops
+    /// taking segments once the next one's live bytes would exceed what is
+    /// left, so a pass under a storage budget cannot ask the filesystem for
+    /// more room than it has. The cap counts record bytes only: footers and
+    /// filesystem allocation overhead sit outside it. At `0` nothing is
+    /// copied, but fully dead segments are still reclaimed, since those need
+    /// no copy. `u64::MAX`, the default, is unbounded. No Go counterpart.
+    pub max_copy_bytes: u64,
 }
 
 impl Default for CompactOpts {
@@ -65,6 +73,7 @@ impl Default for CompactOpts {
             min_dead_ratio: 0.0,
             horizon: None,
             pace: None,
+            max_copy_bytes: u64::MAX,
         }
     }
 }
@@ -213,6 +222,7 @@ impl Store {
             min_dead_ratio,
             horizon,
             mut pace,
+            max_copy_bytes,
         } = opts;
         // Other stores' writers wait for the whole pass and look at the
         // directory again afterwards (gate.rs); inside a collector's
@@ -241,7 +251,12 @@ impl Store {
                 return Err(Error::Failed(msg.clone()));
             }
         }
-        if let Err(e) = self.seal_active(&mut ap) {
+        // Sealing allocates a footer. At a zero budget that allocation must not
+        // stand between a full store and the dead segments it can still
+        // reclaim without copying anything.
+        if max_copy_bytes > 0
+            && let Err(e) = self.seal_active(&mut ap)
+        {
             if !e.is_capacity() {
                 self.set_failed(&e);
             }
@@ -249,7 +264,8 @@ impl Store {
         }
         self.seal_idle(&mut ap)?;
 
-        let victims = self.select_victims(&live, horizon, min_dead_ratio, &mut stats)?;
+        let victims =
+            self.select_victims(&live, horizon, min_dead_ratio, max_copy_bytes, &mut stats)?;
         if victims.is_empty() {
             return Ok(stats);
         }
@@ -276,11 +292,14 @@ impl Store {
     /// Snapshots the sealed segments and picks the rewrite victims: past the
     /// horizon (file mtime strictly before it), with at least one dead key,
     /// and with dead bytes at or above the ratio line (Go: `selectVictims`).
+    /// A segment whose live bytes would take the pass past `copy_left` is
+    /// skipped, and later smaller ones are still considered.
     fn select_victims(
         &self,
         live: &(impl Fn(Key) -> bool + Sync),
         horizon: Option<SystemTime>,
         min_dead_ratio: f64,
+        mut copy_left: u64,
         stats: &mut CompactStats,
     ) -> Result<Vec<Arc<SealedSegment>>, Error> {
         let segs: Vec<Arc<SealedSegment>> = unpoison(self.shared.read()).sealed.clone();
@@ -297,6 +316,10 @@ impl Store {
             let info = segment_liveness(&g, live);
             let total = info.live_bytes + info.dead_bytes;
             if info.dead_keys > 0 && info.dead_bytes as f64 >= min_dead_ratio * total as f64 {
+                if info.live_bytes > copy_left {
+                    continue;
+                }
+                copy_left -= info.live_bytes;
                 stats.victims.push(g.id);
                 victims.push(g);
             }
