@@ -924,3 +924,69 @@ fn a_retirement_that_keeps_failing_makes_one_backup_copy() {
         pairs(&[("a", "1")])
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rust-only: delete_batch and update_batch.
+
+fn rec(name: &str) -> Record {
+    Record {
+        name: name.to_string(),
+        data: name.as_bytes().to_vec(),
+    }
+}
+
+fn names(s: &Store) -> Vec<String> {
+    s.all().unwrap().into_iter().map(|r| r.name).collect()
+}
+
+#[test]
+fn delete_batch_counts_the_rows_it_removed() {
+    let dir = tempdir();
+    let s = open(dir.path());
+    s.put_batch(&[rec("a"), rec("b"), rec("c")]).unwrap();
+
+    // "z" is absent: not an error, and not counted.
+    let removed = s
+        .delete_batch(&["a".into(), "z".into(), "c".into()])
+        .unwrap();
+    assert_eq!(removed, 2);
+    assert_eq!(names(&s), ["b"]);
+
+    // Every name absent: still not an error.
+    assert_eq!(s.delete_batch(&["a".into()]).unwrap(), 0);
+    assert_eq!(s.delete_batch(&[]).unwrap(), 0);
+    assert_eq!(names(&s), ["b"]);
+}
+
+#[test]
+fn update_batch_withdraws_and_publishes_in_one_commit() {
+    let dir = tempdir();
+    let s = open(dir.path());
+    s.put_batch(&[rec("old1"), rec("old2"), rec("kept")])
+        .unwrap();
+
+    s.update_batch(&[rec("new1")], &["old1".into(), "old2".into()])
+        .unwrap();
+    assert_eq!(names(&s), ["kept", "new1"]);
+    assert_eq!(s.get("new1").unwrap(), b"new1");
+}
+
+/// The withdrawal runs first, so the caller gets the record rather than a hole.
+#[test]
+fn update_batch_publishes_a_name_it_also_withdraws() {
+    let dir = tempdir();
+    let s = open(dir.path());
+    s.put("x", b"before").unwrap();
+    s.update_batch(&[rec("x")], &["x".into()]).unwrap();
+    assert_eq!(s.get("x").unwrap(), b"x");
+}
+
+#[test]
+fn an_empty_update_batch_changes_nothing() {
+    let dir = tempdir();
+    let s = open(dir.path());
+    s.put("x", b"v").unwrap();
+    s.update_batch(&[], &[]).unwrap();
+    assert_eq!(names(&s), ["x"]);
+    assert_eq!(s.get("x").unwrap(), b"v");
+}
