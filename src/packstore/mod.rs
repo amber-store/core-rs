@@ -82,7 +82,10 @@ pub const DEFAULT_SEGMENT_SIZE: u64 = 2 << 30; // 2 GiB
 ///
 /// The price is that a segment being written can hold up to this much reserved
 /// and unwritten, which a caller sizing a storage budget has to allow for, per
-/// concurrent writer. Sealing truncates that tail and frees it (Rust-only).
+/// concurrent writer. Sealing truncates that tail, which frees it on Linux; on
+/// APFS the blocks survive the truncation, so a segment sealed before it
+/// reaches the rotation threshold keeps up to one step of allocated and unused
+/// space until it is reaped (Rust-only).
 pub const RESERVE_STEP: u64 = 8 << 20; // 8 MiB
 
 const SEALED_SUFFIX: &str = ".seg";
@@ -255,7 +258,7 @@ impl Error {
 
 /// Sorts a failed reservation: out of space or over quota leaves the store
 /// usable, any other errno does not (Rust-only).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn capacity_or_io(error: io::Error) -> Error {
     match error.raw_os_error() {
         Some(libc::ENOSPC) | Some(libc::EDQUOT) => Error::Capacity(error),
@@ -299,9 +302,9 @@ impl Options {
 
     /// Reserves space before each write to a segment, so a full or over-quota
     /// filesystem is refused up front as [`Error::Capacity`] instead of
-    /// failing mid-write. Costs one syscall per [`RESERVE_STEP`], not per
-    /// append. Linux only: [`Store::open_with`] refuses it elsewhere, rather
-    /// than ignore a guarantee the caller asked for (Rust-only).
+    /// failing mid-write. Costs one syscall per append: `fallocate` on Linux,
+    /// `F_PREALLOCATE` on macOS. Anywhere else [`Store::open_with`] refuses it,
+    /// rather than ignore a guarantee the caller asked for (Rust-only).
     pub fn preallocate(mut self, enabled: bool) -> Options {
         self.preallocate = enabled;
         self
@@ -507,10 +510,10 @@ impl Store {
         // Refused here rather than silently ignored: preallocation is a
         // guarantee the caller asked for, and this platform has no call that
         // gives it.
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         if cfg.preallocate {
             return Err(Error::Other(
-                "packstore: preallocation needs fallocate, which only Linux has".into(),
+                "packstore: preallocation needs fallocate or F_PREALLOCATE, which this platform lacks".into(),
             ));
         }
         let dir = dir.as_ref().to_path_buf();
@@ -692,10 +695,11 @@ impl Store {
     /// so a refusal leaves it where it was and the next append asks again.
     ///
     /// A step never reaches past the rotation threshold, because the segment is
-    /// sealed there and the rest would be reserved for nothing. A record larger
-    /// than what is left, or larger than the step, still gets exactly what it
-    /// needs: one oversized record is allowed to push a segment past the
-    /// threshold (Rust-only).
+    /// sealed there and the rest would be reserved for nothing. `ftruncate`
+    /// releases an unwritten tail on Linux but not on APFS, so on macOS that
+    /// waste would outlive the seal. A record larger than what is left, or
+    /// larger than the step, still gets exactly what it needs: one oversized
+    /// record is allowed to push a segment past the threshold (Rust-only).
     fn reserve_through(&self, aw: &mut ActiveWriter, end: u64) -> Result<(), Error> {
         if !self.cfg.preallocate || end <= aw.reserved {
             return Ok(());
@@ -729,9 +733,54 @@ impl Store {
         Err(capacity_or_io(io::Error::last_os_error()))
     }
 
+    /// Reserves `len` bytes past the file's allocated end when
+    /// [`Options::preallocate`] is set. `F_PREALLOCATE` allocates from the
+    /// physical end of file, so there is nothing for `offset` to do: every call
+    /// site reserves at the write frontier, which is where the allocated end
+    /// sits once the previous reservation has been written. The logical length
+    /// is left alone, as on Linux. Rounding to the volume's clump size can
+    /// reserve more than asked, which refuses a write earlier than Linux
+    /// would, never later.
+    ///
+    /// `F_ALLOCATECONTIG` is deliberately absent: requiring one extent would
+    /// refuse writes a fragmented volume can satisfy (Rust-only).
+    #[cfg(target_os = "macos")]
+    fn reserve_file(&self, file: &File, _offset: u64, len: u64) -> Result<(), Error> {
+        if !self.cfg.preallocate || len == 0 {
+            return Ok(());
+        }
+        let len = i64::try_from(len)
+            .map_err(|_| Error::Other("pack allocation exceeds file range".into()))?;
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: len,
+            fst_bytesalloc: 0,
+        };
+        // SAFETY: plain fcntl(2) on a valid open fd, with a struct this frame
+        // owns; the kernel reads it and writes back fst_bytesalloc.
+        let result = unsafe {
+            libc::fcntl(
+                file.as_raw_fd(),
+                libc::F_PREALLOCATE,
+                &mut store as *mut libc::fstore_t,
+            )
+        };
+        if result == -1 {
+            return Err(capacity_or_io(io::Error::last_os_error()));
+        }
+        // F_ALLOCATEALL is all-or-nothing, so a short count should not happen.
+        // Treat one as a refusal rather than write into space nobody reserved.
+        if store.fst_bytesalloc < len {
+            return Err(Error::Capacity(io::Error::from_raw_os_error(libc::ENOSPC)));
+        }
+        Ok(())
+    }
+
     /// Nothing to reserve: [`Store::open_with`] refuses a preallocating store
-    /// on a platform without `fallocate` (Rust-only).
-    #[cfg(not(target_os = "linux"))]
+    /// on a platform with neither `fallocate` nor `F_PREALLOCATE` (Rust-only).
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn reserve_file(&self, _file: &File, _offset: u64, _len: u64) -> Result<(), Error> {
         Ok(())
     }
