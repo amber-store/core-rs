@@ -129,13 +129,39 @@ impl Store {
                 Err(error) => return Err(error.into()),
             }
             let replace = (|| -> Result<(), Error> {
+                // The replacement's size is known before anything is written,
+                // so the whole file can be reserved up front for a store that
+                // asked for that (Options::preallocate). Hence two passes: the
+                // index and the footer first, the bytes second.
+                let mut offset = MAGIC_HEADER.len() as u64;
+                let mut index = Vec::with_capacity(entries.len());
+                for entry in &entries {
+                    let size = if entry.k == key {
+                        replacement.len() as u64
+                    } else {
+                        REC_HEADER_SIZE as u64 + u64::from(entry.slen)
+                    };
+                    let slen = u32::try_from(size - REC_HEADER_SIZE as u64)
+                        .map_err(|_| super::corrupt("repair record length overflow"))?;
+                    index.push(IndexEntry {
+                        k: entry.k,
+                        off: offset,
+                        slen,
+                    });
+                    offset = offset
+                        .checked_add(size)
+                        .ok_or_else(|| super::corrupt("repair pack size overflow"))?;
+                }
+                let footer = build_footer(offset, &index)?;
+                let total = offset
+                    .checked_add(footer.len() as u64)
+                    .ok_or_else(|| super::corrupt("repair footer offset overflow"))?;
                 let mut file = OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(&temporary)?;
+                self.reserve_file(&file, 0, total)?;
                 file.write_all(&MAGIC_HEADER)?;
-                let mut offset = MAGIC_HEADER.len() as u64;
-                let mut index = Vec::with_capacity(entries.len());
                 for entry in &entries {
                     let bytes = if entry.k == key {
                         replacement.as_slice()
@@ -155,14 +181,8 @@ impl Store {
                             .ok_or_else(|| super::corrupt("repair record is outside its segment"))?
                     };
                     file.write_all(bytes)?;
-                    index.push(IndexEntry {
-                        k: entry.k,
-                        off: offset,
-                        slen: (bytes.len() - REC_HEADER_SIZE) as u32,
-                    });
-                    offset += bytes.len() as u64;
                 }
-                file.write_all(&build_footer(offset, &index)?)?;
+                file.write_all(&footer)?;
                 file.sync_all()?;
                 let mut ready = SealedSegment::open(&temporary, segment.id)?;
                 ready.path = segment.path.clone();

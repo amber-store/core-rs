@@ -70,3 +70,30 @@ fn a_capacity_error_is_seen_through_a_context_wrap() {
     };
     assert!(wrapped.is_capacity());
 }
+
+/// A repair reserves the whole replacement pack before writing a byte of it,
+/// so the rewrite cannot run a preallocating store out of room halfway.
+#[test]
+fn a_preallocating_store_repairs_a_damaged_sealed_record() {
+    use super::testutil::write_sealed_file;
+    use crate::amberpack::REC_HEADER_SIZE;
+
+    let objs = super::testutil::test_objects(4);
+    let (dir, path, entries) = write_sealed_file(&objs);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[entries[1].off as usize + REC_HEADER_SIZE] ^= 0x40;
+    std::fs::write(&path, bytes).unwrap();
+
+    let opts = Options::default().preallocate(true);
+    let store = Store::open_with(dir.path(), opts).unwrap();
+    assert!(store.verify(|| false).is_err());
+    store.put_verified(objs[1].key, &objs[1].data).unwrap();
+    store.verify(|| false).unwrap();
+    store.close().unwrap();
+
+    let reopened = Store::open_with(dir.path(), opts).unwrap();
+    reopened.verify(|| false).unwrap();
+    for obj in &objs {
+        assert_eq!(reopened.get(obj.key).unwrap(), obj.data);
+    }
+}
