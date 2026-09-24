@@ -308,6 +308,56 @@ impl Store {
         Ok(())
     }
 
+    /// Removes every name in `names` atomically and returns how many rows went
+    /// away. A name that is not there is not an error: a withdrawal the caller
+    /// has already made, or one another process made first, leaves the store in
+    /// the state the caller asked for. An empty batch changes nothing. No Go
+    /// counterpart.
+    pub fn delete_batch(&self, names: &[String]) -> Result<usize, Error> {
+        if names.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.writer();
+        // Dropped before the guard: an early return or a panic rolls back.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let mut removed = 0;
+        {
+            let mut delete = tx.prepare_cached(DELETE_RECORD)?;
+            for name in names {
+                removed += delete.execute([name.as_bytes()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Publishes `records` and withdraws `names` in one commit, so a caller
+    /// that replaces one set of references with another is never seen half way.
+    /// Withdrawals are applied first, so a name in both ends up published. A
+    /// missing name is not an error, as in [`Store::delete_batch`]. No Go
+    /// counterpart.
+    pub fn update_batch(&self, records: &[Record], names: &[String]) -> Result<(), Error> {
+        if records.is_empty() && names.is_empty() {
+            return Ok(());
+        }
+        let conn = self.writer();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        {
+            let mut delete = tx.prepare_cached(DELETE_RECORD)?;
+            for name in names {
+                delete.execute([name.as_bytes()])?;
+            }
+        }
+        {
+            let mut put = tx.prepare_cached(PUT_RECORD)?;
+            for record in records {
+                put.execute(params![record.name.as_bytes(), record.data])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Returns the record stored under `name`, or [`Error::NotFound`] (Go:
     /// `Get`).
     pub fn get(&self, name: &str) -> Result<Vec<u8>, Error> {
