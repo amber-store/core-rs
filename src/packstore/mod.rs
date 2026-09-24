@@ -1154,3 +1154,6 @@ mod multi_tests;
 
 #[cfg(test)]
 mod gate_tests;
+
+#[cfg(test)]
+mod budget_tests;
