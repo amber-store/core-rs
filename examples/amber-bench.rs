@@ -103,6 +103,10 @@ struct Config {
     /// gen|ingest|delete|gc|verify|report|all
     #[arg(long, default_value = "all")]
     phase: String,
+    /// reserve space before every write (packstore Options::preallocate), to
+    /// measure what that reservation costs
+    #[arg(long, default_value_t = false)]
+    preallocate: bool,
 }
 
 fn main() {
@@ -754,7 +758,8 @@ fn open_all(
         store.join("packstore"),
         packstore::Options::new()
             .sync(true)
-            .segment_size(cfg.segment),
+            .segment_size(cfg.segment)
+            .preallocate(cfg.preallocate),
     )?);
     let refs = match refstore::Store::open(store.join("refs"), true) {
         Ok(r) => Arc::new(r),
