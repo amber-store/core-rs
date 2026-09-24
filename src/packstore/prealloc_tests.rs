@@ -14,9 +14,9 @@ fn a_capacity_error_is_seen_through_a_context_wrap() {
 
 /// Asking for a guarantee the platform cannot give fails at open, so no store
 /// ever runs believing its writes are reserved.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
-fn opening_a_preallocating_store_is_refused_without_fallocate() {
+fn opening_a_preallocating_store_is_refused_without_support() {
     let dir = tempfile::tempdir().unwrap();
     let opts = super::Options::default().preallocate(true);
     let error = super::Store::open_with(dir.path(), opts).unwrap_err();
@@ -24,8 +24,8 @@ fn opening_a_preallocating_store_is_refused_without_fallocate() {
     assert!(super::Store::open(dir.path()).is_ok());
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod supported {
     use tempfile::TempDir;
 
     use crate::packstore::testutil::{
@@ -124,8 +124,9 @@ mod linux {
         s.put(obj.key, &obj.data).unwrap();
         assert_eq!(s.get(obj.key).unwrap(), obj.data);
     }
+
     /// A step never reaches past the rotation threshold, so a sealed pack is not
-    /// carrying a step's worth of unused blocks.
+    /// carrying a step's worth of unused blocks. This has to hold on APFS too,
     /// where truncating does not give the tail back.
     #[test]
     fn a_sealed_pack_is_not_padded_by_the_reservation() {
