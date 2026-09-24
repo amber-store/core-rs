@@ -160,6 +160,13 @@ pub enum Error {
     /// An I/O error from the underlying files.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// The filesystem refused space for a write that [`Options::preallocate`]
+    /// asked it to reserve up front: `ENOSPC` or `EDQUOT`. Held apart from
+    /// [`Error::Io`] because it is the one write failure that leaves the store
+    /// intact — nothing was written, so the write path is not poisoned and the
+    /// caller may retry after freeing space. No Go counterpart.
+    #[error("pack allocation refused: {0}")]
+    Capacity(#[source] io::Error),
     /// A diagnostic prefix wrapped around another error, preserving its
     /// classification (Go: `fmt.Errorf("...: %w", err)`).
     #[error("{msg}: {source}")]
@@ -227,6 +234,26 @@ impl Error {
             _ => false,
         }
     }
+
+    /// Whether the filesystem refused reserved space. No Go counterpart.
+    pub fn is_capacity(&self) -> bool {
+        match self {
+            Error::Capacity(_) => true,
+            Error::Context { source, .. } => source.is_capacity(),
+            _ => false,
+        }
+    }
+}
+
+/// Classifies a failed reservation: a filesystem out of space or over quota is
+/// [`Error::Capacity`], which leaves the store usable; anything else — a bad
+/// descriptor, a filesystem without `fallocate`, a size past the filesystem's
+/// maximum — is an ordinary [`Error::Io`]. No Go counterpart.
+fn capacity_or_io(error: io::Error) -> Error {
+    match error.raw_os_error() {
+        Some(libc::ENOSPC) | Some(libc::EDQUOT) => Error::Capacity(error),
+        _ => Error::Io(error),
+    }
 }
 
 /// Builds a corruption error whose text matches Go's
@@ -242,6 +269,7 @@ pub(crate) fn corrupt(detail: impl std::fmt::Display) -> Error {
 /// Store configuration (Go: the `WithSegmentSize` / `WithSync` options).
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
+    preallocate: bool,
     segment_size: u64,
     sync: bool,
 }
@@ -249,6 +277,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Options {
         Options {
+            preallocate: false,
             segment_size: DEFAULT_SEGMENT_SIZE,
             sync: true,
         }
@@ -259,6 +288,17 @@ impl Options {
     /// Returns the default configuration.
     pub fn new() -> Options {
         Options::default()
+    }
+
+    /// Reserves space with `fallocate` before every write to a segment, so a
+    /// full or over-quota filesystem is refused up front, as
+    /// [`Error::Capacity`], instead of failing mid-write. A caller that runs
+    /// the store under a storage budget wants this; it costs one syscall per
+    /// append. Linux only: a store opened with it elsewhere refuses every
+    /// write. No Go counterpart.
+    pub fn preallocate(mut self, enabled: bool) -> Options {
+        self.preallocate = enabled;
+        self
     }
 
     /// Sets the rotation threshold in bytes. A single oversized record may
@@ -545,6 +585,10 @@ impl Store {
             return Ok(()); // lost a Put race for this key; the record is already appended
         }
         let off = aw.size;
+        if let Err(error) = self.reserve_file(&aw.seg.f, off, rec.len() as u64) {
+            aw.seg.f.set_len(aw.size)?;
+            return Err(error);
+        }
         aw.seg.f.write_all_at(rec, off)?;
         let loc = ActiveLoc {
             off,
@@ -572,9 +616,12 @@ impl Store {
             // A mid-seal failure can leave a renamed-but-unpublished segment;
             // reads stay correct (the fd is still open), but accepting
             // further writes could append past a footer. Poison the write
-            // path; reopen recovers cleanly.
+            // path; reopen recovers cleanly. A refused reservation wrote
+            // nothing, so it leaves no such tail and must not poison.
             if let Err(e) = self.seal_active(ap) {
-                self.set_failed(&e);
+                if !e.is_capacity() {
+                    self.set_failed(&e);
+                }
                 return Err(e);
             }
         }
@@ -622,6 +669,34 @@ impl Store {
         }
     }
 
+    /// Reserves `len` bytes at `offset` of `file` when
+    /// [`Options::preallocate`] is set, so a write that the filesystem cannot
+    /// satisfy is refused before it starts. `FALLOC_FL_KEEP_SIZE` leaves the
+    /// file length alone: the segment's length is its data, and recovery scans
+    /// to it. `ENOSPC` and `EDQUOT` come back as [`Error::Capacity`], every
+    /// other errno as [`Error::Io`]. No Go counterpart.
+    fn reserve_file(&self, file: &File, offset: u64, len: u64) -> Result<(), Error> {
+        if !self.cfg.preallocate || len == 0 {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let offset = i64::try_from(offset)
+                .map_err(|_| Error::Other("pack offset exceeds file range".into()))?;
+            let len = i64::try_from(len)
+                .map_err(|_| Error::Other("pack allocation exceeds file range".into()))?;
+            let result = unsafe {
+                libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, offset, len)
+            };
+            if result == 0 {
+                return Ok(());
+            }
+            Err(capacity_or_io(io::Error::last_os_error()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(Error::Other("pack preallocation requires Linux".into()))
+    }
+
     /// Seals the active segment: build the footer from the in-RAM index (no
     /// body re-read), append it, fsync, rename to `.seg`, fsync the
     /// directory, and swap in the mmap'd sealed segment. Called under the
@@ -645,6 +720,10 @@ impl Store {
         // The footer is located from EOF, so drop anything a failed write
         // left past aw.size.
         aw.seg.f.set_len(aw.size)?;
+        if let Err(error) = self.reserve_file(&aw.seg.f, aw.size, ftr.len() as u64) {
+            aw.seg.f.set_len(aw.size)?;
+            return Err(error);
+        }
         aw.seg.f.write_all_at(&ftr, aw.size)?;
         aw.seg.f.sync_all()?;
         let sealed_path = view::sealed_path_of(&aw.seg.path);
@@ -1154,3 +1233,6 @@ mod multi_tests;
 
 #[cfg(test)]
 mod gate_tests;
+
+#[cfg(test)]
+mod prealloc_tests;
