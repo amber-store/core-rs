@@ -218,3 +218,28 @@ fn verified_put_cleans_stale_repair_file() {
     assert!(!temporary.exists());
     store.verify(|| false).unwrap();
 }
+
+#[test]
+fn deferred_verified_puts_are_durable_after_one_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let objs = test_objects(3);
+    let before = store.fsyncs.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(store.put_verified_deferred(objs[0].key, b"wrong").is_err());
+    for obj in &objs {
+        store.put_verified_deferred(obj.key, &obj.data).unwrap();
+        store.put_verified_deferred(obj.key, &obj.data).unwrap();
+        assert_eq!(store.get(obj.key).unwrap(), obj.data);
+    }
+    store.sync().unwrap();
+    assert_eq!(
+        store.fsyncs.load(std::sync::atomic::Ordering::Relaxed),
+        before + 1
+    );
+    store.close().unwrap();
+    let reopened = Store::open(dir.path()).unwrap();
+    for obj in &objs {
+        assert_eq!(reopened.get(obj.key).unwrap(), obj.data);
+    }
+    reopened.close().unwrap();
+}
