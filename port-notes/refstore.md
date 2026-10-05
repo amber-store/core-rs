@@ -5,8 +5,9 @@ optimistic updates"): `refstore.go`, `sqlite.go`, `schema.go`, `cas.go`,
 `queries.sql`, `migrations/`, and `migrate.go` re-thought for this crate's
 own legacy. Public API: `Store` (`open` / `put` / `put_batch` / `get` /
 `delete` / `all` / `wipe` / `compare_and_swap` / `create` /
-`compare_and_delete`), `Record {name, data}`, `Error` with `is_not_found()`
-and `is_conflict()`, `SchemaError`. `Close()` stays RAII.
+`compare_and_delete`, and the Rust-only `update_batch`), `Record {name,
+data}`, `Error` with `is_not_found()` and `is_conflict()`, `SchemaError`.
+`Close()` stays RAII.
 
 | File | Go | Holds |
 | --- | --- | --- |
@@ -402,6 +403,12 @@ verbatim:
     record came back and the imported one was missing), and
     `architecture/references.md` does not tell the operator to delete
     `-wal` and `-shm` along with `refs.sqlite`.
+12. **`update_batch` is Rust-only.** Go has no checked batch. It withdraws
+    and publishes a set of names in one `BEGIN IMMEDIATE` transaction, each
+    only if its reference is at the key the caller expects, and returns
+    `Error::Conflict`, rolling everything back, if one is not. It sends
+    only Go's statements (`GetRecord`, `DeleteRecord`, `PutRecord`), so the
+    file stays Go's.
 
 ## Tests
 

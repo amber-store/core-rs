@@ -2,8 +2,10 @@
 
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::queries::{CREATE_RECORD, DELETE_RECORD_IF, GET_RECORD, REPLACE_RECORD};
-use super::{Error, Store};
+use super::queries::{
+    CREATE_RECORD, DELETE_RECORD, DELETE_RECORD_IF, GET_RECORD, PUT_RECORD, REPLACE_RECORD,
+};
+use super::{Error, Record, Store};
 use crate::key::Key;
 use crate::reference::Reference;
 
@@ -48,6 +50,63 @@ impl Store {
         Ok(())
     }
 
+    /// Withdraws `names` and publishes `records` in one commit, each only if
+    /// its reference is where the caller saw it, so a caller replacing one
+    /// set of references with another is never seen half way and never
+    /// undoes another process's move. A record's expectation is the key it
+    /// replaces, or `None` for no reference; a withdrawn name may also be
+    /// gone already, as the caller asked for that state. Every expectation
+    /// is checked before anything changes, and if one fails nothing does and
+    /// the result is [`Error::Conflict`]. Withdrawals run first, so a name in
+    /// both ends up published. Returns how many rows the withdrawals removed
+    /// (Rust-only).
+    pub fn update_batch(
+        &self,
+        records: &[(Record, Option<Key>)],
+        names: &[(String, Key)],
+    ) -> Result<usize, Error> {
+        if records.is_empty() && names.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.writer();
+        // Dropped before the guard: an early return or a panic rolls back.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        for (name, old) in names {
+            if let Some((_, current)) = current(&tx, name)?
+                && !points_at(&current, *old)
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        for (record, old) in records {
+            let at = match (current(&tx, &record.name)?, old) {
+                (None, None) => true,
+                (Some((_, current)), Some(old)) => points_at(&current, *old),
+                _ => false,
+            };
+            if !at {
+                return Err(Error::Conflict);
+            }
+        }
+        // The write lock has been held since the checks, so the plain
+        // statements cannot undo another process's change.
+        let mut removed = 0;
+        {
+            let mut delete = tx.prepare_cached(DELETE_RECORD)?;
+            for (name, _) in names {
+                removed += delete.execute([name.as_bytes()])?;
+            }
+        }
+        {
+            let mut put = tx.prepare_cached(PUT_RECORD)?;
+            for (record, _) in records {
+                put.execute(params![record.name.as_bytes(), record.data])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Runs `change` inside one write transaction after checking that `name`
     /// exists and points at `old` (Go: `ifAt`). The key lives inside the
     /// record, so the current record is decoded; one that does not decode is
@@ -65,16 +124,8 @@ impl Store {
         // the connection is still ours. SQLite's write lock must never
         // outlive this call, or it would wedge every writer in every process.
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let current = tx
-            .prepare_cached(GET_RECORD)?
-            .query_row([name.as_bytes()], |row| row.get::<_, Vec<u8>>(0))
-            .optional()?
-            .ok_or(Error::NotFound)?;
-        let current_ref = Reference::decode(&current).map_err(|source| Error::CurrentRecord {
-            name: name.to_string(),
-            source,
-        })?;
-        if current_ref.key.as_slice() != old.as_bytes().as_slice() {
+        let (current, current_ref) = current(&tx, name)?.ok_or(Error::NotFound)?;
+        if !points_at(&current_ref, old) {
             return Err(Error::Conflict);
         }
         if change(&tx, &current)? != 1 {
@@ -83,4 +134,25 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+
+/// The record stored under `name`, raw and decoded, or `None` if there is
+/// none. A record that does not decode is an error.
+fn current(tx: &Transaction<'_>, name: &str) -> Result<Option<(Vec<u8>, Reference)>, Error> {
+    let Some(current) = tx
+        .prepare_cached(GET_RECORD)?
+        .query_row([name.as_bytes()], |row| row.get::<_, Vec<u8>>(0))
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let decoded = Reference::decode(&current).map_err(|source| Error::CurrentRecord {
+        name: name.to_string(),
+        source,
+    })?;
+    Ok(Some((current, decoded)))
+}
+
+fn points_at(current: &Reference, key: Key) -> bool {
+    current.key.as_slice() == key.as_bytes().as_slice()
 }

@@ -48,7 +48,8 @@ pub enum Error {
     NotFound,
     /// The reference is not in the state an optimistic write expected: for
     /// [`Store::create`] it exists, for the compare forms it points at
-    /// another key. Nothing was changed; the caller re-reads and decides
+    /// another key, for [`Store::update_batch`] some name is not where the
+    /// caller saw it. Nothing was changed; the caller re-reads and decides
     /// (Go: `ErrConflict`).
     #[error("refstore: reference is not at the expected key")]
     Conflict,

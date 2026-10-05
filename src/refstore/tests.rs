@@ -924,3 +924,156 @@ fn a_retirement_that_keeps_failing_makes_one_backup_copy() {
         pairs(&[("a", "1")])
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rust-only: update_batch.
+
+fn keys() -> (Key, Key, Key) {
+    (
+        Key::new(Type::Blob, 3, b"one"),
+        Key::new(Type::Blob, 3, b"two"),
+        Key::new(Type::Blob, 5, b"three"),
+    )
+}
+
+fn rec(name: &str, k: Key) -> Record {
+    Record {
+        name: name.to_string(),
+        data: record(name, k, 1),
+    }
+}
+
+fn names(s: &Store) -> Vec<String> {
+    s.all().unwrap().into_iter().map(|r| r.name).collect()
+}
+
+#[test]
+fn update_batch_withdraws_and_publishes_in_one_commit() {
+    let (k1, k2, _) = keys();
+    let dir = tempdir();
+    let s = open(dir.path());
+    s.put_batch(&[rec("old1", k1), rec("old2", k1), rec("moved", k1)])
+        .unwrap();
+
+    let removed = s
+        .update_batch(
+            &[(rec("new", k2), None), (rec("moved", k2), Some(k1))],
+            &[("old1".into(), k1), ("old2".into(), k1)],
+        )
+        .unwrap();
+    assert_eq!(removed, 2);
+    assert_eq!(names(&s), ["moved", "new"]);
+    assert_eq!(s.get("moved").unwrap(), record("moved", k2, 1));
+}
+
+/// The caller asked for the name to be gone, and it is: not a conflict, and
+/// not counted.
+#[test]
+fn update_batch_withdraws_a_missing_name_quietly() {
+    let (k1, _, _) = keys();
+    let dir = tempdir();
+    let s = open(dir.path());
+    s.put("a", &record("a", k1, 1)).unwrap();
+    let removed = s
+        .update_batch(&[], &[("a".into(), k1), ("z".into(), k1)])
+        .unwrap();
+    assert_eq!(removed, 1);
+    assert!(names(&s).is_empty());
+}
+
+/// The withdrawal runs first, so the caller gets the record rather than a hole.
+#[test]
+fn update_batch_publishes_a_name_it_also_withdraws() {
+    let (k1, k2, _) = keys();
+    let dir = tempdir();
+    let s = open(dir.path());
+    s.put("x", &record("x", k1, 1)).unwrap();
+    s.update_batch(&[(rec("x", k2), Some(k1))], &[("x".into(), k1)])
+        .unwrap();
+    assert_eq!(s.get("x").unwrap(), record("x", k2, 1));
+}
+
+#[test]
+fn an_empty_update_batch_changes_nothing() {
+    let dir = tempdir();
+    let s = open(dir.path());
+    s.put("x", b"v").unwrap();
+    assert_eq!(s.update_batch(&[], &[]).unwrap(), 0);
+    assert_eq!(names(&s), ["x"]);
+    assert_eq!(s.get("x").unwrap(), b"v");
+}
+
+/// Any expectation that fails, here mostly because another handle moved
+/// one name after the caller read it, is a conflict, and none of the
+/// batch's other changes land.
+#[test]
+fn an_update_batch_conflict_rolls_the_whole_batch_back() {
+    let (k1, k2, k3) = keys();
+    let dir = tempdir();
+    let s = open(dir.path());
+    let other = open(dir.path());
+    let before = [rec("a", k1), rec("b", k1), rec("c", k1)];
+    s.put_batch(&before).unwrap();
+    let snapshot = s.all().unwrap();
+
+    let tries = [
+        (
+            "a withdrawal of a moved name",
+            vec![(rec("new", k3), None)],
+            vec![("a".into(), k1), ("b".into(), k1)],
+        ),
+        (
+            "a replacement of a moved name",
+            vec![(rec("a", k3), Some(k1)), (rec("b", k3), Some(k1))],
+            vec![("c".into(), k1)],
+        ),
+        (
+            "a creation of a name that exists",
+            vec![(rec("c", k3), None)],
+            vec![("a".into(), k1)],
+        ),
+        (
+            "a replacement of a missing name",
+            vec![(rec("z", k3), Some(k1))],
+            vec![("a".into(), k1)],
+        ),
+    ];
+    for (what, records, withdrawals) in tries {
+        other.put("b", &record("b", k2, 1)).unwrap();
+        let err = s.update_batch(&records, &withdrawals).unwrap_err();
+        assert!(err.is_conflict(), "{what}: {err}");
+        other.put_batch(&before).unwrap();
+        assert_eq!(s.all().unwrap(), snapshot, "{what}");
+    }
+}
+
+/// A batch that fails after some of its changes ran leaves none of them
+/// behind, and its transaction ends: the next writer, on another handle,
+/// does not wait.
+#[test]
+fn an_update_batch_is_all_or_nothing() {
+    let (k1, k2, _) = keys();
+    let timeout = Duration::from_millis(500);
+    let dir = tempdir();
+    let s = open_with_timeout(dir.path(), timeout);
+    let other = open_with_timeout(dir.path(), timeout);
+    s.put_batch(&[rec("a", k1), rec("b", k1)]).unwrap();
+    let snapshot = s.all().unwrap();
+    raw_db(dir.path(), timeout)
+        .execute_batch(
+            "CREATE TRIGGER refuse BEFORE INSERT ON refs
+             WHEN NEW.name = CAST('refused' AS BLOB)
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .unwrap();
+
+    let err = s
+        .update_batch(
+            &[(rec("a", k2), Some(k1)), (rec("refused", k2), None)],
+            &[("b".into(), k1)],
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("refused"), "{err}");
+    assert_eq!(s.all().unwrap(), snapshot);
+    other.put("w", b"").expect("after a failed batch");
+}
