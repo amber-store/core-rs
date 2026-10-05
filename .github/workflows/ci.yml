@@ -5,38 +5,45 @@ on:
     branches: [main]
   pull_request:
 
+defaults:
+  run:
+    shell: nix develop --command bash -e {0}
+
 jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6 # v1.0.0
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          installer-version: 2.35.2
+          extra-conf: experimental-features = nix-command flakes
+      # rust-cache runs outside nix develop and needs rustc on PATH.
+      - run: echo "PATH=$PATH" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --all-targets
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo build --locked --all-targets
+      - run: cargo test --locked
 
   interop:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: amber-store/core
           ref: 9026f423c13fb49cde8b3148dc98cb2a25411c01 # core v0.0.10
           path: amber-go
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-go@v5
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6 # v1.0.0
         with:
-          go-version-file: amber-go/go.mod
-          cache-dependency-path: amber-go/go.sum
+          installer-version: 2.35.2
+          extra-conf: experimental-features = nix-command flakes
+      - run: echo "PATH=$PATH" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: bash interop/check.sh
         env:
           AMBER_GO_REPO: ${{ github.workspace }}/amber-go
