@@ -21,6 +21,7 @@ mod decode;
 mod encode;
 mod fx;
 mod read;
+mod scan;
 
 use std::fmt;
 
