@@ -48,7 +48,8 @@ pub enum Error {
     NotFound,
     /// The reference is not in the state an optimistic write expected: for
     /// [`Store::create`] it exists, for the compare forms it points at
-    /// another key. Nothing was changed; the caller re-reads and decides
+    /// another key, for [`Store::update_batch`] some name is not where the
+    /// caller saw it. Nothing was changed; the caller re-reads and decides
     /// (Go: `ErrConflict`).
     #[error("refstore: reference is not at the expected key")]
     Conflict,
@@ -298,54 +299,6 @@ impl Store {
         let conn = self.writer();
         // Dropped before the guard: an early return or a panic rolls back.
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        {
-            let mut put = tx.prepare_cached(PUT_RECORD)?;
-            for record in records {
-                put.execute(params![record.name.as_bytes(), record.data])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Removes every name in `names` atomically and returns how many rows went
-    /// away. A missing name is not an error: the caller asked for a state, and
-    /// that state holds whether it or another process got there first. An empty
-    /// batch changes nothing (Rust-only).
-    pub fn delete_batch(&self, names: &[String]) -> Result<usize, Error> {
-        if names.is_empty() {
-            return Ok(0);
-        }
-        let conn = self.writer();
-        // Dropped before the guard: an early return or a panic rolls back.
-        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let mut removed = 0;
-        {
-            let mut delete = tx.prepare_cached(DELETE_RECORD)?;
-            for name in names {
-                removed += delete.execute([name.as_bytes()])?;
-            }
-        }
-        tx.commit()?;
-        Ok(removed)
-    }
-
-    /// Publishes `records` and withdraws `names` in one commit, so a caller
-    /// replacing one set of references with another is never seen half way.
-    /// Withdrawals run first, so a name in both ends up published. A missing
-    /// name is not an error, as in [`Store::delete_batch`] (Rust-only).
-    pub fn update_batch(&self, records: &[Record], names: &[String]) -> Result<(), Error> {
-        if records.is_empty() && names.is_empty() {
-            return Ok(());
-        }
-        let conn = self.writer();
-        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        {
-            let mut delete = tx.prepare_cached(DELETE_RECORD)?;
-            for name in names {
-                delete.execute([name.as_bytes()])?;
-            }
-        }
         {
             let mut put = tx.prepare_cached(PUT_RECORD)?;
             for record in records {
