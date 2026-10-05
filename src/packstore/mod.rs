@@ -45,7 +45,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::SystemTime;
 
@@ -389,6 +389,10 @@ pub struct Store {
 
     /// Active-segment fsyncs issued, for tests (Go: `fsyncs`).
     fsyncs: AtomicU64,
+    /// Set while [`Store::put_verified_deferred`] has appended records
+    /// that no fsync has covered yet. A write that promises durability
+    /// and finds its key already in the active segment checks it.
+    deferred: AtomicBool,
 
     /// Serializes refreshes of the view. `refresh_seq` counts them, so that a
     /// lookup that waited for one does not repeat it; `refreshes` counts them
@@ -498,6 +502,7 @@ impl Store {
             grey: Mutex::new(None),
             writes: Mutex::new(gc::Writes::new()),
             fsyncs: AtomicU64::new(0),
+            deferred: AtomicBool::new(false),
             refresh_mu: Mutex::new(()),
             refresh_seq: AtomicU64::new(0),
             refreshes: AtomicU64::new(0),
@@ -548,7 +553,18 @@ impl Store {
             return Err(Error::Closed); // unreachable: ensure_active succeeded
         };
         if unpoison(aw.seg.index.read()).contains_key(&k) {
-            return Ok(()); // lost a Put race for this key; the record is already appended
+            // Lost a Put race for this key; the record is already appended.
+            // The winner may have been a deferred put, which has not
+            // synced it.
+            if sync_now && self.cfg.sync && self.deferred.load(Ordering::SeqCst) {
+                if let Err(e) = aw.seg.f.sync_all() {
+                    self.set_failed(&e);
+                    return Err(e.into());
+                }
+                aw.sidecar_synced();
+                self.deferred.store(false, Ordering::SeqCst);
+            }
+            return Ok(());
         }
         let off = aw.size;
         aw.seg.f.write_all_at(rec, off)?;
@@ -569,6 +585,7 @@ impl Store {
                 return Err(e.into());
             }
             aw.sidecar_synced();
+            self.deferred.store(false, Ordering::SeqCst);
         }
         if ap
             .active
@@ -597,6 +614,8 @@ impl Store {
             return Ok(());
         }
         let Some(aw) = ap.active.as_mut() else {
+            // Sealing synced whatever a deferred put left behind.
+            self.deferred.store(false, Ordering::SeqCst);
             return Ok(());
         };
         if let Err(e) = aw.seg.f.sync_all() {
@@ -604,6 +623,7 @@ impl Store {
             return Err(e.into());
         }
         aw.sidecar_synced();
+        self.deferred.store(false, Ordering::SeqCst);
         self.fsyncs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -768,6 +788,11 @@ impl Store {
         // hits too (a hit in a condemned pack is otherwise lost).
         self.observe(k);
         if self.has_durably(k)? {
+            // "Durably" trusts this store's own active records, and a
+            // deferred put leaves those unsynced.
+            if self.deferred.load(Ordering::SeqCst) {
+                self.sync_active()?;
+            }
             return Ok(());
         }
         let rec = encode_record(k, data).map_err(Error::Pack)?;
