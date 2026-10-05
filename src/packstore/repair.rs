@@ -95,6 +95,10 @@ impl Store {
         }
 
         if !found {
+            if !sync_now {
+                self.deferred
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             let record = encode_record(key, data).map_err(Error::Pack)?;
             return self.append_locked(&mut ap, key, &record, sync_now);
         }

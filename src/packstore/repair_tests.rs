@@ -243,3 +243,18 @@ fn deferred_verified_puts_are_durable_after_one_sync() {
     }
     reopened.close().unwrap();
 }
+
+#[test]
+fn a_durable_put_syncs_a_record_a_deferred_put_left_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let obj = blob_obj(b"deferred, then promised");
+    store.put_verified_deferred(obj.key, &obj.data).unwrap();
+    let fsyncs = || store.fsyncs.load(std::sync::atomic::Ordering::Relaxed);
+    let before = fsyncs();
+    store.put(obj.key, &obj.data).unwrap();
+    assert_eq!(fsyncs(), before + 1);
+    store.put(obj.key, &obj.data).unwrap();
+    assert_eq!(fsyncs(), before + 1);
+    store.close().unwrap();
+}

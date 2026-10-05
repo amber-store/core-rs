@@ -117,6 +117,9 @@ impl Store {
         let mut res = recover_segment(path)?;
         if res.sealed {
             // A crash between the footer's write and the rename: finish it.
+            // The crash may also have come before the seal.s fsync, and a
+            // sealed segment is trusted as durable from here on.
+            f.sync_all()?;
             let sealed_path = sealed_path_of(path);
             fs::rename(path, &sealed_path)?;
             ap.dir_f.as_ref().ok_or(Error::Closed)?.sync_all()?;
