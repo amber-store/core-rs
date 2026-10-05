@@ -241,10 +241,7 @@ impl Store {
                 return Err(Error::Failed(msg.clone()));
             }
         }
-        if let Err(e) = self.seal_active(&mut ap) {
-            self.set_failed(&e);
-            return Err(e);
-        }
+        self.seal_active(&mut ap)?;
         self.seal_idle(&mut ap)?;
 
         let victims = self.select_victims(&live, horizon, min_dead_ratio, &mut stats)?;

@@ -314,10 +314,7 @@ impl Store {
             if !self.adopt(ap, id, &ls.active[&id].path)? {
                 continue;
             }
-            if let Err(e) = self.seal_active(ap) {
-                self.set_failed(&e);
-                return Err(e);
-            }
+            self.seal_active(ap)?;
             if ap.active.is_some() {
                 return Ok(()); // an empty one: the pass appends its survivors to it
             }

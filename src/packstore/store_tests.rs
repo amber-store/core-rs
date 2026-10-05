@@ -727,6 +727,49 @@ fn wipe_clears_poisoned_write_path() {
     }
 }
 
+/// A footer that does not fit is cut off again, so the segment stays active
+/// and the store writable; any other footer error still poisons.
+#[test]
+fn a_seal_out_of_room_leaves_the_store_writable() {
+    for (errno, poisons) in [
+        (libc::ENOSPC, false),
+        (libc::EDQUOT, false),
+        (libc::EIO, true),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let opts = Options::default().segment_size(2048);
+        let objs = test_objects(4);
+        let s = Store::open_with(dir.path(), opts).unwrap();
+        *super::unpoison(s.hooks.after_footer.lock()) = Some(Box::new(move || {
+            Err(std::io::Error::from_raw_os_error(errno))
+        }));
+        s.put(objs[0].key, &objs[0].data).unwrap();
+        let err = s.put(objs[1].key, &objs[1].data).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.raw_os_error() == Some(errno)),
+            "{err}"
+        );
+        *super::unpoison(s.hooks.after_footer.lock()) = None;
+        if poisons {
+            let next = s.put(objs[2].key, &objs[2].data);
+            assert!(matches!(next, Err(Error::Failed(_))), "{next:?}");
+            continue;
+        }
+        let (path, size) = {
+            let ap = s.append_lock();
+            let aw = ap.active.as_ref().expect("the segment is still active");
+            (aw.seg.path.clone(), aw.size)
+        };
+        assert_eq!(fs::metadata(&path).unwrap().len(), size, "errno {errno}");
+        s.put(objs[2].key, &objs[2].data).unwrap();
+        assert!(!path.exists(), "the retried seal renamed the segment");
+        s.put(objs[3].key, &objs[3].data).unwrap();
+        drop(s);
+        let s = Store::open_with(dir.path(), opts).unwrap();
+        want_objects(&s, &objs);
+    }
+}
+
 // Drives a store through random put/write_batch/reopen cycles with a small
 // rotation threshold and cross-checks every observable (get, has, missing,
 // verify) against an in-memory map (Go: `TestOracle`).
