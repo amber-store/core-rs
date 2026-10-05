@@ -348,6 +348,9 @@ struct Shared {
 /// A test hook.
 type Hook = Box<dyn Fn() + Send + Sync>;
 
+/// A test hook that can fail.
+type FallibleHook = Box<dyn Fn() -> io::Result<()> + Send + Sync>;
+
 /// Test hooks; never set outside tests.
 #[derive(Default)]
 struct Hooks {
@@ -357,6 +360,9 @@ struct Hooks {
     /// Runs when `compact` or `remove` took its victims out of the view,
     /// before it unlinks them (Go: `afterDetach`).
     after_detach: Mutex<Option<Hook>>,
+    /// Runs when a seal wrote the footer, before it syncs; an error it
+    /// returns stands in for the write's (Go: `afterFooter`).
+    after_footer: Mutex<Option<FallibleHook>>,
 }
 
 /// An on-disk content-addressable store over segment files. It is safe for
@@ -569,14 +575,7 @@ impl Store {
             .as_ref()
             .is_some_and(|a| a.size >= self.cfg.segment_size)
         {
-            // A mid-seal failure can leave a renamed-but-unpublished segment;
-            // reads stay correct (the fd is still open), but accepting
-            // further writes could append past a footer. Poison the write
-            // path; reopen recovers cleanly.
-            if let Err(e) = self.seal_active(ap) {
-                self.set_failed(&e);
-                return Err(e);
-            }
+            self.seal_active(ap)?;
         }
         Ok(())
     }
@@ -626,6 +625,13 @@ impl Store {
     /// body re-read), append it, fsync, rename to `.seg`, fsync the
     /// directory, and swap in the mmap'd sealed segment. Called under the
     /// append lock (Go: `sealActiveLocked`).
+    ///
+    /// A failure poisons the write path: a mid-seal failure can leave a
+    /// renamed-but-unpublished segment; reads stay correct (the fd is still
+    /// open), but accepting further writes could append past a footer; reopen
+    /// recovers cleanly. Running out of room for the footer does not poison:
+    /// nothing was renamed yet, so cutting the footer off leaves a valid
+    /// active segment, and a later seal tries again.
     fn seal_active(&self, ap: &mut AppendState) -> Result<(), Error> {
         let Some(aw) = ap.active.as_ref() else {
             return Ok(());
@@ -641,22 +647,35 @@ impl Store {
         if entries.is_empty() {
             return Ok(());
         }
-        let ftr = footer::build_footer(aw.size, &entries)?;
+        let ftr = footer::build_footer(aw.size, &entries).inspect_err(|e| self.set_failed(e))?;
         // The footer is located from EOF, so drop anything a failed write
         // left past aw.size.
-        aw.seg.f.set_len(aw.size)?;
-        aw.seg.f.write_all_at(&ftr, aw.size)?;
-        aw.seg.f.sync_all()?;
+        let mut written = aw
+            .seg
+            .f
+            .set_len(aw.size)
+            .and_then(|()| aw.seg.f.write_all_at(&ftr, aw.size));
+        if let Some(hook) = unpoison(self.hooks.after_footer.lock()).as_ref() {
+            written = written.and_then(|()| hook());
+        }
+        if let Err(e) = written {
+            let no_room = matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT));
+            if !no_room || aw.seg.f.set_len(aw.size).is_err() {
+                self.set_failed(&e);
+            }
+            return Err(e.into());
+        }
         let sealed_path = view::sealed_path_of(&aw.seg.path);
-        fs::rename(&aw.seg.path, &sealed_path)?;
-        let Some(dir_f) = ap.dir_f.as_ref() else {
-            return Err(Error::Closed);
-        };
-        dir_f.sync_all()?;
-        // The footer indexes the segment from here on. A crash before the
-        // removal leaves an orphan that the next open deletes.
-        let _ = fs::remove_file(with_suffix(&aw.seg.path, SIDECAR_SUFFIX));
-        let seg = SealedSegment::open(&sealed_path, aw.seg.id)?;
+        let seg = (|| -> Result<SealedSegment, Error> {
+            aw.seg.f.sync_all()?;
+            fs::rename(&aw.seg.path, &sealed_path)?;
+            ap.dir_f.as_ref().ok_or(Error::Closed)?.sync_all()?;
+            // The footer indexes the segment from here on. A crash before the
+            // removal leaves an orphan that the next open deletes.
+            let _ = fs::remove_file(with_suffix(&aw.seg.path, SIDECAR_SUFFIX));
+            SealedSegment::open(&sealed_path, aw.seg.id)
+        })()
+        .inspect_err(|e| self.set_failed(e))?;
         {
             let mut sh = unpoison(self.shared.write());
             publish_sealed(&mut sh, Arc::new(seg));

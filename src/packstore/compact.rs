@@ -255,10 +255,7 @@ impl Store {
         // of this store's segment on the premise that the seal emptied it,
         // then adopts and seals whatever it finds, this one included.
         if max_copy_bytes > 0 {
-            if let Err(e) = self.seal_active(&mut ap) {
-                self.set_failed(&e);
-                return Err(e);
-            }
+            self.seal_active(&mut ap)?;
             self.seal_idle(&mut ap)?;
         }
 

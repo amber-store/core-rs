@@ -102,10 +102,7 @@ impl Store {
         }
         // Seal from the live index before replacement. Reopening a corrupt
         // active tail would otherwise discard records after the damaged one.
-        if let Err(error) = self.seal_active(&mut ap) {
-            self.set_failed(&error);
-            return Err(error);
-        }
+        self.seal_active(&mut ap)?;
         let replacement = encode_record(key, data).map_err(Error::Pack)?;
         let segments = unpoison(self.shared.read()).sealed.clone();
         let mut repaired = false;
