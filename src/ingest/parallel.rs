@@ -27,7 +27,7 @@ impl Sem {
     /// Takes a slot if one is free, without blocking.
     pub(crate) fn try_acquire(&self) -> bool {
         self.free
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |v| v.checked_sub(1))
+            .try_update(Ordering::Acquire, Ordering::Relaxed, |v| v.checked_sub(1))
             .is_ok()
     }
 
