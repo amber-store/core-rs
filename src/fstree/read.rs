@@ -14,7 +14,7 @@ use std::io;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{Entry, Error, decode_dir_leaf, decode_dir_node, decode_file_node};
+use super::{Entry, Error, decode_dir_leaf, decode_dir_node, decode_file_node, scan};
 use crate::commit::{self, Commit};
 use crate::key::{self, Key, Type};
 
@@ -532,6 +532,26 @@ where
         let data = get(k).map_err(|source| WalkError::Read { key: k, source })?;
         match k.type_() {
             Type::DirLeaf => {
+                match scan::leaf(&data, name) {
+                    scan::Leaf::Found(span) => {
+                        // The entry alone, as a one-element array (0x81),
+                        // through the full decoder.
+                        let mut one = Vec::with_capacity(span.len() + 1);
+                        one.push(0x81);
+                        one.extend_from_slice(&data[span]);
+                        if let Ok(mut e) = decode_dir_leaf(&one)
+                            && e.len() == 1
+                        {
+                            return Ok(e.swap_remove(0));
+                        }
+                    }
+                    scan::Leaf::Missing => {
+                        return Err(WalkError::NotFound {
+                            name: name.to_vec(),
+                        });
+                    }
+                    scan::Leaf::Unsure => {}
+                }
                 let mut entries = decode_dir_leaf(&data)
                     .map_err(|source| WalkError::DecodeDirLeaf { key: k, source })?;
                 let i = entries.partition_point(|e| e.name.as_slice() < name);
@@ -543,6 +563,19 @@ where
                 });
             }
             Type::DirNode => {
+                match scan::node(&data, name) {
+                    scan::Node::Child(ck) => {
+                        k = Key::parse(ck)
+                            .map_err(|source| WalkError::ChildKey { key: k, source })?;
+                        continue;
+                    }
+                    scan::Node::Missing => {
+                        return Err(WalkError::NotFound {
+                            name: name.to_vec(),
+                        });
+                    }
+                    scan::Node::Unsure => {}
+                }
                 let pairs = decode_dir_node(&data)
                     .map_err(|source| WalkError::DecodeDirNode { key: k, source })?;
                 // The first pair whose sepName >= name roots the only subtree
