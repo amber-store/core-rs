@@ -926,7 +926,7 @@ fn a_retirement_that_keeps_failing_makes_one_backup_copy() {
 }
 
 // ---------------------------------------------------------------------------
-// Rust-only: update_batch.
+// update_batch (Go: `update_batch_test.go`, `update_batch_internal_test.go`).
 
 fn keys() -> (Key, Key, Key) {
     (
@@ -1078,7 +1078,7 @@ fn an_update_batch_is_all_or_nothing() {
     other.put("w", b"").expect("after a failed batch");
 }
 
-// Rust-only: put_volatile and delete_volatile.
+// put_volatile and delete_volatile (Go: `volatile_internal_test.go`).
 #[test]
 fn volatile_writes_land_and_leave_the_durability_as_configured() {
     for sync in [true, false] {

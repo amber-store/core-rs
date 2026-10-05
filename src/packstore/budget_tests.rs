@@ -1,4 +1,4 @@
-//! [`CompactOpts::max_copy_bytes`] (Rust-only).
+//! [`CompactOpts::max_copy_bytes`] (Go: `budget_test.go`).
 
 use std::collections::HashSet;
 

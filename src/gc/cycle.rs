@@ -57,7 +57,8 @@ impl Collector {
     }
 
     /// [`Collector::run`] with a cap on the bytes the sweep copies. Sets
-    /// [`crate::packstore::CompactOpts::max_copy_bytes`] (Rust-only).
+    /// [`crate::packstore::CompactOpts::max_copy_bytes`] (Go:
+    /// `RunWithCopyBudget`).
     pub fn run_with_copy_budget(
         &self,
         garbage: f64,

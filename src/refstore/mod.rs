@@ -291,7 +291,7 @@ impl Store {
     /// [`Store::put`] without the commit fsync. The record survives a
     /// crash of the process but may be lost with the machine, so it is for
     /// records the owner discards when it starts, such as a session's
-    /// pins. The database stays consistent either way (Rust-only).
+    /// pins. The database stays consistent either way (Go: `PutVolatile`).
     pub fn put_volatile(&self, name: &str, record: &[u8]) -> Result<(), Error> {
         self.volatile(|conn| {
             conn.prepare_cached(PUT_RECORD)?
@@ -301,7 +301,7 @@ impl Store {
     }
 
     /// [`Store::delete`] without the commit fsync, for a record written by
-    /// [`Store::put_volatile`] (Rust-only).
+    /// [`Store::put_volatile`] (Go: `DeleteVolatile`).
     pub fn delete_volatile(&self, name: &str) -> Result<(), Error> {
         self.volatile(|conn| {
             let n = conn
