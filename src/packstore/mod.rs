@@ -45,7 +45,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::SystemTime;
 
@@ -348,6 +348,9 @@ struct Shared {
 /// A test hook.
 type Hook = Box<dyn Fn() + Send + Sync>;
 
+/// A test hook that can fail.
+type FallibleHook = Box<dyn Fn() -> io::Result<()> + Send + Sync>;
+
 /// Test hooks; never set outside tests.
 #[derive(Default)]
 struct Hooks {
@@ -357,6 +360,9 @@ struct Hooks {
     /// Runs when `compact` or `remove` took its victims out of the view,
     /// before it unlinks them (Go: `afterDetach`).
     after_detach: Mutex<Option<Hook>>,
+    /// Runs when a seal wrote the footer, before it syncs; an error it
+    /// returns stands in for the write's (Go: `afterFooter`).
+    after_footer: Mutex<Option<FallibleHook>>,
 }
 
 /// An on-disk content-addressable store over segment files. It is safe for
@@ -383,6 +389,10 @@ pub struct Store {
 
     /// Active-segment fsyncs issued, for tests (Go: `fsyncs`).
     fsyncs: AtomicU64,
+    /// Set while [`Store::put_verified_deferred`] has appended records
+    /// that no fsync has covered yet. A write that promises durability
+    /// and finds its key already in the active segment checks it.
+    deferred: AtomicBool,
 
     /// Serializes refreshes of the view. `refresh_seq` counts them, so that a
     /// lookup that waited for one does not repeat it; `refreshes` counts them
@@ -492,6 +502,7 @@ impl Store {
             grey: Mutex::new(None),
             writes: Mutex::new(gc::Writes::new()),
             fsyncs: AtomicU64::new(0),
+            deferred: AtomicBool::new(false),
             refresh_mu: Mutex::new(()),
             refresh_seq: AtomicU64::new(0),
             refreshes: AtomicU64::new(0),
@@ -542,7 +553,18 @@ impl Store {
             return Err(Error::Closed); // unreachable: ensure_active succeeded
         };
         if unpoison(aw.seg.index.read()).contains_key(&k) {
-            return Ok(()); // lost a Put race for this key; the record is already appended
+            // Lost a Put race for this key; the record is already appended.
+            // The winner may have been a deferred put, which has not
+            // synced it.
+            if sync_now && self.cfg.sync && self.deferred.load(Ordering::SeqCst) {
+                if let Err(e) = aw.seg.f.sync_all() {
+                    self.set_failed(&e);
+                    return Err(e.into());
+                }
+                aw.sidecar_synced();
+                self.deferred.store(false, Ordering::SeqCst);
+            }
+            return Ok(());
         }
         let off = aw.size;
         aw.seg.f.write_all_at(rec, off)?;
@@ -563,20 +585,14 @@ impl Store {
                 return Err(e.into());
             }
             aw.sidecar_synced();
+            self.deferred.store(false, Ordering::SeqCst);
         }
         if ap
             .active
             .as_ref()
             .is_some_and(|a| a.size >= self.cfg.segment_size)
         {
-            // A mid-seal failure can leave a renamed-but-unpublished segment;
-            // reads stay correct (the fd is still open), but accepting
-            // further writes could append past a footer. Poison the write
-            // path; reopen recovers cleanly.
-            if let Err(e) = self.seal_active(ap) {
-                self.set_failed(&e);
-                return Err(e);
-            }
+            self.seal_active(ap)?;
         }
         Ok(())
     }
@@ -598,6 +614,8 @@ impl Store {
             return Ok(());
         }
         let Some(aw) = ap.active.as_mut() else {
+            // Sealing synced whatever a deferred put left behind.
+            self.deferred.store(false, Ordering::SeqCst);
             return Ok(());
         };
         if let Err(e) = aw.seg.f.sync_all() {
@@ -605,6 +623,7 @@ impl Store {
             return Err(e.into());
         }
         aw.sidecar_synced();
+        self.deferred.store(false, Ordering::SeqCst);
         self.fsyncs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -626,6 +645,13 @@ impl Store {
     /// body re-read), append it, fsync, rename to `.seg`, fsync the
     /// directory, and swap in the mmap'd sealed segment. Called under the
     /// append lock (Go: `sealActiveLocked`).
+    ///
+    /// A failure poisons the write path: a mid-seal failure can leave a
+    /// renamed-but-unpublished segment; reads stay correct (the fd is still
+    /// open), but accepting further writes could append past a footer; reopen
+    /// recovers cleanly. Running out of room for the footer does not poison:
+    /// nothing was renamed yet, so cutting the footer off leaves a valid
+    /// active segment, and a later seal tries again.
     fn seal_active(&self, ap: &mut AppendState) -> Result<(), Error> {
         let Some(aw) = ap.active.as_ref() else {
             return Ok(());
@@ -641,22 +667,35 @@ impl Store {
         if entries.is_empty() {
             return Ok(());
         }
-        let ftr = footer::build_footer(aw.size, &entries)?;
+        let ftr = footer::build_footer(aw.size, &entries).inspect_err(|e| self.set_failed(e))?;
         // The footer is located from EOF, so drop anything a failed write
         // left past aw.size.
-        aw.seg.f.set_len(aw.size)?;
-        aw.seg.f.write_all_at(&ftr, aw.size)?;
-        aw.seg.f.sync_all()?;
+        let mut written = aw
+            .seg
+            .f
+            .set_len(aw.size)
+            .and_then(|()| aw.seg.f.write_all_at(&ftr, aw.size));
+        if let Some(hook) = unpoison(self.hooks.after_footer.lock()).as_ref() {
+            written = written.and_then(|()| hook());
+        }
+        if let Err(e) = written {
+            let no_room = matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT));
+            if !no_room || aw.seg.f.set_len(aw.size).is_err() {
+                self.set_failed(&e);
+            }
+            return Err(e.into());
+        }
         let sealed_path = view::sealed_path_of(&aw.seg.path);
-        fs::rename(&aw.seg.path, &sealed_path)?;
-        let Some(dir_f) = ap.dir_f.as_ref() else {
-            return Err(Error::Closed);
-        };
-        dir_f.sync_all()?;
-        // The footer indexes the segment from here on. A crash before the
-        // removal leaves an orphan that the next open deletes.
-        let _ = fs::remove_file(with_suffix(&aw.seg.path, SIDECAR_SUFFIX));
-        let seg = SealedSegment::open(&sealed_path, aw.seg.id)?;
+        let seg = (|| -> Result<SealedSegment, Error> {
+            aw.seg.f.sync_all()?;
+            fs::rename(&aw.seg.path, &sealed_path)?;
+            ap.dir_f.as_ref().ok_or(Error::Closed)?.sync_all()?;
+            // The footer indexes the segment from here on. A crash before the
+            // removal leaves an orphan that the next open deletes.
+            let _ = fs::remove_file(with_suffix(&aw.seg.path, SIDECAR_SUFFIX));
+            SealedSegment::open(&sealed_path, aw.seg.id)
+        })()
+        .inspect_err(|e| self.set_failed(e))?;
         {
             let mut sh = unpoison(self.shared.write());
             publish_sealed(&mut sh, Arc::new(seg));
@@ -749,6 +788,11 @@ impl Store {
         // hits too (a hit in a condemned pack is otherwise lost).
         self.observe(k);
         if self.has_durably(k)? {
+            // "Durably" trusts this store's own active records, and a
+            // deferred put leaves those unsynced.
+            if self.deferred.load(Ordering::SeqCst) {
+                self.sync_active()?;
+            }
             return Ok(());
         }
         let rec = encode_record(k, data).map_err(Error::Pack)?;
@@ -1154,3 +1198,6 @@ mod multi_tests;
 
 #[cfg(test)]
 mod gate_tests;
+
+#[cfg(test)]
+mod budget_tests;

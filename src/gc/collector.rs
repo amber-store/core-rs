@@ -484,7 +484,7 @@ fn spawn_loop(core: Arc<Core>) -> Background {
                     if core.loop_cancel.load(Ordering::Relaxed) {
                         return; // Go: the select's ctx.Done arm
                     }
-                    let _ = core.run(-1.0, Some(&core.loop_cancel));
+                    let _ = core.run(-1.0, Some(&core.loop_cancel), u64::MAX);
                 }
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }

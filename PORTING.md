@@ -2,13 +2,13 @@
 
 This crate is a port of `github.com/amber-store/core` (Go; formerly
 `jobs-build/amber-store-core`), pinned at commit
-`9026f423c13fb49cde8b3148dc98cb2a25411c01` (tag `v0.0.10`, the merge of PR
-#15, the jj fields of the `Commit` object). Not yet ported from that range:
-Go PR #8's `inbox.WithGate`. The Go sources are the normative reference
-wherever this document or `architecture/` is silent; clone the parent fresh
-when porting (the checkout at `/Users/dragan/jobs-build/amber-store-core`
-lags GitHub). The CI interop job pins the same Go commit in
-`.github/workflows/ci.yml`.
+`ee93d9586a3628f2b36d0ef2357c82d639f7639f` (tag `v0.0.11`, the merge of PR
+#17, the seal that stays usable when it runs out of space). Not yet ported
+from that range: Go PR #8's `inbox.WithGate`. The Go sources are the
+normative reference wherever this document or `architecture/` is silent;
+clone the parent fresh when porting (the checkout at
+`/Users/dragan/jobs-build/amber-store-core` lags GitHub). The CI interop job
+pins the same Go commit in `.github/workflows/ci.yml`.
 
 ## Compatibility contract
 

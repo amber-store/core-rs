@@ -14,7 +14,7 @@ use std::io;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{Entry, Error, decode_dir_leaf, decode_dir_node, decode_file_node};
+use super::{Entry, Error, decode_dir_leaf, decode_dir_node, decode_file_node, scan};
 use crate::commit::{self, Commit};
 use crate::key::{self, Key, Type};
 
@@ -532,6 +532,26 @@ where
         let data = get(k).map_err(|source| WalkError::Read { key: k, source })?;
         match k.type_() {
             Type::DirLeaf => {
+                match scan::leaf(&data, name) {
+                    scan::Leaf::Found(span) => {
+                        // The entry alone, as a one-element array (0x81),
+                        // through the full decoder.
+                        let mut one = Vec::with_capacity(span.len() + 1);
+                        one.push(0x81);
+                        one.extend_from_slice(&data[span]);
+                        if let Ok(mut e) = decode_dir_leaf(&one)
+                            && e.len() == 1
+                        {
+                            return Ok(e.swap_remove(0));
+                        }
+                    }
+                    scan::Leaf::Missing => {
+                        return Err(WalkError::NotFound {
+                            name: name.to_vec(),
+                        });
+                    }
+                    scan::Leaf::Unsure => {}
+                }
                 let mut entries = decode_dir_leaf(&data)
                     .map_err(|source| WalkError::DecodeDirLeaf { key: k, source })?;
                 let i = entries.partition_point(|e| e.name.as_slice() < name);
@@ -543,6 +563,19 @@ where
                 });
             }
             Type::DirNode => {
+                match scan::node(&data, name) {
+                    scan::Node::Child(ck) => {
+                        k = Key::parse(ck)
+                            .map_err(|source| WalkError::ChildKey { key: k, source })?;
+                        continue;
+                    }
+                    scan::Node::Missing => {
+                        return Err(WalkError::NotFound {
+                            name: name.to_vec(),
+                        });
+                    }
+                    scan::Node::Unsure => {}
+                }
                 let pairs = decode_dir_node(&data)
                     .map_err(|source| WalkError::DecodeDirNode { key: k, source })?;
                 // The first pair whose sepName >= name roots the only subtree
@@ -562,6 +595,140 @@ where
     }
 }
 
+/// The lookups of this module, keeping each directory object it decodes. The
+/// getter must return immutable content for each key, as for [`lookup_entry`].
+///
+/// Holds at most `capacity` directory objects; when full, it drops the least
+/// recently used half, so eviction costs O(1) per miss amortized. It also
+/// holds at most `capacity` commit-to-tree answers, all dropped when full.
+/// A hit does not read the object again, so the reader can answer for objects
+/// that gc removed after it decoded them: keep one for a bounded operation.
+pub struct DirectoryReader<G> {
+    get: G,
+    capacity: usize,
+    clock: u64,
+    directories: std::collections::HashMap<Key, (DecodedDirectory, u64)>,
+    commits: std::collections::HashMap<Key, Key>,
+}
+
+enum DecodedDirectory {
+    Leaf(Vec<Entry>),
+    Node(Vec<super::DirPair>),
+}
+
+impl<G, E> DirectoryReader<G>
+where
+    G: FnMut(Key) -> Result<Vec<u8>, E>,
+{
+    pub const DEFAULT_CAPACITY: usize = 4096;
+
+    pub fn new(get: G) -> Self {
+        Self::with_capacity(get, Self::DEFAULT_CAPACITY)
+    }
+
+    /// `capacity` is a number of directory objects; 0 is taken as 1.
+    pub fn with_capacity(get: G, capacity: usize) -> Self {
+        Self {
+            get,
+            capacity: capacity.max(1),
+            clock: 0,
+            directories: std::collections::HashMap::new(),
+            commits: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn lookup_entry(&mut self, dir: Key, name: &[u8]) -> Result<Entry, WalkError<E>> {
+        let mut k = self.dir_of(dir)?;
+        loop {
+            match self.directory(k)? {
+                DecodedDirectory::Leaf(entries) => {
+                    let i = entries.partition_point(|e| e.name.as_slice() < name);
+                    return entries
+                        .get(i)
+                        .filter(|e| e.name == name)
+                        .cloned()
+                        .ok_or_else(|| WalkError::NotFound {
+                            name: name.to_vec(),
+                        });
+                }
+                DecodedDirectory::Node(pairs) => {
+                    let i = pairs.partition_point(|p| p.sep_name.as_slice() < name);
+                    let pair = pairs.get(i).ok_or_else(|| WalkError::NotFound {
+                        name: name.to_vec(),
+                    })?;
+                    k = Key::parse(&pair.child_key)
+                        .map_err(|source| WalkError::ChildKey { key: k, source })?;
+                }
+            }
+        }
+    }
+
+    pub fn resolve_path(&mut self, root: Key, path: &str) -> Result<Key, WalkError<E>> {
+        walk_path(root, path, |k, name| self.lookup_entry(k, name))
+    }
+
+    pub fn resolve_entry(&mut self, root: Key, path: &str) -> Result<Option<Entry>, WalkError<E>> {
+        walk_entry(root, path, |k, name| self.lookup_entry(k, name))
+    }
+
+    pub fn write_content<W: io::Write>(&mut self, w: &mut W, key: Key) -> Result<(), WalkError<E>> {
+        write_content(w, key, &mut self.get)
+    }
+
+    fn dir_of(&mut self, k: Key) -> Result<Key, WalkError<E>> {
+        if k.type_() != Type::Commit {
+            return dir_of(k, &mut self.get);
+        }
+        if let Some(&tree) = self.commits.get(&k) {
+            return Ok(tree);
+        }
+        let tree = dir_of(k, &mut self.get)?;
+        if self.commits.len() >= self.capacity {
+            self.commits.clear();
+        }
+        self.commits.insert(k, tree);
+        Ok(tree)
+    }
+
+    fn directory(&mut self, k: Key) -> Result<&DecodedDirectory, WalkError<E>> {
+        self.clock += 1;
+        let now = self.clock;
+        if let Some(slot) = self.directories.get_mut(&k) {
+            slot.1 = now;
+        } else {
+            let data = (self.get)(k).map_err(|source| WalkError::Read { key: k, source })?;
+            let decoded = match k.type_() {
+                Type::DirLeaf => DecodedDirectory::Leaf(
+                    decode_dir_leaf(&data)
+                        .map_err(|source| WalkError::DecodeDirLeaf { key: k, source })?,
+                ),
+                Type::DirNode => DecodedDirectory::Node(
+                    decode_dir_node(&data)
+                        .map_err(|source| WalkError::DecodeDirNode { key: k, source })?,
+                ),
+                _ => return Err(WalkError::NotDirObject { key: k }),
+            };
+            if self.directories.len() >= self.capacity {
+                self.evict();
+            }
+            self.directories.insert(k, (decoded, now));
+        }
+        Ok(&self.directories[&k].0)
+    }
+
+    fn evict(&mut self) {
+        let keep = self.capacity / 2;
+        if keep == 0 {
+            self.directories.clear();
+            return;
+        }
+        let mut stamps: Vec<u64> = self.directories.values().map(|(_, t)| *t).collect();
+        let cut = stamps.len() - keep;
+        let (_, &mut oldest_kept, _) = stamps.select_nth_unstable(cut);
+        self.directories.retain(|_, (_, t)| *t >= oldest_kept);
+    }
+}
+
 /// Descends from the directory object `root` along the slash-separated path
 /// and returns the content key of the directory entry it names, as stored: a
 /// DirLeaf or DirNode key, or the key of a Commit that stands for its tree
@@ -574,6 +741,14 @@ pub fn resolve_path<G, E>(root: Key, path: &str, mut get: G) -> Result<Key, Walk
 where
     G: FnMut(Key) -> Result<Vec<u8>, E>,
 {
+    walk_path(root, path, |k, name| lookup_entry(k, name, &mut get))
+}
+
+fn walk_path<E>(
+    root: Key,
+    path: &str,
+    mut lookup: impl FnMut(Key, &[u8]) -> Result<Entry, WalkError<E>>,
+) -> Result<Key, WalkError<E>> {
     let mut k = root;
     for comp in path.split('/') {
         if comp.is_empty() || comp == "." {
@@ -584,7 +759,7 @@ where
                 path: path.to_string(),
             });
         }
-        let found = lookup_entry(k, comp.as_bytes(), &mut get)?;
+        let found = lookup(k, comp.as_bytes())?;
         if found.mode & S_IFMT != S_IFDIR {
             return Err(WalkError::NotDir {
                 name: comp.as_bytes().to_vec(),
@@ -609,6 +784,14 @@ pub fn resolve_entry<G, E>(root: Key, path: &str, mut get: G) -> Result<Option<E
 where
     G: FnMut(Key) -> Result<Vec<u8>, E>,
 {
+    walk_entry(root, path, |k, name| lookup_entry(k, name, &mut get))
+}
+
+fn walk_entry<E>(
+    root: Key,
+    path: &str,
+    mut lookup: impl FnMut(Key, &[u8]) -> Result<Entry, WalkError<E>>,
+) -> Result<Option<Entry>, WalkError<E>> {
     let mut dir = root;
     let mut cur: Option<Entry> = None; // entry of dir; None while dir is the root
     for comp in path.split('/') {
@@ -631,7 +814,7 @@ where
                 source,
             })?;
         }
-        cur = Some(lookup_entry(dir, comp.as_bytes(), &mut get)?);
+        cur = Some(lookup(dir, comp.as_bytes())?);
     }
     Ok(cur)
 }
@@ -1920,6 +2103,143 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "fstree: \"nope\": entry not found"
+        );
+    }
+
+    #[test]
+    fn directory_reader_reuses_decodes_and_matches_single_lookups() {
+        let mut store = MemStore::default();
+        let root = big_dir(&mut store, 1000);
+        let reads = std::cell::RefCell::new(std::collections::HashMap::<Key, usize>::new());
+        let mut reader = DirectoryReader::new(|k| {
+            *reads.borrow_mut().entry(k).or_default() += 1;
+            store.0.get(&k).cloned().ok_or("missing")
+        });
+        for _ in 0..2 {
+            for name in [
+                "e00000", "e00001", "e00499", "e00998", "e00999", "", "a", "zzz",
+            ] {
+                assert_eq!(
+                    reader
+                        .lookup_entry(root, name.as_bytes())
+                        .map_err(|error| error.to_string()),
+                    lookup_entry(root, name.as_bytes(), store.get())
+                        .map_err(|error| error.to_string())
+                );
+            }
+            for path in ["", ".", "/", "./", "e00000", "../e00000", "absent"] {
+                assert_eq!(
+                    reader
+                        .resolve_path(root, path)
+                        .map_err(|error| error.to_string()),
+                    resolve_path(root, path, store.get()).map_err(|error| error.to_string())
+                );
+            }
+        }
+        assert!(reads.borrow().values().all(|&count| count == 1));
+    }
+
+    #[test]
+    fn directory_reader_eviction_preserves_lookup_results() {
+        let mut store = MemStore::default();
+        let root = big_dir(&mut store, 1000);
+        for capacity in [0, 1, 2, 3, 64] {
+            let mut reader = DirectoryReader::with_capacity(store.get(), capacity);
+            for _ in 0..2 {
+                for i in 0..1000 {
+                    let name = format!("e{i:05}");
+                    assert_eq!(
+                        reader.lookup_entry(root, name.as_bytes()).unwrap(),
+                        lookup_entry(root, name.as_bytes(), store.get()).unwrap()
+                    );
+                    assert!(reader.directories.len() <= capacity.max(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn directory_reader_passes_through_a_commit() {
+        let v = vendored_tree();
+        let store = MemStore::of(&v.all.iter().collect::<Vec<_>>());
+        let mut reader = DirectoryReader::new(store.get());
+        for _ in 0..2 {
+            assert_eq!(
+                reader.lookup_entry(v.commit.key, b"README").unwrap(),
+                lookup_entry(v.commit.key, b"README", store.get()).unwrap()
+            );
+            for path in [
+                "vendor",
+                "vendor/sub",
+                "vendor/sub/file",
+                "vendor/absent",
+                "",
+            ] {
+                assert_eq!(
+                    reader
+                        .resolve_entry(v.top.key, path)
+                        .map_err(|error| error.to_string()),
+                    resolve_entry(v.top.key, path, store.get()).map_err(|error| error.to_string())
+                );
+                assert_eq!(
+                    reader
+                        .resolve_path(v.top.key, path)
+                        .map_err(|error| error.to_string()),
+                    resolve_path(v.top.key, path, store.get()).map_err(|error| error.to_string())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_reader_bounds_its_commits() {
+        let (tree, blob) = one_file_tree("f", "x");
+        let commits: Vec<Object> = (0..10)
+            .map(|i| commit_obj(&format!("c{i}"), tree.key, &[]))
+            .collect();
+        let mut store = MemStore::of(&[&tree, &blob]);
+        for c in &commits {
+            store.insert(c);
+        }
+        for capacity in [1, 3] {
+            let mut reader = DirectoryReader::with_capacity(store.get(), capacity);
+            for c in &commits {
+                assert_eq!(
+                    reader.lookup_entry(c.key, b"f").unwrap(),
+                    lookup_entry(c.key, b"f", store.get()).unwrap()
+                );
+                assert!(reader.commits.len() <= capacity);
+            }
+        }
+    }
+
+    #[test]
+    fn directory_reader_does_not_cache_failed_reads_or_decodes() {
+        let bytes = vec![0xff];
+        let key = Key::new(Type::DirLeaf, bytes.len() as u64, &bytes);
+        let reads = std::cell::Cell::new(0);
+        let mut reader = DirectoryReader::new(|_| {
+            reads.set(reads.get() + 1);
+            Ok::<_, &str>(bytes.clone())
+        });
+        let expected = lookup_entry(key, b"entry", |_| Ok::<_, &str>(bytes.clone()))
+            .map_err(|error| error.to_string());
+        for _ in 0..2 {
+            assert_eq!(
+                reader
+                    .lookup_entry(key, b"entry")
+                    .map_err(|error| error.to_string()),
+                expected
+            );
+        }
+        assert_eq!(reads.get(), 2);
+        let mut reader = DirectoryReader::new(|_| Err::<Vec<u8>, _>("missing"));
+        assert_eq!(
+            reader
+                .lookup_entry(key, b"entry")
+                .map_err(|error| error.to_string()),
+            lookup_entry(key, b"entry", |_| Err::<Vec<u8>, _>("missing"))
+                .map_err(|error| error.to_string())
         );
     }
 

@@ -48,6 +48,18 @@ impl Store {
     /// Unindexed damage and corrupt footers require separate recovery.
     /// An error can leave some copies repaired; retrying is safe.
     pub fn put_verified(&self, key: Key, data: &[u8]) -> Result<(), Error> {
+        self.put_verified_with(key, data, true)
+    }
+
+    /// [`Store::put_verified`] without the fsync of a new or healthy active
+    /// record. The caller ends a run of these with [`Store::sync`], and must
+    /// not treat the content as stored before that returns. Repairs still
+    /// sync.
+    pub fn put_verified_deferred(&self, key: Key, data: &[u8]) -> Result<(), Error> {
+        self.put_verified_with(key, data, false)
+    }
+
+    fn put_verified_with(&self, key: Key, data: &[u8], sync_now: bool) -> Result<(), Error> {
         verify_object(key, data).map_err(|msg| Error::Corrupt { msg, verify: true })?;
         let _write_token = self.begin_write_token()?;
         self.observe(key);
@@ -83,12 +95,17 @@ impl Store {
         }
 
         if !found {
+            if !sync_now {
+                self.deferred
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             let record = encode_record(key, data).map_err(Error::Pack)?;
-            return self.append_locked(&mut ap, key, &record, true);
+            return self.append_locked(&mut ap, key, &record, sync_now);
         }
         if !damaged {
             // A concurrent batch can publish a record before its final sync.
-            if self.cfg.sync
+            if sync_now
+                && self.cfg.sync
                 && let Some(active) = ap.active.as_mut()
                 && unpoison(active.seg.index.read()).contains_key(&key)
             {
@@ -102,10 +119,7 @@ impl Store {
         }
         // Seal from the live index before replacement. Reopening a corrupt
         // active tail would otherwise discard records after the damaged one.
-        if let Err(error) = self.seal_active(&mut ap) {
-            self.set_failed(&error);
-            return Err(error);
-        }
+        self.seal_active(&mut ap)?;
         let replacement = encode_record(key, data).map_err(Error::Pack)?;
         let segments = unpoison(self.shared.read()).sealed.clone();
         let mut repaired = false;
