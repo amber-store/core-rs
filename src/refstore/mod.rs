@@ -318,12 +318,27 @@ impl Store {
     /// restored before the writer is released, also after a failed write:
     /// the next writer relies on it.
     fn volatile(&self, write: impl FnOnce(&Connection) -> Result<(), Error>) -> Result<(), Error> {
+        /// Puts FULL back when the write unwinds; the normal path does it
+        /// by hand, to report a failure.
+        struct Restore<'a>(Option<&'a Connection>);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                if let Some(conn) = self.0.take() {
+                    let _ = conn.execute_batch("PRAGMA synchronous=FULL");
+                }
+            }
+        }
+
         let conn = self.writer();
         if !self.sync {
             return write(&conn);
         }
         conn.execute_batch("PRAGMA synchronous=NORMAL")?;
+        let mut restore = Restore(Some(&conn));
         let written = write(&conn);
+        restore.0 = None;
+        // A connection left at NORMAL would drop the fsync of every later
+        // commit, so this error wins over the write's own.
         conn.execute_batch("PRAGMA synchronous=FULL")?;
         written
     }
