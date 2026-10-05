@@ -2,7 +2,7 @@
 
 `tools/vectorgen` (Go) generates every vector file in `tests/golden/` per
 VECTORS.md, driving the pinned Go library (`github.com/amber-store/core`
-at the version in `tools/vectorgen/go.mod` — v0.0.11 since the 0.7.1
+at the version in `tools/vectorgen/go.mod` — v0.0.12 since the 0.8.0
 release; originally `jobs-build/amber-store-core@e4fcb60`; no replace
 directive). Regenerate with `cd tools/vectorgen && go run . ../../tests/golden`
 — the generator first deletes exactly the files it owns, so a rerun is a clean
@@ -131,3 +131,13 @@ out of space (Go PR #17). Neither touches a format, and each was ported in
 its own change (core-rs PRs #22 and #24). The pin moved `v0.0.10` →
 `v0.0.11`. A full regeneration into a scratch directory at the new pin
 reproduced all 19 files byte for byte.
+
+## Go v0.0.12 (2026-10-05)
+
+No vector changed. Go v0.0.12 holds the Go counterparts of seven additions
+that were written here first (Go PRs #18 to #24): the checked batch and the
+volatile writes of the reference store, `PutVerifiedDeferred`, the copy
+budget of a compaction pass, `UnreachableFrom`, `DirectoryReader`, and the
+lookup that does not decode the directory object. None touches a format. The
+pin moved `v0.0.11` → `v0.0.12`. A full regeneration into a scratch directory
+at the new pin reproduced all 19 files byte for byte.

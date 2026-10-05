@@ -46,7 +46,9 @@ move the reference only if it still points at the key the writer last saw,
 create it only if it does not exist, delete it only if it still points at a
 given key. The comparison is on the pointed-to key, not on the whole record.
 A failed expectation changes nothing and is reported to the caller, who
-re-reads and decides.
+re-reads and decides. A writer swapping one set of references for another
+uses a **checked batch**: the names to withdraw and the records to publish,
+each with the key the writer last saw, land in one commit or not at all.
 
 ## Storage
 
@@ -83,6 +85,14 @@ first opens fail. Write durability follows the store's sync flag:
 `synchronous=FULL` with `fullfsync` and `checkpoint_fullfsync` on, or
 `synchronous=NORMAL` without.
 
+A **volatile** write is the exception. With the sync flag on, an
+implementation may commit a single record at `synchronous=NORMAL`, which in
+WAL mode skips the fsync of that commit. It is for records their owner
+discards when it starts, such as a session's pins: the most recent ones can
+be lost with the machine, while the database stays consistent. `synchronous`
+is a setting of the connection, so it is back at `FULL` before that
+connection runs any other write.
+
 ### Rules for implementations
 
 An implementation that shares a store with others follows these; they are
@@ -105,6 +115,16 @@ what makes concurrent use by different programs safe.
   points elsewhere, or exists when it must not, is a *conflict*; a current
   record that does not decode is an error, never a match. The store retries
   nothing.
+- **Checked batches.** A batch that withdraws names and publishes records is
+  one write transaction, and every change is checked, as in the optimistic
+  forms, before any is made. A withdrawn name must point at the key the
+  writer saw, or be gone already; a published record's name must point at
+  the key the record replaces, or not exist if it replaces none. Anything
+  else is a *conflict*, and nothing of the batch lands. That includes a
+  missing name that a record was to replace: a batch has no *not found*.
+  Then the withdrawals run, and after them the publications, so a name in
+  both ends up published. They are the plain delete and put: the write lock
+  has been held since the checks.
 - **One host.** WAL shares memory between the processes that have the file
   open, so all of them run on one host; network filesystems are out.
 - **Pebble directories.** `refs.sqlite` appears next to Pebble files only by

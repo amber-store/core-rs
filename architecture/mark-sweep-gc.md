@@ -51,6 +51,15 @@ refLock.Lock    sweep: packstore.Compact                   (writers stall)
   payload rehash) in parallel while a single loop appends; fsync; only
   then unlink the victims and fsync the directory. A crash mid-sweep
   loses no live record: victims outlive the durable copies.
+- **Copy budget.** A sweep can be capped in the live record bytes it
+  copies (`CompactOpts.MaxCopyBytes`, or `Collector.RunWithCopyBudget` for
+  a cycle), for a collector that must not start a sweep that needs more
+  room than it has. Selection skips a pack whose live bytes exceed what is
+  left of the cap and goes on to smaller ones. The cap counts record
+  bytes, not footers. At a cap of zero nothing is sealed, since a footer
+  would grow the store, and the packs with nothing live in them are still
+  reaped: a store too full to copy can still free space. `Run` and the
+  background cycles are not capped.
 
 ## Writers vs. the cycle: the barrier
 

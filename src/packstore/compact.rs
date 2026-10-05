@@ -61,7 +61,8 @@ pub struct CompactOpts {
     /// segment whose live bytes exceed what is left and goes on to smaller
     /// ones. Record bytes only: footers and allocation overhead sit outside
     /// it. At `0` fully dead segments are still reclaimed, since those need no
-    /// copy. The default, `u64::MAX`, is unbounded (Rust-only).
+    /// copy. The default, `u64::MAX`, is unbounded (Go: `MaxCopyBytes`, a
+    /// pointer that is nil for no cap).
     pub max_copy_bytes: u64,
 }
 

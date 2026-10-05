@@ -806,7 +806,7 @@ fn prepare_ref_missing_ancestor_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// Rust-only: advisory reachability.
+// Advisory reachability (Go: the `TestUnreachableFrom` tests).
 
 #[test]
 fn unreachable_from_separates_reached_from_unreached() {

@@ -59,7 +59,7 @@ impl Store {
     /// is checked before anything changes, and if one fails nothing does and
     /// the result is [`Error::Conflict`]. Withdrawals run first, so a name in
     /// both ends up published. Returns how many rows the withdrawals removed
-    /// (Rust-only).
+    /// (Go: `UpdateBatch`).
     pub fn update_batch(
         &self,
         records: &[(Record, Option<Key>)],
