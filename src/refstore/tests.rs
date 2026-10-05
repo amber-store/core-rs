@@ -1077,3 +1077,21 @@ fn an_update_batch_is_all_or_nothing() {
     assert_eq!(s.all().unwrap(), snapshot);
     other.put("w", b"").expect("after a failed batch");
 }
+
+// Rust-only: put_volatile and delete_volatile.
+#[test]
+fn volatile_writes_land_and_leave_the_durability_as_configured() {
+    for sync in [true, false] {
+        let dir = tempdir();
+        let s = Store::open(dir.path(), sync).unwrap();
+        let configured = pragma_int(&s.writer(), "synchronous");
+        s.put_volatile("pin", b"held").unwrap();
+        assert_eq!(s.get("pin").unwrap(), b"held");
+        s.put_volatile("pin", b"again").unwrap();
+        assert_eq!(s.get("pin").unwrap(), b"again");
+        s.delete_volatile("pin").unwrap();
+        assert!(s.get("pin").unwrap_err().is_not_found());
+        assert!(s.delete_volatile("pin").unwrap_err().is_not_found());
+        assert_eq!(pragma_int(&s.writer(), "synchronous"), configured);
+    }
+}
