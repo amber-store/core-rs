@@ -287,6 +287,47 @@ impl Store {
         Ok(())
     }
 
+    /// [`Store::put`] without the commit fsync. The record survives a
+    /// crash of the process but may be lost with the machine, so it is for
+    /// records the owner discards when it starts, such as a session's
+    /// pins. The database stays consistent either way (Rust-only).
+    pub fn put_volatile(&self, name: &str, record: &[u8]) -> Result<(), Error> {
+        self.volatile(|conn| {
+            conn.prepare_cached(PUT_RECORD)?
+                .execute(params![name.as_bytes(), record])?;
+            Ok(())
+        })
+    }
+
+    /// [`Store::delete`] without the commit fsync, for a record written by
+    /// [`Store::put_volatile`] (Rust-only).
+    pub fn delete_volatile(&self, name: &str) -> Result<(), Error> {
+        self.volatile(|conn| {
+            let n = conn
+                .prepare_cached(DELETE_RECORD)?
+                .execute([name.as_bytes()])?;
+            if n == 0 {
+                return Err(Error::NotFound);
+            }
+            Ok(())
+        })
+    }
+
+    /// Runs one autocommit write with `synchronous=NORMAL`, which in WAL
+    /// mode skips the fsync of the commit. The configured durability is
+    /// restored before the writer is released, also after a failed write:
+    /// the next writer relies on it.
+    fn volatile(&self, write: impl FnOnce(&Connection) -> Result<(), Error>) -> Result<(), Error> {
+        let conn = self.writer();
+        if !self.sync {
+            return write(&conn);
+        }
+        conn.execute_batch("PRAGMA synchronous=NORMAL")?;
+        let written = write(&conn);
+        conn.execute_batch("PRAGMA synchronous=FULL")?;
+        written
+    }
+
     /// Publishes `records` atomically, using the configured write
     /// durability (Go: `PutBatch`). When names repeat, the last record wins.
     /// An empty batch changes nothing. Readers of [`Store::all`] see the
