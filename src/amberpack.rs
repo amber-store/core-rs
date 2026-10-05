@@ -29,9 +29,15 @@
 //! are not byte-identical (Go uses `klauspost/compress`, this port uses
 //! libzstd), but each side decodes the other's frames; see PORTING.md.
 
+use std::cell::RefCell;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
 use crate::key::Key;
+
+thread_local! {
+    // Building a context costs more than decoding a small record.
+    static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { RefCell::new(None) };
+}
 
 /// The fixed record-header length:
 /// tag(1) + key(32) + flags(1) + ulen(4) + slen(4) + crc(4). Payload follows.
@@ -210,7 +216,13 @@ pub fn decode_payload(flags: u8, ulen: u32, stored: &[u8]) -> Result<Vec<u8>, Er
     // past the header's claim fails inside zstd rather than allocating; either
     // way the record is Corrupt (Go decodes fully, then reports the length
     // mismatch — same class, slightly different message in that edge).
-    let out = zstd::bulk::decompress(stored, ulen as usize)
+    let out = DECOMPRESSOR
+        .with_borrow_mut(|d| -> io::Result<Vec<u8>> {
+            if d.is_none() {
+                *d = Some(zstd::bulk::Decompressor::new()?);
+            }
+            d.as_mut().unwrap().decompress(stored, ulen as usize)
+        })
         .map_err(|e| Error::Corrupt(format!("zstd: {e}")))?;
     if out.len() != ulen as usize {
         return Err(Error::Corrupt(format!(
@@ -726,6 +738,36 @@ mod tests {
             err.to_string(),
             "amberpack: corrupt pack data: decompressed to 0 bytes, header says 5"
         );
+    }
+
+    #[test]
+    fn decompressor_survives_bad_frames_on_each_thread() {
+        let workers: Vec<_> = (0..4u8)
+            .map(|seed| {
+                std::thread::spawn(move || {
+                    for size in [256, 65536, 4096, 0, 256] {
+                        let data = vec![seed; size];
+                        let frame =
+                            zstd::bulk::compress(&data, zstd::DEFAULT_COMPRESSION_LEVEL).unwrap();
+                        assert!(decode_payload(FLAG_ZSTD, size as u32, b"invalid frame").is_err());
+                        assert_eq!(
+                            decode_payload(FLAG_ZSTD, size as u32, &frame).unwrap(),
+                            data
+                        );
+                        if size > 0 {
+                            assert!(decode_payload(FLAG_ZSTD, (size - 1) as u32, &frame).is_err());
+                            assert_eq!(
+                                decode_payload(FLAG_ZSTD, size as u32, &frame).unwrap(),
+                                zstd::bulk::decompress(&frame, size).unwrap()
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 
     #[test]
