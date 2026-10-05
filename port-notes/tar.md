@@ -96,7 +96,7 @@ skeptical atime/ctime fallback, PAX extended headers (`parsePAX`,
 correction, `readSpecialFile` 1 MiB cap), `mergePAX` (empty values keep the
 USTAR value; `uid`/`gid`/`size` re-parse errors are `ErrHeader`), TypeRegA
 promotion, size re-setup after merge, and global headers ('g') surfacing as
-entries (which `extract` then rejects like Go does).
+entries (which `extract` then skips like Go does).
 
 Not ported (out of scope for what tarexport emits; foreign archives only):
 

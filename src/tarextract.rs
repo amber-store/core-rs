@@ -188,6 +188,10 @@ where
     let mut tr = TarReader::new(r);
     let mut dirs: Vec<TarHeader> = Vec::new(); // directories, for deferred metadata
     while let Some(h) = tr.next()? {
+        // Archive-wide metadata, not a member; `git archive` writes one.
+        if h.typeflag == TYPE_XGLOBAL_HEADER {
+            continue;
+        }
         let target = safe_join(dest_dir, &h.name)?;
         // safe_join is lexical. An earlier symlink member could still lead
         // directory creation or the open out of dest_dir.
@@ -1063,6 +1067,31 @@ mod tests {
         let err = extract(&mut &buf[..], &dest).unwrap_err();
         assert!(matches!(err, Error::UnsafeName { .. }));
         assert_eq!(err.to_string(), "refusing unsafe entry name \"../escape\"");
+    }
+
+    #[test]
+    fn extract_skips_pax_global_header() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tw = TarWriter::new(&mut buf);
+        let mut g = pax_header(b"pax_global_header", TYPE_XGLOBAL_HEADER);
+        g.pax_records
+            .insert(b"comment".to_vec(), b"0e7b0ccc10ca".to_vec());
+        tw.write_header(&g).unwrap();
+        let mut dir = pax_header(b"source/", TYPE_DIR);
+        dir.mode = 0o755;
+        tw.write_header(&dir).unwrap();
+        let mut file = pax_header(b"source/README", TYPE_REG);
+        file.mode = 0o644;
+        file.size = 2;
+        tw.write_header(&file).unwrap();
+        tw.write_all(b"hi").unwrap();
+        tw.close().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out");
+        extract(&mut &buf[..], &dest).expect("Extract");
+        assert_eq!(fs::read(dest.join("source/README")).unwrap(), b"hi");
+        assert!(!dest.join("pax_global_header").exists());
     }
 
     #[test]
