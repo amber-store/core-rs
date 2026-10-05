@@ -2,8 +2,8 @@
 
 `tools/vectorgen` (Go) generates every vector file in `tests/golden/` per
 VECTORS.md, driving the pinned Go library (`github.com/amber-store/core`
-at the version in `tools/vectorgen/go.mod` — v0.0.10 since the Go PR #15
-backport; originally `jobs-build/amber-store-core@e4fcb60`; no replace
+at the version in `tools/vectorgen/go.mod` — v0.0.11 since the 0.7.1
+release; originally `jobs-build/amber-store-core@e4fcb60`; no replace
 directive). Regenerate with `cd tools/vectorgen && go run . ../../tests/golden`
 — the generator first deletes exactly the files it owns, so a rerun is a clean
 rebuild.
@@ -122,3 +122,12 @@ through a temporary copy of `go.mod`/`go.sum` carrying `replace
 github.com/amber-store/core => <a worktree at the PR's head>` and passed
 with `go run -modfile=…`. At the `v0.0.10` pin a plain `go run .` into a
 scratch directory reproduced it, and every other vector file, byte for byte.
+
+## Go v0.0.11 (2026-10-05)
+
+No vector changed. Go v0.0.11 holds two fixes, the pax global header that
+`tarextract` skips (Go PR #16) and the seal that stays usable when it runs
+out of space (Go PR #17). Neither touches a format, and each was ported in
+its own change (core-rs PRs #22 and #24). The pin moved `v0.0.10` →
+`v0.0.11`. A full regeneration into a scratch directory at the new pin
+reproduced all 19 files byte for byte.
