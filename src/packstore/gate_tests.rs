@@ -49,7 +49,7 @@ fn text<T>(r: Result<T, Error>) -> Result<(), String> {
 }
 
 fn nosync() -> Options {
-    Options::new().sync(false)
+    zstd_opts().sync(false)
 }
 
 fn two_stores() -> (TempDir, Arc<Store>, Arc<Store>) {
@@ -309,7 +309,9 @@ fn stale_writer_refreshes_before_dedup() {
         b.put(doomed.key, &doomed.data).unwrap();
         check_doomed(
             never_refresh,
-            Store::open(dir.path()).unwrap().get(doomed.key),
+            Store::open_with(dir.path(), zstd_opts())
+                .unwrap()
+                .get(doomed.key),
         );
     }
 }
@@ -330,7 +332,10 @@ fn wipe_waits_for_a_foreign_write_span() {
     // span, still reads the wiped segment through the file it holds open, as
     // any view reads a reaped one until it next looks at the directory.
     assert!(
-        !Store::open(dir.path()).unwrap().has(o.key).unwrap(),
+        !Store::open_with(dir.path(), zstd_opts())
+            .unwrap()
+            .has(o.key)
+            .unwrap(),
         "the wiped object is still there"
     );
 }
@@ -409,7 +414,12 @@ fn every_sweep_moves_the_generation() {
         "generation {after} after a second store swept, {before} before: every sweep must move it"
     );
     w.put(doomed.key, &doomed.data).unwrap();
-    check_doomed(false, Store::open(dir.path()).unwrap().get(doomed.key));
+    check_doomed(
+        false,
+        Store::open_with(dir.path(), zstd_opts())
+            .unwrap()
+            .get(doomed.key),
+    );
 }
 
 // A write inside an open span — a put inside a begin_write bracket, or a
@@ -466,7 +476,9 @@ fn store_opened_during_a_sweep_looks_again_before_its_first_write() {
         x.put(doomed.key, &doomed.data).unwrap();
         check_doomed(
             never_refresh,
-            Store::open(dir.path()).unwrap().get(doomed.key),
+            Store::open_with(dir.path(), zstd_opts())
+                .unwrap()
+                .get(doomed.key),
         );
     }
 }

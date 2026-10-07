@@ -225,7 +225,7 @@ impl Store {
                 Err(e) => return run.fail(e),
             }
             let key = obj.key;
-            let (rec, ulen) = match prepare(obj, verify) {
+            let (rec, ulen) = match prepare(&self.cfg, obj, verify) {
                 Ok(v) => v,
                 Err(e) => return run.fail(e),
             };

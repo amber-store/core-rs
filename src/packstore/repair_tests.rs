@@ -15,7 +15,7 @@ fn damage(path: &std::path::Path, entry: &IndexEntry, header: bool) {
 #[test]
 fn verified_put_rejects_bad_input_and_preserves_existing_object() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let obj = blob_obj(b"correct");
     assert!(store.put_verified(obj.key, b"wrong").is_err());
     assert!(!store.has(obj.key).unwrap());
@@ -24,7 +24,7 @@ fn verified_put_rejects_bad_input_and_preserves_existing_object() {
     store.put_verified(obj.key, &obj.data).unwrap();
     assert_eq!(store.get(obj.key).unwrap(), obj.data);
     store.close().unwrap();
-    let reopened = Store::open(dir.path()).unwrap();
+    let reopened = Store::open_with(dir.path(), zstd_opts()).unwrap();
     assert_eq!(reopened.get(obj.key).unwrap(), obj.data);
     reopened.close().unwrap();
     assert!(matches!(
@@ -39,13 +39,13 @@ fn verified_put_repairs_sealed_records_and_preserves_neighbors() {
         let objs = test_objects(4);
         let (dir, path, entries) = write_sealed_file(&objs);
         damage(&path, &entries[1], header);
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
         assert!(store.verify(|| false).is_err());
         store.put_verified(objs[1].key, &objs[1].data).unwrap();
         store.verify(|| false).unwrap();
         assert!(path.exists());
         store.close().unwrap();
-        let reopened = Store::open(dir.path()).unwrap();
+        let reopened = Store::open_with(dir.path(), zstd_opts()).unwrap();
         reopened.verify(|| false).unwrap();
         for obj in &objs {
             assert_eq!(reopened.get(obj.key).unwrap(), obj.data);
@@ -59,7 +59,7 @@ fn verified_put_repairs_hidden_duplicate_and_keeps_old_mapping_alive() {
     let (dir, path, entries) = write_sealed_file(&objs);
     fs::copy(&path, dir.path().join("0000000000000002.seg")).unwrap();
     damage(&path, &entries[0], false);
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let old = super::unpoison(store.shared.read()).sealed[0].clone();
     assert_eq!(store.get(objs[0].key).unwrap(), objs[0].data);
     assert!(store.verify(|| false).is_err());
@@ -68,13 +68,16 @@ fn verified_put_repairs_hidden_duplicate_and_keeps_old_mapping_alive() {
     assert!(old.verify(&|| false).is_err());
     assert_eq!(old.get(objs[1].key).unwrap().unwrap(), objs[1].data);
     store.close().unwrap();
-    Store::open(dir.path()).unwrap().verify(|| false).unwrap();
+    Store::open_with(dir.path(), zstd_opts())
+        .unwrap()
+        .verify(|| false)
+        .unwrap();
 }
 
 #[test]
 fn verified_put_repairs_active_corruption_without_losing_later_records() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(4);
     for obj in &objs {
         store.put(obj.key, &obj.data).unwrap();
@@ -88,7 +91,7 @@ fn verified_put_repairs_active_corruption_without_losing_later_records() {
     store.put_verified(objs[1].key, &objs[1].data).unwrap();
     store.verify(|| false).unwrap();
     store.close().unwrap();
-    let reopened = Store::open(dir.path()).unwrap();
+    let reopened = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for obj in &objs {
         assert_eq!(reopened.get(obj.key).unwrap(), obj.data);
     }
@@ -100,13 +103,16 @@ fn crashed_seal_retains_records_after_corruption() {
     let (dir, path, entries) = write_sealed_file(&objs);
     damage(&path, &entries[0], true);
     fs::rename(&path, path.with_extension("seg.active")).unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     assert_eq!(store.get(objs[2].key).unwrap(), objs[2].data);
     assert!(store.verify(|| false).is_err());
     store.put_verified(objs[0].key, &objs[0].data).unwrap();
     store.verify(|| false).unwrap();
     store.close().unwrap();
-    Store::open(dir.path()).unwrap().verify(|| false).unwrap();
+    Store::open_with(dir.path(), zstd_opts())
+        .unwrap()
+        .verify(|| false)
+        .unwrap();
 }
 
 #[test]
@@ -114,7 +120,7 @@ fn concurrent_verified_writes_and_reads_preserve_objects() {
     let objs = test_objects(4);
     let (dir, path, entries) = write_sealed_file(&objs);
     damage(&path, &entries[0], false);
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store = Arc::new(Store::open_with(dir.path(), zstd_opts()).unwrap());
     std::thread::scope(|scope| {
         for _ in 0..4 {
             scope.spawn(|| {
@@ -142,7 +148,7 @@ fn verified_put_repairs_hash_mismatch_with_valid_crc() {
         record: None,
     };
     let (dir, _, _) = write_sealed_file(&[wrong]);
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     assert!(store.verify(|| false).is_err());
     store.put_verified(obj.key, &obj.data).unwrap();
     store.verify(|| false).unwrap();
@@ -155,7 +161,7 @@ fn verified_put_repairs_every_corrupt_duplicate() {
     let (dir, path, entries) = write_sealed_file(&objs);
     damage(&path, &entries[0], false);
     fs::copy(&path, dir.path().join("0000000000000002.seg")).unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     store.put_verified(objs[0].key, &objs[0].data).unwrap();
     store.verify(|| false).unwrap();
 }
@@ -165,7 +171,7 @@ fn verified_put_observes_gc_barrier_and_preserves_mark_positions() {
     let objs = test_objects(3);
     let (dir, path, entries) = write_sealed_file(&objs);
     damage(&path, &entries[0], true);
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let mut marks = store.new_mark_set();
     for obj in &objs {
         assert!(marks.mark(obj.key).1);
@@ -185,7 +191,7 @@ fn verified_put_observes_gc_barrier_and_preserves_mark_positions() {
 #[test]
 fn verified_put_rejects_failed_store_and_propagates_active_read_error() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let obj = blob_obj(b"hello");
     store.put(obj.key, &obj.data).unwrap();
     let path = dir.path().join("0000000000000001.seg.active");
@@ -213,7 +219,7 @@ fn verified_put_cleans_stale_repair_file() {
     damage(&path, &entries[0], false);
     let temporary = path.with_extension("repair");
     fs::write(&temporary, b"interrupted replacement").unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     store.put_verified(objs[0].key, &objs[0].data).unwrap();
     assert!(!temporary.exists());
     store.verify(|| false).unwrap();
@@ -222,7 +228,7 @@ fn verified_put_cleans_stale_repair_file() {
 #[test]
 fn deferred_verified_puts_are_durable_after_one_sync() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(3);
     let before = store.fsyncs.load(std::sync::atomic::Ordering::Relaxed);
     assert!(store.put_verified_deferred(objs[0].key, b"wrong").is_err());
@@ -237,7 +243,7 @@ fn deferred_verified_puts_are_durable_after_one_sync() {
         before + 1
     );
     store.close().unwrap();
-    let reopened = Store::open(dir.path()).unwrap();
+    let reopened = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for obj in &objs {
         assert_eq!(reopened.get(obj.key).unwrap(), obj.data);
     }
@@ -247,7 +253,7 @@ fn deferred_verified_puts_are_durable_after_one_sync() {
 #[test]
 fn a_durable_put_syncs_a_record_a_deferred_put_left_behind() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let obj = blob_obj(b"deferred, then promised");
     store.put_verified_deferred(obj.key, &obj.data).unwrap();
     let fsyncs = || store.fsyncs.load(std::sync::atomic::Ordering::Relaxed);

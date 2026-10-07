@@ -9,7 +9,7 @@ use std::thread;
 
 use tempfile::TempDir;
 
-use crate::amberpack::{REC_HEADER_SIZE, encode_record};
+use crate::amberpack::{REC_HEADER_SIZE, encode_record_with};
 use crate::binaryfuse::{BinaryFuse16, SECTION_HEADER_SIZE};
 use crate::key::{Key, Type};
 
@@ -20,7 +20,7 @@ use super::footer::{
 };
 use super::recover::scan_active;
 use super::testutil::*;
-use super::{Error, MAGIC_HEADER, Object, Options, Store, TAG_SEAL, WriteOpts};
+use super::{Error, MAGIC_HEADER, Object, Store, TAG_SEAL, WriteOpts};
 
 /// The synthetic error `objSeq` yields (Go: "synthetic iterator error").
 #[derive(Debug, thiserror::Error)]
@@ -68,7 +68,7 @@ pub(crate) fn active_files(dir: &Path) -> Vec<std::path::PathBuf> {
 #[test]
 fn put_get_has_round_trip() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(50);
     for o in &objs {
         s.put(o.key, &o.data).unwrap();
@@ -92,7 +92,7 @@ fn get_record_round_trip() {
     // segments; payloads mix compressible (stored zstd) and incompressible
     // (stored raw) so both flag paths are exercised.
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(2048)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(2048)).unwrap();
     let objs: Vec<Object> = (0..30)
         .map(|i| {
             let mut data = if i % 2 == 0 {
@@ -108,7 +108,7 @@ fn get_record_round_trip() {
         s.put(o.key, &o.data).unwrap();
     }
     for o in &objs {
-        let want = encode_record(o.key, &o.data).unwrap();
+        let want = encode_record_with(o.key, &o.data, ZSTD).unwrap();
         let got = s.get_record(o.key).unwrap();
         assert_eq!(got, want, "get_record({}): record mismatch", o.key);
         // The returned record must decode back to the original payload.
@@ -130,7 +130,7 @@ fn get_record_round_trip() {
 #[test]
 fn get_record_absent_returns_not_found() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let err = s.get_record(blob_obj(b"nope").key).unwrap_err();
     assert!(err.is_not_found(), "err = {err}, want NotFound");
 }
@@ -138,7 +138,7 @@ fn get_record_absent_returns_not_found() {
 #[test]
 fn stored_size_matches_record_payload() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(2048)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(2048)).unwrap();
     let objs: Vec<Object> = (0..30)
         .map(|i| {
             let mut data = if i % 2 == 0 {
@@ -154,7 +154,7 @@ fn stored_size_matches_record_payload() {
         s.put(o.key, &o.data).unwrap();
     }
     for o in &objs {
-        let rec = encode_record(o.key, &o.data).unwrap();
+        let rec = encode_record_with(o.key, &o.data, ZSTD).unwrap();
         let want = (rec.len() - crate::amberpack::REC_HEADER_SIZE) as u64;
         let got = s.stored_size(o.key).unwrap();
         assert_eq!(got, Some(want), "stored_size({})", o.key);
@@ -173,7 +173,7 @@ fn sort_by_location_orders_by_disk_layout() {
     // ordered by physical layout — grouped by segment, ascending offset
     // within a segment.
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(2048)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(2048)).unwrap();
     let mut keys: Vec<Key> = Vec::new();
     for i in 0..60u32 {
         let mut data = incompressible(1500);
@@ -205,7 +205,7 @@ fn sort_by_location_orders_by_disk_layout() {
 #[test]
 fn sort_by_location_puts_absent_keys_last() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let present = blob_obj(b"here");
     s.put(present.key, &present.data).unwrap();
     let absent = blob_obj(b"gone").key;
@@ -221,7 +221,7 @@ fn sort_by_location_puts_absent_keys_last() {
 #[test]
 fn get_absent_returns_not_found() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let err = s.get(blob_obj(b"nope").key).unwrap_err();
     assert!(err.is_not_found(), "err = {err}, want NotFound");
     assert_eq!(err.to_string(), "packstore: object not found");
@@ -231,7 +231,7 @@ fn get_absent_returns_not_found() {
 #[test]
 fn put_is_idempotent() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let o = blob_obj(&incompressible(1000));
     for _ in 0..3 {
         s.put(o.key, &o.data).unwrap();
@@ -241,21 +241,21 @@ fn put_is_idempotent() {
     let actives = active_files(dir.path());
     assert_eq!(actives.len(), 1);
     let size = fs::metadata(&actives[0]).unwrap().len();
-    let rec = encode_record(o.key, &o.data).unwrap();
+    let rec = encode_record_with(o.key, &o.data, ZSTD).unwrap();
     assert_eq!(size, (MAGIC_HEADER.len() + rec.len()) as u64);
 }
 
 #[test]
 fn reopen_resumes_active_segment() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let first = test_objects(10);
     for o in &first {
         s.put(o.key, &o.data).unwrap();
     }
     s.close().unwrap();
 
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for o in &first {
         assert_eq!(
             s2.get(o.key).unwrap(),
@@ -275,7 +275,7 @@ fn reopen_resumes_active_segment() {
 #[test]
 fn reopen_truncates_corrupt_tail() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(5);
     for o in &objs {
         s.put(o.key, &o.data).unwrap();
@@ -288,7 +288,7 @@ fn reopen_truncates_corrupt_tail() {
     b.extend_from_slice(&[0x55, 0x44, 0x33]);
     fs::write(&actives[0], &b).unwrap();
 
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for o in &objs {
         assert_eq!(
             s2.get(o.key).unwrap(),
@@ -301,7 +301,7 @@ fn reopen_truncates_corrupt_tail() {
     let o = blob_obj(b"post-recovery write");
     s2.put(o.key, &o.data).unwrap();
     s2.close().unwrap();
-    let s3 = Store::open(dir.path()).unwrap();
+    let s3 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     assert_eq!(s3.get(o.key).unwrap(), o.data, "get after second reopen");
 }
 
@@ -311,7 +311,7 @@ fn reopen_truncates_corrupt_tail() {
 #[test]
 fn closed_store_errors() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let o = blob_obj(b"x");
     s.put(o.key, &o.data).unwrap();
     s.close().unwrap();
@@ -328,7 +328,7 @@ fn closed_store_errors() {
 #[test]
 fn with_sync_false() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().sync(false)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().sync(false)).unwrap();
     let o = blob_obj(&incompressible(100));
     s.put(o.key, &o.data).unwrap();
     assert_eq!(s.get(o.key).unwrap(), o.data);
@@ -337,7 +337,7 @@ fn with_sync_false() {
 #[test]
 fn concurrent_put_get_has() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().sync(false)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().sync(false)).unwrap();
     let objs = test_objects(200);
 
     thread::scope(|scope| {
@@ -385,7 +385,7 @@ fn rotation_seals_segments() {
     let dir = TempDir::new().unwrap();
     // Tiny threshold + incompressible payloads: every record (~2 KB stored)
     // crosses 1024 bytes, so every put seals a segment.
-    let s = Store::open_with(dir.path(), Options::default().segment_size(1024)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(1024)).unwrap();
     let objs: Vec<Object> = (0..30u32)
         .map(|i| {
             let mut data = incompressible(2000);
@@ -404,7 +404,7 @@ fn rotation_seals_segments() {
     }
     // And survive a reopen.
     s.close().unwrap();
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for o in &objs {
         assert_eq!(
             s2.get(o.key).unwrap(),
@@ -420,7 +420,7 @@ fn rotation_mid_stream_keeps_all_objects() {
     // Mixed compressible/incompressible objects across several rotations:
     // every object must remain reachable from whichever segment it landed in.
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(8 << 10)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(8 << 10)).unwrap();
     let objs = test_objects(100);
     for o in &objs {
         s.put(o.key, &o.data).unwrap();
@@ -433,7 +433,7 @@ fn rotation_mid_stream_keeps_all_objects() {
 #[test]
 fn crash_between_footer_and_rename() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(10);
     for o in &objs {
         s.put(o.key, &o.data).unwrap();
@@ -461,7 +461,7 @@ fn crash_between_footer_and_rename() {
     // Opening serves everything from the file as it is: a store that only
     // reads finishes nobody's seal. Its first write takes the segment,
     // completes the rename, and goes to a new active segment.
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for o in &objs {
         assert_eq!(s2.get(o.key).unwrap(), o.data, "get({})", o.key);
     }
@@ -482,7 +482,7 @@ fn crash_between_footer_and_rename() {
 #[test]
 fn open_fails_on_corrupt_sealed_segment() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(1)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(1)).unwrap();
     let o = blob_obj(&incompressible(500));
     s.put(o.key, &o.data).unwrap();
     s.close().unwrap();
@@ -492,7 +492,7 @@ fn open_fails_on_corrupt_sealed_segment() {
     let last = b.len() - 1;
     b[last] ^= 0xFF; // trailer magic
     fs::write(&segs[0], &b).unwrap();
-    let err = Store::open(dir.path()).unwrap_err();
+    let err = Store::open_with(dir.path(), zstd_opts()).unwrap_err();
     assert!(err.is_corrupt(), "open = {err}, want corrupt");
 }
 
@@ -501,7 +501,7 @@ fn concurrent_rotation_reads() {
     // Rotation under read load: sealing must never surface spurious errors
     // for present keys (the fd may only close after the reader-visible swap).
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(1024)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(1024)).unwrap();
     let objs: Vec<Object> = (0..120u32)
         .map(|i| {
             let mut data = incompressible(600);
@@ -551,7 +551,7 @@ fn concurrent_rotation_reads() {
 #[test]
 fn write_batch_stores_all() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(100);
     // Duplicate some objects within the batch; they must be written once.
     let mut batch = objs.clone();
@@ -565,7 +565,7 @@ fn write_batch_stores_all() {
 #[test]
 fn write_batch_iterator_error() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(10);
     let err = s.write_batch(obj_seq(&objs, Some(5))).unwrap_err();
     assert_eq!(err.to_string(), "synthetic iterator error");
@@ -579,7 +579,7 @@ fn write_batch_iterator_error() {
 #[test]
 fn write_batch_on_closed_store() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     s.close().unwrap();
     let objs = test_objects(3);
     let err = s.write_batch(obj_seq(&objs, None)).unwrap_err();
@@ -591,11 +591,11 @@ fn write_batch_on_closed_store() {
 #[test]
 fn write_batch_survives_reopen() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(16 << 10)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(16 << 10)).unwrap();
     let objs = test_objects(100);
     s.write_batch(obj_seq(&objs, None)).unwrap();
     s.close().unwrap();
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for o in &objs {
         assert_eq!(
             s2.get(o.key).unwrap(),
@@ -609,7 +609,7 @@ fn write_batch_survives_reopen() {
 #[test]
 fn write_batch_rotates() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(16 << 10)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(16 << 10)).unwrap();
     let objs = test_objects(100);
     s.write_batch(obj_seq(&objs, None)).unwrap();
     assert!(
@@ -625,7 +625,7 @@ fn write_batch_rotates() {
 fn wipe() {
     let dir = TempDir::new().unwrap();
     // Small segments so the store holds sealed segments AND an active one.
-    let s = Store::open_with(dir.path(), Options::default().segment_size(1024)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(1024)).unwrap();
     let objs = test_objects(40);
     for o in &objs {
         s.put(o.key, &o.data).unwrap();
@@ -661,7 +661,7 @@ fn wipe() {
     }
     // And it survives a reopen.
     s.close().unwrap();
-    let s2 = Store::open_with(dir.path(), Options::default().segment_size(1024)).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts().segment_size(1024)).unwrap();
     for o in &more {
         assert_eq!(
             s2.get(o.key).unwrap(),
@@ -675,7 +675,7 @@ fn wipe() {
 #[test]
 fn wipe_with_concurrent_readers() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(1024)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(1024)).unwrap();
     let objs = test_objects(40);
     for o in &objs {
         s.put(o.key, &o.data).unwrap();
@@ -706,7 +706,7 @@ fn wipe_with_concurrent_readers() {
 #[test]
 fn wipe_clears_poisoned_write_path() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(3);
     for o in &objs {
         s.put(o.key, &o.data).unwrap();
@@ -737,9 +737,9 @@ fn a_seal_out_of_room_leaves_the_store_writable() {
         (libc::EIO, true),
     ] {
         let dir = TempDir::new().unwrap();
-        let opts = Options::default().segment_size(2048);
+        let opts = zstd_opts().segment_size(2048);
         let objs = test_objects(4);
-        let s = Store::open_with(dir.path(), opts).unwrap();
+        let s = Store::open_with(dir.path(), opts.clone()).unwrap();
         *super::unpoison(s.hooks.after_footer.lock()) = Some(Box::new(move || {
             Err(std::io::Error::from_raw_os_error(errno))
         }));
@@ -798,8 +798,8 @@ fn oracle() {
         blob_obj(&data)
     };
 
-    let opts = Options::default().segment_size(16 << 10).sync(false);
-    let mut s = Store::open_with(dir.path(), opts).unwrap();
+    let opts = zstd_opts().segment_size(16 << 10).sync(false);
+    let mut s = Store::open_with(dir.path(), opts.clone()).unwrap();
     for _ in 0..20 {
         match r.below(3) {
             0 => {
@@ -824,7 +824,7 @@ fn oracle() {
             _ => {
                 // reopen (exercises seal-survival + tail-scan resume)
                 s.close().unwrap();
-                s = Store::open_with(dir.path(), opts).unwrap();
+                s = Store::open_with(dir.path(), opts.clone()).unwrap();
             }
         }
     }
@@ -880,7 +880,7 @@ fn segment_id_parsing() {
     // Naming must match Go's parseSegmentID exactly: 16 hex digits + suffix.
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("123.seg"), b"x").unwrap();
-    let err = Store::open(dir.path()).unwrap_err();
+    let err = Store::open_with(dir.path(), zstd_opts()).unwrap_err();
     assert!(err.is_corrupt(), "short id: {err}");
     assert_eq!(
         err.to_string(),
@@ -889,14 +889,14 @@ fn segment_id_parsing() {
 
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("00000000000000zz.seg"), b"x").unwrap();
-    let err = Store::open(dir.path()).unwrap_err();
+    let err = Store::open_with(dir.path(), zstd_opts()).unwrap_err();
     assert!(err.is_corrupt(), "non-hex id: {err}");
 
     // A plus sign must not be accepted as part of the id (Go's ParseUint
     // rejects signs).
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("+000000000000001.seg"), b"x").unwrap();
-    let err = Store::open(dir.path()).unwrap_err();
+    let err = Store::open_with(dir.path(), zstd_opts()).unwrap_err();
     assert!(err.is_corrupt(), "signed id: {err}");
 }
 
@@ -905,7 +905,7 @@ fn non_segment_files_are_ignored() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join(".DS_Store"), b"junk").unwrap();
     fs::write(dir.path().join("manifest.json"), b"{}").unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let o = blob_obj(b"hello");
     s.put(o.key, &o.data).unwrap();
     assert_eq!(s.get(o.key).unwrap(), o.data);
@@ -1467,11 +1467,8 @@ fn open_refuses_store_of_another_format_version() {
     // segment size is small enough to seal, or large enough not to.
     for (suffix, seg_size) in [(".seg.active", 1u64 << 30), (".seg", 4 << 10)] {
         let dir = TempDir::new().unwrap();
-        let s = Store::open_with(
-            dir.path(),
-            Options::new().segment_size(seg_size).sync(false),
-        )
-        .unwrap();
+        let s =
+            Store::open_with(dir.path(), zstd_opts().segment_size(seg_size).sync(false)).unwrap();
         put_all(&s, &test_objects(40));
         s.close().unwrap();
         drop(s);
@@ -1481,7 +1478,7 @@ fn open_refuses_store_of_another_format_version() {
         old[MAGIC_HEADER.len() - 1] = 0x01;
         fs::write(&segs[0], &old).unwrap();
 
-        let err = match Store::open(dir.path()) {
+        let err = match Store::open_with(dir.path(), zstd_opts()) {
             Ok(_) => panic!("{suffix}: open accepted a version 1 segment"),
             Err(e) => e,
         };
@@ -1558,7 +1555,7 @@ fn scan_active_valid_footer_with_trailing_garbage() {
 /// `sealedStore`; also the GC tests' `gcStore` substrate — see gc_tests.rs).
 pub(crate) fn sealed_store(objs: &[Object]) -> TempDir {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(8 << 10)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(8 << 10)).unwrap();
     for o in objs {
         s.put(o.key, &o.data).unwrap();
     }
@@ -1569,7 +1566,7 @@ pub(crate) fn sealed_store(objs: &[Object]) -> TempDir {
 #[test]
 fn verify_clean_store() {
     let dir = sealed_store(&test_objects(100));
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     s.verify(|| false).unwrap();
 }
 
@@ -1584,7 +1581,7 @@ fn verify_detects_body_corruption() {
     b[100] ^= 0x01;
     fs::write(&segs[0], &b).unwrap();
 
-    let s = Store::open(dir.path()).unwrap(); // open succeeds: footer intact
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap(); // open succeeds: footer intact
     let err = s.verify(|| false).unwrap_err();
     assert!(err.is_corrupt(), "verify = {err}, want corrupt");
 }
@@ -1603,7 +1600,7 @@ fn verify_detects_wrong_index_entry() {
     file.extend_from_slice(&footer);
     fs::write(dir.path().join("0000000000000001.seg"), &file).unwrap();
 
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let err = s.verify(|| false).unwrap_err();
     assert!(err.is_corrupt(), "verify = {err}, want corrupt");
 }
@@ -1611,7 +1608,7 @@ fn verify_detects_wrong_index_entry() {
 #[test]
 fn verify_honors_cancel() {
     let dir = sealed_store(&test_objects(100));
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let err = s.verify(|| true).unwrap_err();
     assert!(
         matches!(err, Error::Canceled),
@@ -1625,7 +1622,7 @@ fn verify_ignores_active_segment() {
     // verify only walks sealed segments. A store with only an active segment
     // verifies clean.
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for o in test_objects(5) {
         s.put(o.key, &o.data).unwrap();
     }
@@ -1639,7 +1636,7 @@ fn verify_concurrent_with_close() {
     // and the scrub must finish clean (or observe the closed store).
     for _ in 0..5 {
         let dir = sealed_store(&test_objects(200));
-        let s = Store::open(dir.path()).unwrap();
+        let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
         thread::scope(|scope| {
             let h = scope.spawn(|| s.verify(|| false));
             thread::sleep(std::time::Duration::from_millis(2));
@@ -1671,7 +1668,7 @@ fn verify_detects_key_count_mismatch() {
     let mut file = body;
     file.extend_from_slice(&footer);
     fs::write(dir.path().join("0000000000000001.seg"), &file).unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let err = s.verify(|| false).unwrap_err();
     assert!(err.is_corrupt(), "verify = {err}, want corrupt");
 }
@@ -1688,7 +1685,7 @@ fn verify_scrub_hash_mismatch_is_corrupt() {
     for (i, o) in good.iter().enumerate() {
         let data = if i == 1 { &imposter.data } else { &o.data };
         // Encoded under good[1].key: CRC fine, hash wrong.
-        let rec = encode_record(o.key, data).unwrap();
+        let rec = encode_record_with(o.key, data, ZSTD).unwrap();
         entries.push(IndexEntry {
             k: o.key,
             off: body.len() as u64,
@@ -1701,7 +1698,7 @@ fn verify_scrub_hash_mismatch_is_corrupt() {
     let mut file = body;
     file.extend_from_slice(&footer);
     fs::write(dir.path().join("0000000000000001.seg"), &file).unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let err = s.verify(|| false).unwrap_err();
     assert!(err.is_corrupt(), "want corrupt, got {err}");
     assert!(err.is_verify(), "want verify too, got {err}");
@@ -1715,7 +1712,7 @@ fn verify_scrub_hash_mismatch_is_corrupt() {
 fn missing_preserves_order_and_multiplicity() {
     let dir = TempDir::new().unwrap();
     // Force a sealed + active mix.
-    let s = Store::open_with(dir.path(), Options::default().segment_size(8 << 10)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(8 << 10)).unwrap();
     let objs = test_objects(200);
     let (stored, absent) = objs.split_at(120);
     for o in stored {
@@ -1738,7 +1735,7 @@ fn missing_preserves_order_and_multiplicity() {
 #[test]
 fn missing_empty_input() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     assert_eq!(s.missing(&[]).unwrap(), Vec::<Key>::new());
 }
 
@@ -1748,7 +1745,7 @@ fn missing_empty_input() {
 #[test]
 fn write_parallel_stores_all() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(32 << 10)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(32 << 10)).unwrap();
     let objs = test_objects(300);
     let mut batch = objs.clone();
     batch.extend_from_slice(&objs[..50]); // 50 in-stream dups
@@ -1773,7 +1770,7 @@ fn write_parallel_stores_all() {
 #[test]
 fn write_parallel_skips_existing() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(20);
     for o in &objs[..10] {
         s.put(o.key, &o.data).unwrap();
@@ -1786,7 +1783,7 @@ fn write_parallel_skips_existing() {
 #[test]
 fn write_parallel_verify_catches_mismatch() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let good = test_objects(5);
     let mut bad = good[2].clone();
     bad.data.push(0xFF); // payload no longer matches the key
@@ -1806,7 +1803,7 @@ fn write_parallel_verify_catches_mismatch() {
 #[test]
 fn write_parallel_iterator_error() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(10);
     let (_, res) = s.write_parallel(
         obj_seq(&objs, Some(7)),
@@ -1821,7 +1818,7 @@ fn write_parallel_iterator_error() {
 #[test]
 fn write_parallel_on_closed_store() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     s.close().unwrap();
     let objs = test_objects(5);
     let (_, res) = s.write_parallel(
@@ -1840,7 +1837,7 @@ fn write_parallel_error_flushes_prefix() {
     // An erroring run must leave its appended prefix durable (fsynced):
     // reopen after a dirty stop and the prefix records must still be there.
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(10);
     let (stats, res) = s.write_parallel(
         obj_seq(&objs, Some(7)),
@@ -1867,7 +1864,7 @@ fn write_parallel_error_flushes_prefix() {
     // batch-size setup ensures the only fsync before close comes from the
     // error-path sync.
     s.close().unwrap();
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for o in &objs[..stored] {
         assert_eq!(
             s2.get(o.key).unwrap(),
@@ -1896,7 +1893,7 @@ fn oversized_record_error_passthrough() {
 #[test]
 fn seal_truncates_stale_bytes_past_logical_end() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(4096)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(4096)).unwrap();
     let mut d = incompressible(1000);
     d.push(1);
     let first = blob_obj(&d);
@@ -1919,7 +1916,7 @@ fn seal_truncates_stale_bytes_past_logical_end() {
     s.put(second.key, &second.data).unwrap();
     s.close().unwrap();
 
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for o in [&first, &second] {
         assert_eq!(
             s2.get(o.key).unwrap(),
@@ -1936,11 +1933,11 @@ fn seal_truncates_stale_bytes_past_logical_end() {
 #[test]
 fn write_parallel_dedup_only_run_still_syncs() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(4);
     // Stand in for a concurrent, not-yet-committed writer.
     for o in &objs {
-        let rec = encode_record(o.key, &o.data).unwrap();
+        let rec = encode_record_with(o.key, &o.data, ZSTD).unwrap();
         s.append(o.key, &rec, false).unwrap();
     }
     let before = s.fsyncs.load(std::sync::atomic::Ordering::Relaxed);
@@ -1962,7 +1959,7 @@ fn write_parallel_dedup_only_run_still_syncs() {
 #[test]
 fn write_parallel_syncs_once_per_run() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(16);
     let before = s.fsyncs.load(std::sync::atomic::Ordering::Relaxed);
     let (_, res) = s.write_parallel(

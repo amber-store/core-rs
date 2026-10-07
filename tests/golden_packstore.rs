@@ -195,7 +195,7 @@ fn golden_segments_rewrite_rotate_reopen() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     // Small segments force several rotations over the ~31 golden objects.
     let opts = Options::new().segment_size(16 << 10).sync(false);
-    let s = Store::open_with(dir.path(), opts).expect("open fresh store");
+    let s = Store::open_with(dir.path(), opts.clone()).expect("open fresh store");
     let (stats, res) = s.write_parallel(
         objs.iter()
             .cloned()

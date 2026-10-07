@@ -2,7 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::Arc;
 
-use crate::amberpack::{REC_HEADER_SIZE, decode_payload, encode_record, parse_record};
+use crate::amberpack::{REC_HEADER_SIZE, decode_payload, parse_record};
 use crate::key::Key;
 
 use super::compact::all_entries;
@@ -99,7 +99,7 @@ impl Store {
                 self.deferred
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            let record = encode_record(key, data).map_err(Error::Pack)?;
+            let record = self.cfg.encode(key, data)?;
             return self.append_locked(&mut ap, key, &record, sync_now);
         }
         if !damaged {
@@ -120,7 +120,7 @@ impl Store {
         // Seal from the live index before replacement. Reopening a corrupt
         // active tail would otherwise discard records after the damaged one.
         self.seal_active(&mut ap)?;
-        let replacement = encode_record(key, data).map_err(Error::Pack)?;
+        let replacement = self.cfg.encode(key, data)?;
         let segments = unpoison(self.shared.read()).sealed.clone();
         let mut repaired = false;
         for segment in segments {

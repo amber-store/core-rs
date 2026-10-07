@@ -40,6 +40,7 @@ pub use markset::MarkSet;
 pub use parallel::{DEFAULT_BATCH_SIZE, WriteOpts, WriteStats};
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -49,7 +50,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::SystemTime;
 
-use crate::amberpack::{self, REC_HEADER_SIZE, decode_payload, encode_record};
+use crate::amberpack::{self, Compression, REC_HEADER_SIZE, decode_payload, encode_record_with};
 use crate::key::Key;
 
 use footer::SealedSegment;
@@ -92,7 +93,7 @@ const ACTIVE_SUFFIX: &str = ".seg.active";
 
 /// One CAS object to store: its key and either its serialized bytes
 /// (`data`) or, for an object that was encoded elsewhere, the complete
-/// record as [`encode_record`] produced it (`record`). Exactly one of the two
+/// record as [`amberpack::encode_record_with`] produced it (`record`). Exactly one of the two
 /// is set: an object offered as a record carries an empty `data`. A record is
 /// parsed (framing, CRC, canonical key, key equal to `key`) and appended
 /// verbatim, so a caller that already holds encoded records, say a pack it
@@ -247,6 +248,15 @@ impl Error {
         }
     }
 
+    /// Go's `errors.Is(err, amberpack.ErrInvalidCompression)`.
+    pub fn is_invalid_compression(&self) -> bool {
+        match self {
+            Error::Pack(e) => e.is_invalid_compression(),
+            Error::Context { source, .. } => source.is_invalid_compression(),
+            _ => false,
+        }
+    }
+
     /// Go's `errors.Is(err, ErrVerify)`.
     pub fn is_verify(&self) -> bool {
         match self {
@@ -268,11 +278,31 @@ pub(crate) fn corrupt(detail: impl std::fmt::Display) -> Error {
     }
 }
 
-/// Store configuration (Go: the `WithSegmentSize` / `WithSync` options).
-#[derive(Debug, Clone, Copy)]
+/// Chooses the compression for one object (Go: `CompressionFunc`).
+type CompressionFor = Arc<dyn Fn(&Key, &[u8], Compression) -> Compression + Send + Sync>;
+
+/// Store configuration (Go: the `WithSegmentSize` / `WithSync` /
+/// `WithCompression` / `WithCompressionFor` options).
+#[derive(Clone)]
 pub struct Options {
     segment_size: u64,
     sync: bool,
+    compression: Compression,
+    compression_for: Option<CompressionFor>,
+}
+
+impl fmt::Debug for Options {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Options")
+            .field("segment_size", &self.segment_size)
+            .field("sync", &self.sync)
+            .field("compression", &self.compression)
+            .field(
+                "compression_for",
+                &self.compression_for.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for Options {
@@ -280,6 +310,8 @@ impl Default for Options {
         Options {
             segment_size: DEFAULT_SEGMENT_SIZE,
             sync: true,
+            compression: Compression::None,
+            compression_for: None,
         }
     }
 }
@@ -302,6 +334,56 @@ impl Options {
     pub fn sync(mut self, b: bool) -> Options {
         self.sync = b;
         self
+    }
+
+    /// Sets the compression for the objects this store encodes: those given
+    /// to `put`, `put_verified` and `put_verified_deferred`, and those a
+    /// batch carries as data. The default is no compression. The setting
+    /// belongs to this handle and is stored nowhere; reading never depends
+    /// on it, and records that arrive already encoded keep the codec they
+    /// have (Go: `WithCompression`).
+    pub fn compression(mut self, c: Compression) -> Options {
+        self.compression = c;
+        self
+    }
+
+    /// Makes the store ask `f` for every object it encodes, whatever the
+    /// [`Options::compression`] value is. `f` gets the key, the bytes and
+    /// that value: returning it accepts the store's setting, returning
+    /// [`Compression::None`] stores the object raw, and anything else
+    /// overrides the setting for this object. `f` is not asked for an object
+    /// the store already holds, nor for a pre-encoded record.
+    ///
+    /// `f` runs on whichever thread is writing, several at once under
+    /// `write_parallel`. It must not call the store: a repair calls it with
+    /// the store's append lock held. A returned value that does not validate
+    /// fails that object's write with an invalid-compression error (Go:
+    /// `WithCompressionFor`).
+    pub fn compression_for(
+        mut self,
+        f: impl Fn(&Key, &[u8], Compression) -> Compression + Send + Sync + 'static,
+    ) -> Options {
+        self.compression_for = Some(Arc::new(f));
+        self
+    }
+
+    /// Returns the record to append for `(k, data)`, compressed as these
+    /// options say (Go: `Store.encode`).
+    fn encode(&self, k: Key, data: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut c = self.compression;
+        if let Some(f) = &self.compression_for {
+            c = f(&k, data, c);
+        }
+        encode_record_with(k, data, c).map_err(|e| {
+            if e.is_invalid_compression() {
+                Error::Context {
+                    msg: format!("packstore: object {k}"),
+                    source: Box::new(Error::Pack(e)),
+                }
+            } else {
+                Error::Pack(e)
+            }
+        })
     }
 }
 
@@ -492,6 +574,10 @@ impl Store {
 
     /// [`Store::open`] with explicit [`Options`].
     pub fn open_with(dir: impl AsRef<Path>, cfg: Options) -> Result<Store, Error> {
+        cfg.compression.validate().map_err(|e| Error::Context {
+            msg: "packstore".into(),
+            source: Box::new(Error::Pack(e)),
+        })?;
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)
             .map_err(|e| Error::Other(format!("packstore: creating {}: {e}", dir.display())))?;
@@ -789,7 +875,7 @@ impl Store {
                 continue;
             }
             let key = obj.key;
-            let rec = match prepare(obj, false) {
+            let rec = match prepare(&self.cfg, obj, false) {
                 Ok((r, _)) => r,
                 Err(e) => return Err(fail(appended, e)),
             };
@@ -824,7 +910,7 @@ impl Store {
             }
             return Ok(());
         }
-        let rec = encode_record(k, data).map_err(Error::Pack)?;
+        let rec = self.cfg.encode(k, data)?;
         self.append(k, &rec, true)
     }
 
@@ -908,7 +994,7 @@ impl Store {
 
     /// Returns a caller-owned copy of the full on-disk record stored under
     /// `k` — its 46-byte header plus the stored (still-compressed) payload,
-    /// exactly as written by [`encode_record`] — or [`Error::NotFound`] if
+    /// exactly as written by [`amberpack::encode_record_with`] — or [`Error::NotFound`] if
     /// `k` is absent. This is the zero-copy push path: the record is
     /// wire-format-identical, so a caller can hand it to
     /// `amberpack::Writer::add_record` without decompressing and re-encoding.
@@ -1209,6 +1295,9 @@ pub(crate) mod testutil;
 
 #[cfg(test)]
 mod gc_tests;
+
+#[cfg(test)]
+mod compression_tests;
 
 #[cfg(test)]
 mod store_tests;

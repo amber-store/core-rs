@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
-use crate::amberpack::{REC_HEADER_SIZE, encode_record};
+use crate::amberpack::{REC_HEADER_SIZE, encode_record_with};
 use crate::key::Key;
 
 use super::gc_tests::compact_store;
@@ -27,11 +27,11 @@ use super::view::segment_name;
 use super::{ACTIVE_SUFFIX, MAGIC_HEADER, Object, Options, Store, unpoison};
 
 fn nosync() -> Options {
-    Options::new().sync(false)
+    zstd_opts().sync(false)
 }
 
 fn open(dir: &Path) -> Store {
-    Store::open(dir).unwrap()
+    Store::open_with(dir, zstd_opts()).unwrap()
 }
 
 fn open_nosync(dir: &Path) -> Store {
@@ -115,7 +115,7 @@ fn old_exclusive_directory_lock_is_refused() {
     );
     s.close().unwrap();
     assert!(try_exclusive(&old));
-    let err = Store::open(dir.path()).unwrap_err();
+    let err = Store::open_with(dir.path(), zstd_opts()).unwrap_err();
     assert!(err.to_string().contains("older release"), "{err}");
 }
 
@@ -642,8 +642,8 @@ fn compact_does_not_leave_the_only_copy_unsynced() {
     let unsynced = open_nosync(dir.path()); // a live writer that never syncs
     put_all(&unsynced, std::slice::from_ref(&kept));
 
-    let s = Store::open_with(dir.path(), Options::new().segment_size(8 << 10)).unwrap(); // syncs
-    let rec = encode_record(kept.key, &kept.data).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(8 << 10)).unwrap(); // syncs
+    let rec = encode_record_with(kept.key, &kept.data, ZSTD).unwrap();
     assert!(rec.len() > REC_HEADER_SIZE);
     s.append_record(kept.key, &rec).unwrap(); // a copy of its own, whatever the duplicate check thinks
     put_all(&s, std::slice::from_ref(&garbage)); // fills the segment: sealed, and synced
