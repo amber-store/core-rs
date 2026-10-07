@@ -93,8 +93,10 @@ let store = packstore::Store::open_with(
 compressor, 1–12 for high compression); level 0 is each algorithm's default.
 `Options::compression_for` adds a function that chooses per object, from its
 key and bytes. Every store reads records of every codec, whatever it was
-opened with. Releases before this one read raw and zstd records but not lz4
-ones; see [architecture/amberpack.md](architecture/amberpack.md). The example
+opened with. Releases before this one read raw and zstd records, but they
+misread lz4 records instead of rejecting them: never open a store that holds
+lz4 records with one. See
+[architecture/amberpack.md](architecture/amberpack.md). The example
 CLI takes the setting as `--compression none|zstd[:LEVEL]|lz4[:LEVEL]`.
 
 A dev CLI mirroring the Go `amber-store` commands

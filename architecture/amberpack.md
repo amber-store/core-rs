@@ -54,11 +54,16 @@ detect a payload that decompresses to the wrong length.
 
 **Codec ids and earlier releases.** Codecs 0 and 1 are the two values of what
 was a single flag bit for zstd, so records written before lz4 existed are valid as
-they are. A release from before codec 2 rejects an lz4 record as corrupt
-(`unknown record flags`), in a segment and in a wire pack alike: lz4 is for
-stores and peers that all run a release that knows it. A later algorithm takes
-the next id, and neither the pack version nor the segment version changes for
-it.
+they are. A release from before codec 2 (up to 0.9.0) does not handle an lz4
+record safely. Its wire-pack reader and its scrub reject the record as corrupt
+(`unknown record flags`), but its read path tests only the zstd bit: it
+returns the lz4 block itself as the object's bytes, without an error. And when
+it indexes an active segment by scanning it, it takes the first lz4 record for
+a torn tail and truncates the segment there at its next write, losing that
+record and every one after it. A store that holds lz4 records must therefore
+never be opened by such a release. Nothing in the format stops one yet: until
+a segment that holds lz4 records carries a format version of its own, keeping
+older releases away from such a store is the operator's job.
 
 **The CRC covers the whole record with its own field zeroed.** It is computed
 over bytes `[0:42]`, then four zero bytes standing in for the `crc` field, then
