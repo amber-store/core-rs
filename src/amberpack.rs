@@ -31,7 +31,9 @@
 //! libzstd), but each side decodes the other's frames; see PORTING.md.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::str::FromStr;
 
 use crate::key::Key;
 
@@ -88,6 +90,10 @@ pub enum Error {
         /// The payload length in bytes.
         len: usize,
     },
+    /// A [`Compression`] the codec does not take, or text that does not name
+    /// one (Go: `ErrInvalidCompression`).
+    #[error("amberpack: invalid compression: {0}")]
+    InvalidCompression(String),
     /// An I/O error from the underlying writer. (The [`Reader`] never returns
     /// this: exactly like Go, every stream read failure is classified
     /// `Malformed`.)
@@ -104,6 +110,119 @@ impl Error {
     /// Go's `errors.Is(err, ErrMalformed)`.
     pub fn is_malformed(&self) -> bool {
         matches!(self, Error::Malformed(_))
+    }
+
+    /// Go's `errors.Is(err, ErrInvalidCompression)`.
+    pub fn is_invalid_compression(&self) -> bool {
+        matches!(self, Error::InvalidCompression(_))
+    }
+}
+
+/// The highest level each algorithm takes.
+const MAX_ZSTD_LEVEL: i32 = 22;
+const MAX_LZ4_LEVEL: i32 = 12;
+
+/// How a record's payload is compressed: an algorithm and its level. The
+/// default is no compression. Level 0 selects the algorithm's default: 3 for
+/// zstd, the fast compressor for lz4. zstd takes levels up to 22 and lz4 up
+/// to 12, where 1 and above are its high-compression levels.
+///
+/// Go: `Compression{Algorithm, Level}`. The Go encoders have fewer distinct
+/// levels and map a level to the nearest one they have; this crate uses the
+/// level as given. The level changes what is written and never how it is
+/// read.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compression {
+    /// The payload is stored as it is.
+    #[default]
+    None,
+    /// The payload is one zstd frame.
+    Zstd {
+        /// 0 to 22; 0 means 3.
+        level: i32,
+    },
+    /// The payload is one LZ4 block.
+    Lz4 {
+        /// 0 to 12; 0 means the fast compressor.
+        level: i32,
+    },
+}
+
+impl Compression {
+    /// Reports whether the level is one the algorithm takes (Go: `Validate`).
+    pub fn validate(&self) -> Result<(), Error> {
+        let (name, level, max) = match *self {
+            Compression::None => return Ok(()),
+            Compression::Zstd { level } => ("zstd", level, MAX_ZSTD_LEVEL),
+            Compression::Lz4 { level } => ("lz4", level, MAX_LZ4_LEVEL),
+        };
+        if !(0..=max).contains(&level) {
+            return Err(Error::InvalidCompression(format!(
+                "{name} level {level}, want 0 to {max}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The text form [`FromStr`] reads: `none`, `zstd`, `zstd:19`, `lz4`,
+/// `lz4:9`. A level of 0 is left out (Go: `Compression.String`).
+impl fmt::Display for Compression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (name, level) = match *self {
+            Compression::None => return f.write_str("none"),
+            Compression::Zstd { level } => ("zstd", level),
+            Compression::Lz4 { level } => ("lz4", level),
+        };
+        if level == 0 {
+            f.write_str(name)
+        } else {
+            write!(f, "{name}:{level}")
+        }
+    }
+}
+
+/// Reads the text form: `none`, `zstd`, `zstd:LEVEL`, `lz4` or `lz4:LEVEL`.
+/// The result is valid (Go: `ParseCompression`).
+impl FromStr for Compression {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Compression, Error> {
+        let (name, level_text) = match s.split_once(':') {
+            Some((name, level)) => (name, Some(level)),
+            None => (s, None),
+        };
+        if !matches!(name, "none" | "zstd" | "lz4") {
+            return Err(Error::InvalidCompression(format!(
+                "{s:?}: want none, zstd[:LEVEL] or lz4[:LEVEL]"
+            )));
+        }
+        let level = match level_text {
+            None => 0,
+            // The plain decimal form only: parse also takes a sign and
+            // leading zeros.
+            Some(text) => match text.parse::<i32>() {
+                Ok(n) if n.to_string() == text => n,
+                _ => {
+                    return Err(Error::InvalidCompression(format!(
+                        "{s:?}: bad level {text:?}"
+                    )));
+                }
+            },
+        };
+        let c = match name {
+            "none" if level != 0 => {
+                return Err(Error::InvalidCompression(format!(
+                    "none takes no level, got {level}"
+                )));
+            }
+            "none" => Compression::None,
+            "zstd" => Compression::Zstd { level },
+            _ => Compression::Lz4 { level },
+        };
+        c.validate()?;
+        Ok(c)
     }
 }
 
@@ -1100,5 +1219,74 @@ mod tests {
         let mut r = Reader::new(&b"NOTAMBER..."[..]).records();
         assert!(matches!(r.next(), Some(Err(_))));
         assert!(r.next().is_none());
+    }
+
+    #[test]
+    fn compression_validate() {
+        for c in [
+            Compression::None,
+            Compression::Zstd { level: 0 },
+            Compression::Zstd { level: 1 },
+            Compression::Zstd { level: 22 },
+            Compression::Lz4 { level: 0 },
+            Compression::Lz4 { level: 1 },
+            Compression::Lz4 { level: 12 },
+        ] {
+            c.validate().unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        }
+        for c in [
+            Compression::Zstd { level: -1 },
+            Compression::Zstd { level: 23 },
+            Compression::Lz4 { level: -1 },
+            Compression::Lz4 { level: 13 },
+        ] {
+            let err = c.validate().expect_err("must be invalid");
+            assert!(err.is_invalid_compression(), "{c:?}: {err}");
+        }
+        assert_eq!(Compression::default(), Compression::None);
+        assert_eq!(
+            Compression::Zstd { level: 23 }
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "amberpack: invalid compression: zstd level 23, want 0 to 22"
+        );
+    }
+
+    #[test]
+    fn compression_text_form() {
+        for (text, c) in [
+            ("none", Compression::None),
+            ("zstd", Compression::Zstd { level: 0 }),
+            ("zstd:19", Compression::Zstd { level: 19 }),
+            ("lz4", Compression::Lz4 { level: 0 }),
+            ("lz4:9", Compression::Lz4 { level: 9 }),
+        ] {
+            assert_eq!(c.to_string(), text);
+            assert_eq!(text.parse::<Compression>().unwrap(), c, "{text}");
+        }
+        // An explicit level of 0 parses; it prints without the level.
+        for (text, c) in [
+            ("zstd:0", Compression::Zstd { level: 0 }),
+            ("lz4:0", Compression::Lz4 { level: 0 }),
+            ("none:0", Compression::None),
+            ("lz4:12", Compression::Lz4 { level: 12 }),
+        ] {
+            assert_eq!(text.parse::<Compression>().unwrap(), c, "{text}");
+        }
+    }
+
+    #[test]
+    fn compression_parse_rejects_sloppy_text() {
+        for text in [
+            "", " ", "gzip", "ZSTD", "Zstd", " zstd", "zstd ", "zstd:", "zstd:x", "zstd:+3",
+            "zstd:03", "zstd:-1", "zstd:3 ", "zstd:23", "zstd:3:4", "lz4:13", "lz4:-0", "none:1",
+            ":3", "lz4hc",
+        ] {
+            match text.parse::<Compression>() {
+                Err(e) => assert!(e.is_invalid_compression(), "{text:?}: {e}"),
+                Ok(c) => panic!("{text:?} parsed as {c:?}"),
+            }
+        }
     }
 }
