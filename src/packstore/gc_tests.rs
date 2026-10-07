@@ -17,12 +17,12 @@ use crate::key::Key;
 
 use super::store_tests::sealed_store;
 use super::testutil::*;
-use super::{CompactOpts, MAGIC_HEADER, Object, Options, Store};
+use super::{CompactOpts, MAGIC_HEADER, Object, Store};
 
 /// An open store with `objs` sealed into segments of 8 KiB (Go: `gcStore`).
 fn gc_store(objs: &[Object]) -> (TempDir, Store) {
     let dir = sealed_store(objs); // put + close seals via rotation at 8 KiB
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     (dir, s)
 }
 
@@ -41,7 +41,7 @@ fn seg_files(dir: &Path) -> Vec<PathBuf> {
 /// in the active one (Go: `compactStore`).
 pub(crate) fn compact_store() -> (TempDir, Store, Vec<Object>) {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::new().segment_size(8 << 10).sync(false)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(8 << 10).sync(false)).unwrap();
     let objs: Vec<Object> = (0..5)
         .map(|i| {
             let mut data = incompressible(4 << 10);
@@ -219,7 +219,7 @@ fn record_reports_corrupt_payload() {
     let mut b = fs::read(&segs[0]).unwrap();
     b[8 + REC_HEADER_SIZE] ^= 0xFF;
     fs::write(&segs[0], &b).unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let segs = s.segments().unwrap();
     let err = s.record(segs[0].id, 8).unwrap_err();
     assert!(
@@ -343,7 +343,7 @@ fn remove_drops_segment() {
     // Survives reopen: no half-state on disk.
     s.close().unwrap();
     drop(s);
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for o in &objs {
         s2.get(o.key)
             .unwrap_or_else(|e| panic!("get({}) after reopen: {e}", o.key));
@@ -428,7 +428,7 @@ fn remove_during_scan_index_is_safe() {
 #[test]
 fn oldest_inflight_write_tracks_write_batch() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     assert!(
         s.oldest_inflight_write().is_none(),
         "idle store reports an in-flight write"
@@ -483,7 +483,7 @@ fn oldest_inflight_write_covers_put() {
     // only observable via the map being empty afterwards, so just check a
     // plain put leaves no token behind and errors don't leak tokens.
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let o = blob_obj(b"x");
     s.put(o.key, &o.data).unwrap();
     s.put(o.key, &o.data).unwrap(); // dedup path
@@ -559,7 +559,7 @@ fn compact_removes_dead_objects() {
     s.verify(|| false).unwrap();
     s.close().unwrap();
     drop(s);
-    let s2 = Store::open_with(dir.path(), Options::new().sync(false)).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts().sync(false)).unwrap();
     for i in [0, 2, 4] {
         s2.get(objs[i].key)
             .unwrap_or_else(|e| panic!("after reopen, object {i}: {e}"));
@@ -620,7 +620,7 @@ fn compact_horizon_spares_young_segments() {
 #[test]
 fn compact_rejects_corrupt_record() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::new().segment_size(8 << 10).sync(false)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(8 << 10).sync(false)).unwrap();
     let objs: Vec<Object> = (0..2)
         .map(|i| {
             let mut data = incompressible(4 << 10);
@@ -639,7 +639,7 @@ fn compact_rejects_corrupt_record() {
     let mut raw = fs::read(&segs[0]).unwrap();
     raw[MAGIC_HEADER.len() + REC_HEADER_SIZE] ^= 0xFF;
     fs::write(&segs[0], &raw).unwrap();
-    let s = Store::open_with(dir.path(), Options::new().sync(false)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().sync(false)).unwrap();
     // objs[1] is dead, so the segment is a victim; copying corrupted objs[0]
     // must fail.
     let err = s
@@ -722,7 +722,7 @@ fn abort_barrier_discards_capture() {
 #[test]
 fn compact_during_reads() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::new().segment_size(8 << 10).sync(false)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(8 << 10).sync(false)).unwrap();
 
     let by_key: Mutex<HashMap<Key, Vec<u8>>> = Mutex::new(HashMap::new());
     let keys: Mutex<Arc<Vec<Key>>> = Mutex::new(Arc::new(Vec::new()));

@@ -4,11 +4,11 @@
 
 use tempfile::TempDir;
 
-use crate::amberpack::encode_record;
+use crate::amberpack::encode_record_with;
 
 use super::store_tests::obj_seq;
 use super::testutil::*;
-use super::{Object, Options, Store, WriteOpts};
+use super::{Object, Store, WriteOpts};
 
 /// `o` as a pre-encoded record: what a caller that already holds the record
 /// bytes (a staged pack) offers instead of `data` (Go: `recordObj`).
@@ -16,7 +16,7 @@ fn record_obj(o: &Object) -> Object {
     Object {
         key: o.key,
         data: Vec::new(),
-        record: Some(encode_record(o.key, &o.data).unwrap()),
+        record: Some(encode_record_with(o.key, &o.data, ZSTD).unwrap()),
     }
 }
 
@@ -30,7 +30,7 @@ fn corrupt_record(o: &mut Object) {
 #[test]
 fn write_parallel_records_stored_and_readable() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open_with(dir.path(), Options::default().segment_size(32 << 10)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(32 << 10)).unwrap();
     let objs = test_objects(60);
     let recs: Vec<Object> = objs.iter().map(record_obj).collect();
     let mut batch = recs.clone();
@@ -69,7 +69,7 @@ fn write_parallel_records_stored_and_readable() {
 #[test]
 fn write_parallel_records_dedup_against_present() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(20);
     for o in &objs[..10] {
         s.put(o.key, &o.data).unwrap();
@@ -91,14 +91,14 @@ fn write_parallel_record_verify_catches_wrong_payload() {
     // The record is well formed (its CRC is right) but its payload does not
     // hash to its key: only verify can tell, exactly as for data.
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(3);
     let mut wrong = objs[0].data.clone();
     wrong.push(0xFF);
     let bad = Object {
         key: objs[0].key,
         data: Vec::new(),
-        record: Some(encode_record(objs[0].key, &wrong).unwrap()),
+        record: Some(encode_record_with(objs[0].key, &wrong, ZSTD).unwrap()),
     };
     let (_, res) = s.write_parallel(
         obj_seq(&[record_obj(&objs[1]), bad.clone()], None),
@@ -121,7 +121,7 @@ fn write_parallel_record_verify_catches_wrong_payload() {
 #[test]
 fn write_parallel_record_corrupt_fails() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let mut o = record_obj(&test_objects(1)[0]);
     corrupt_record(&mut o);
     let (_, res) = s.write_parallel(obj_seq(&[o.clone()], None), WriteOpts::default());
@@ -133,7 +133,7 @@ fn write_parallel_record_corrupt_fails() {
 #[test]
 fn write_parallel_record_key_mismatch_fails() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(2);
     let mut o = record_obj(&objs[0]);
     o.key = objs[1].key; // record says objs[0], object says objs[1]
@@ -145,7 +145,7 @@ fn write_parallel_record_key_mismatch_fails() {
 #[test]
 fn write_parallel_data_and_record_fails() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let o = test_objects(1).remove(0);
     let mut both = record_obj(&o);
     both.data = o.data.clone();
@@ -157,7 +157,7 @@ fn write_parallel_data_and_record_fails() {
 #[test]
 fn write_batch_records() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(30);
     s.put(objs[0].key, &objs[0].data).unwrap();
     let mut recs: Vec<Object> = objs.iter().map(record_obj).collect();
@@ -184,7 +184,7 @@ fn write_batch_records() {
 #[test]
 fn append_record_rejects_empty_record() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let o = test_objects(1).remove(0);
     let err = s.append_record(o.key, &[]).unwrap_err();
     assert!(

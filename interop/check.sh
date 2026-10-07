@@ -19,6 +19,12 @@
 #      (ref get, ref list, ls ref:NAME@PATH) the references the OTHER one
 #      wrote into the same store directory, moves them with --expect, is
 #      refused with a stale expectation, and both see the final state.
+#   6. compression: each implementation ingests the tree with zstd and with
+#      lz4 into a store of its own, the OTHER lists and exports it byte for
+#      byte, and each compressed store is smaller than the default one. Every
+#      segment of a zstd store is at format version 2, which releases up to
+#      0.9.0 read, and every segment of an lz4 store at version 3, which they
+#      refuse.
 set -euo pipefail
 
 RS_REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,6 +48,7 @@ T="$WORK/tree"
 mkdir -p "$T/docs/deep/deeper" "$T/logs"
 printf 'hello amber\n' > "$T/hello.txt"
 head -c 3000000 /dev/urandom > "$T/big.bin"        # multi-chunk, multi-level index
+seq 1 150000 > "$T/compressible.txt"   # ~1 MiB of numbers: it compresses and does not dedup
 touch "$T/empty"
 printf 'x' > "$T/one-byte"
 ln -s ../hello.txt "$T/docs/link"
@@ -78,6 +85,44 @@ echo "== cross-exporting (tar byte-compare, 4 combinations)"
 cmp "$WORK/go-from-go.tar" "$WORK/rs-from-go.tar"
 cmp "$WORK/go-from-go.tar" "$WORK/rs-from-rs.tar"
 cmp "$WORK/go-from-go.tar" "$WORK/go-from-rs.tar"
+
+echo "== compression (each side reads what the OTHER wrote with zstd and with lz4)"
+store_bytes() { find "$1" -type f -exec cat {} + | wc -c | tr -d ' '; }
+PLAIN_GO=$(store_bytes "$WORK/store-go/packstore")
+PLAIN_RS=$(store_bytes "$WORK/store-rs/packstore")
+for comp in zstd:19 lz4:9; do
+  tag=${comp%%:*}
+  [ "$("$GO" --store "$WORK/store-go-$tag" --compression "$comp" ingest "$T")" = "$ROOT_GO" ] \
+    || { echo "FAIL: go root key differs with --compression $comp" >&2; exit 1; }
+  [ "$("$RS" --store "$WORK/store-rs-$tag" --compression "$comp" ingest "$T")" = "$ROOT_GO" ] \
+    || { echo "FAIL: rust root key differs with --compression $comp" >&2; exit 1; }
+  "$RS" --store "$WORK/store-go-$tag" ls --keys "$ROOT_GO" > "$WORK/ls-rs-from-go-$tag.txt"
+  "$GO" --store "$WORK/store-rs-$tag" ls --keys "$ROOT_GO" > "$WORK/ls-go-from-rs-$tag.txt"
+  cmp "$WORK/ls-go-own.txt" "$WORK/ls-rs-from-go-$tag.txt"
+  cmp "$WORK/ls-go-own.txt" "$WORK/ls-go-from-rs-$tag.txt"
+  "$RS" --store "$WORK/store-go-$tag" export -o "$WORK/rs-from-go-$tag.tar" "$ROOT_GO"
+  "$GO" --store "$WORK/store-rs-$tag" export -o "$WORK/go-from-rs-$tag.tar" "$ROOT_GO"
+  cmp "$WORK/go-from-go.tar" "$WORK/rs-from-go-$tag.tar"
+  cmp "$WORK/go-from-go.tar" "$WORK/go-from-rs-$tag.tar"
+  # A smaller store is the evidence that compressed records were written.
+  [ "$(store_bytes "$WORK/store-go-$tag/packstore")" -lt "$PLAIN_GO" ] \
+    || { echo "FAIL: go store is no smaller with --compression $comp" >&2; exit 1; }
+  [ "$(store_bytes "$WORK/store-rs-$tag/packstore")" -lt "$PLAIN_RS" ] \
+    || { echo "FAIL: rust store is no smaller with --compression $comp" >&2; exit 1; }
+  # The format version is the last byte of a segment's 8-byte header.
+  if [ "$tag" = lz4 ]; then want=03; else want=02; fi
+  for side in go rs; do
+    checked=0
+    for f in "$WORK/store-$side-$tag/packstore"/*.seg "$WORK/store-$side-$tag/packstore"/*.seg.active; do
+      [ -e "$f" ] || continue
+      got=$(od -An -tx1 -j7 -N1 "$f" | tr -d ' ')
+      [ "$got" = "$want" ] \
+        || { echo "FAIL: $f is at segment version $got with --compression $comp, want $want" >&2; exit 1; }
+      checked=$((checked + 1))
+    done
+    [ "$checked" -gt 0 ] || { echo "FAIL: no segments in store-$side-$tag" >&2; exit 1; }
+  done
+done
 
 echo "== restore (rust, from the go store) -> re-ingest (go) -> same root"
 "$RS" --store "$WORK/store-go" restore "$ROOT_GO" "$WORK/restored"

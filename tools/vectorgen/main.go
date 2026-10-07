@@ -64,7 +64,7 @@ func run(outDir string) error {
 		return fmt.Errorf("filters.json: %w", err)
 	}
 	if err := genSegments(outDir); err != nil {
-		return fmt.Errorf("segments_go: %w", err)
+		return fmt.Errorf("segments: %w", err)
 	}
 	if err := genTar(outDir, tree); err != nil {
 		return fmt.Errorf("tar_go.tar: %w", err)

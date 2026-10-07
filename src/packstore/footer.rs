@@ -12,7 +12,9 @@ use crate::binaryfuse::{BinaryFuse16, SECTION_HEADER_SIZE};
 use crate::key::Key;
 
 use super::view::FileIdent;
-use super::{Error, MAGIC_HEADER, MAGIC_TRAILER, TAG_SEAL, be_u32, check_version, corrupt};
+use super::{
+    Error, MAGIC_HEADER, MAGIC_TRAILER, TAG_SEAL, be_u32, check_version, corrupt, is_header,
+};
 
 /// 256 cumulative u32 counts on the key's first byte.
 pub(crate) const FANOUT_SIZE: usize = 256 * 4;
@@ -240,7 +242,7 @@ pub(crate) fn parse_footer(mm: &[u8]) -> Result<FooterView, Error> {
         return Err(corrupt(format!("file too short: {} bytes", mm.len())));
     }
     check_version(mm)?;
-    if mm[..MAGIC_HEADER.len()] != MAGIC_HEADER {
+    if !is_header(&mm[..MAGIC_HEADER.len()]) {
         return Err(corrupt("bad header magic"));
     }
     let tr = &mm[mm.len() - TRAILER_SIZE..];
@@ -329,6 +331,11 @@ impl std::fmt::Debug for SealedSegment {
 }
 
 impl SealedSegment {
+    /// The segment's format version (Go: `sealedSegment.version`).
+    pub(crate) fn version(&self) -> u8 {
+        self.mm[MAGIC_HEADER.len() - 1]
+    }
+
     /// Maps a sealed segment and validates its footer. The fd is closed after
     /// mapping; the mapping keeps the file content alive (Go: `openSealed`).
     pub(crate) fn open(path: &Path, id: u64) -> Result<SealedSegment, Error> {

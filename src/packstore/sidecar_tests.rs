@@ -19,7 +19,7 @@ use super::sidecar::{
 };
 use super::store_tests::obj_seq;
 use super::testutil::*;
-use super::{MAGIC_HEADER, MAGIC_TRAILER, Options, Store};
+use super::{MAGIC_HEADER, MAGIC_TRAILER, Store};
 
 fn sc_key(i: usize) -> Key {
     let data = format!("sidecar-object-{i}");
@@ -181,7 +181,7 @@ fn sidecar_writer_stops_after_a_failure() {
 #[test]
 fn open_trusts_synced_entries() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(5);
     put_all(&s, &objs);
     s.close().unwrap();
@@ -190,7 +190,7 @@ fn open_trusts_synced_entries() {
     // The first payload byte of the first record.
     flip_byte(&data, (MAGIC_HEADER.len() + REC_HEADER_SIZE) as u64);
 
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     for o in &objs {
         assert!(
             s2.has(o.key).unwrap(),
@@ -297,7 +297,7 @@ fn recovery_reads_only_the_untrusted_tail() {
 #[test]
 fn acknowledged_record_missing_from_index_is_found() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(3);
     put_all(&s, &objs);
     s.close().unwrap();
@@ -313,7 +313,7 @@ fn acknowledged_record_missing_from_index_is_found() {
         .set_len((valid - 3 * SIDECAR_REC_SIZE) as u64)
         .unwrap();
 
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     want_objects(&s2, &objs); // found by a store that only reads, which repairs nothing
     // The next writer takes the segment and brings its sidecar in line.
     let extra = &test_objects(4)[3..];
@@ -336,9 +336,9 @@ fn crashed_copy(from: &std::path::Path) -> TempDir {
 
 #[test]
 fn unsynced_entries_are_verified() {
-    let nosync = Options::new().sync(false);
+    let nosync = zstd_opts().sync(false);
     let src = TempDir::new().unwrap();
-    let s = Store::open_with(src.path(), nosync).unwrap();
+    let s = Store::open_with(src.path(), nosync.clone()).unwrap();
     let objs = test_objects(5);
     s.write_batch(obj_seq(&objs, None)).unwrap();
     let dir = crashed_copy(src.path()); // no fsync ever ran: nothing is known durable
@@ -346,7 +346,7 @@ fn unsynced_entries_are_verified() {
     // The last record's last payload byte.
     flip_byte(&data, fs::metadata(&data).unwrap().len() - 1);
 
-    let s2 = Store::open_with(dir.path(), nosync).unwrap();
+    let s2 = Store::open_with(dir.path(), nosync.clone()).unwrap();
     want_objects(&s2, &objs[..4]);
     assert!(
         !s2.has(objs[4].key).unwrap(),
@@ -358,7 +358,7 @@ fn unsynced_entries_are_verified() {
     put_all(&s2, more);
     s2.close().unwrap();
     for _ in 0..2 {
-        let s3 = Store::open_with(dir.path(), nosync).unwrap();
+        let s3 = Store::open_with(dir.path(), nosync.clone()).unwrap();
         want_objects(&s3, &objs[..4]);
         want_objects(&s3, more);
         assert!(
@@ -386,14 +386,14 @@ fn sidecar_problems_fall_back_to_a_full_scan() {
     ];
     for (name, damage) in damages {
         let dir = TempDir::new().unwrap();
-        let s = Store::open(dir.path()).unwrap();
+        let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
         let objs = test_objects(4);
         put_all(&s, &objs);
         s.close().unwrap();
         let data = only_active(dir.path());
         damage(&sidecar_of(&data), fs::metadata(&data).unwrap().len());
 
-        let s2 = Store::open(dir.path()).unwrap();
+        let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
         want_objects(&s2, &objs);
         // The writer that takes the segment rebuilds its sidecar.
         let extra = &test_objects(5)[4..];
@@ -408,7 +408,7 @@ fn sidecar_problems_fall_back_to_a_full_scan() {
 fn seal_removes_sidecar() {
     let dir = TempDir::new().unwrap();
     // Every record seals its segment.
-    let s = Store::open_with(dir.path(), Options::new().segment_size(1)).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts().segment_size(1)).unwrap();
     put_all(&s, &test_objects(3));
     assert_eq!(sidecar_files(dir.path()), Vec::<std::path::PathBuf>::new());
 }
@@ -416,7 +416,7 @@ fn seal_removes_sidecar() {
 #[test]
 fn crashed_seal_leaves_no_sidecar() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     let objs = test_objects(6);
     put_all(&s, &objs);
     s.close().unwrap();
@@ -424,7 +424,7 @@ fn crashed_seal_leaves_no_sidecar() {
     let data = only_active(dir.path());
     crash_seal(dir.path());
 
-    let s2 = Store::open(dir.path()).unwrap();
+    let s2 = Store::open_with(dir.path(), zstd_opts()).unwrap();
     want_objects(&s2, &objs);
     put_all(&s2, &test_objects(7)[6..]); // the write that takes the segment and finishes its seal
     assert!(
@@ -445,7 +445,7 @@ fn orphan_sidecar_is_removed() {
         .path()
         .join(format!("00000000000000aa.seg.active{SIDECAR_SUFFIX}"));
     fs::write(&orphan, sidecar_image(&[])).unwrap();
-    let _s = Store::open(dir.path()).unwrap();
+    let _s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     assert_eq!(
         sidecar_files(dir.path()),
         Vec::<std::path::PathBuf>::new(),
@@ -456,7 +456,7 @@ fn orphan_sidecar_is_removed() {
 #[test]
 fn wipe_removes_sidecar() {
     let dir = TempDir::new().unwrap();
-    let s = Store::open(dir.path()).unwrap();
+    let s = Store::open_with(dir.path(), zstd_opts()).unwrap();
     put_all(&s, &test_objects(1));
     assert_eq!(
         sidecar_files(dir.path()).len(),

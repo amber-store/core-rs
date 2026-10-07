@@ -201,7 +201,13 @@ impl Store {
         let mut pending = 0usize;
         loop {
             if run.canceled() {
-                return; // no flush; the run-level final sync covers us
+                // Keep taking objects off the channel until the distributor
+                // closes it. It may be blocked in a send on a full channel
+                // (Go's selects on the context there), and writers that
+                // simply left would leave it blocked for good. No flush:
+                // the run-level final sync covers us.
+                while unpoison(rx.lock()).recv().is_ok() {}
+                return;
             }
             let recv = unpoison(rx.lock()).recv();
             let obj = match recv {
@@ -222,15 +228,22 @@ impl Store {
                     continue;
                 }
                 Ok(false) => {}
-                Err(e) => return run.fail(e),
+                Err(e) => {
+                    run.fail(e);
+                    continue;
+                }
             }
             let key = obj.key;
-            let (rec, ulen) = match prepare(obj, verify) {
+            let (rec, ulen) = match prepare(&self.cfg, obj, verify) {
                 Ok(v) => v,
-                Err(e) => return run.fail(e),
+                Err(e) => {
+                    run.fail(e);
+                    continue;
+                }
             };
             if let Err(e) = self.append(key, &rec, false) {
-                return run.fail(e);
+                run.fail(e);
+                continue;
             }
             run.stored.fetch_add(1, Ordering::Relaxed);
             run.bytes_stored.fetch_add(ulen, Ordering::Relaxed);
@@ -238,7 +251,8 @@ impl Store {
             if pending >= batch_size {
                 pending = 0;
                 if let Err(e) = self.sync_active() {
-                    return run.fail(e);
+                    run.fail(e);
+                    continue;
                 }
             }
         }

@@ -148,12 +148,21 @@ Records whose splitmix payloads do **not** compress (flag stays 0), so bytes
 are implementation-independent. `record_hex` present only for payloads
 ≤ 256 bytes; `record_blake3` always. Includes the empty payload.
 
-- `records_compressed.json`: Go-encoded records with compressible payloads —
+- `records_compressed.json`: Go-encoded zstd records (level 0) of compressible payloads —
   decode-only vectors (Rust must parse and recover the payload; byte equality
   is **not** expected from a Rust encoder):
 
 ```json
 { "cases": [ { "record_hex": "...", "key": "<64 hex>", "payload": {..} } ] }
+```
+
+- `records_lz4.json`: Go-encoded lz4 records of the same compressible
+  payloads, at level 0 (the fast compressor) and at level 9 (high
+  compression) — decode-only vectors, like the zstd ones (a Rust encoder
+  produces different blocks):
+
+```json
+{ "cases": [ { "record_hex": "...", "key": "<64 hex>", "payload": {..}, "level": 0 } ] }
 ```
 
 - `pack_go.bin`: a wire pack written by Go containing **every object of the
@@ -201,6 +210,16 @@ damaging the first tail record's payload before opening: trusted entries are
 not read back, so all three stay indexed, where a fall-back scan would stop at
 the damage and index none. `gc.lock`, which every open creates, is not part of
 the fixture.
+
+### `segments_go_lz4/`
+
+The same store, written by Go with `--compression lz4`'s setting, with its own
+`manifest.json` of the same shape. Its two sealed segments and its active one
+are at **segment format version 3** (`AMBERSG\x03`), the version a segment
+needs to hold a record beyond zstd, and lz4 records are in them
+(`architecture/packstore.md`). The Rust store must open it, serve every
+object, pass a full verify, and resume the version-3 active segment.
+`segments_go/` stays at version 2.
 
 ### `reference.json`
 

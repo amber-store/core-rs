@@ -8,7 +8,7 @@ use crate::commit::{self, Commit};
 use crate::key::{self, Key, Type};
 
 use super::footer::{IndexEntry, SealedSegment, build_index_section, filter_key};
-use super::{Error, MAGIC_HEADER, Store, unpoison};
+use super::{Error, MAGIC_HEADER, Store, unpoison, version_for};
 
 impl Store {
     /// Scrubs every sealed segment: walks the body record by record
@@ -53,6 +53,13 @@ impl SealedSegment {
                 msg: format!("{path}: record at offset {off}: {e}"),
                 verify: false,
             })?;
+            if version_for(rec.flags) > self.version() {
+                return Err(super::corrupt(format!(
+                    "{path}: record at offset {off}: codec {} in a version-{} segment",
+                    rec.flags,
+                    self.version()
+                )));
+            }
             let payload_at = off + REC_HEADER_SIZE;
             let payload = decode_payload(
                 rec.flags,

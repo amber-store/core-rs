@@ -9,14 +9,24 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
-use crate::amberpack::{REC_HEADER_SIZE, encode_record};
+use crate::amberpack::{Compression, REC_HEADER_SIZE, encode_record_with};
 use crate::key::{Key, Type};
 
 use super::footer::{IndexEntry, TRAILER_SIZE, build_footer};
 use super::recover::scan_active;
 use super::sidecar::{SIDECAR_MAGIC, SIDECAR_SUFFIX, SidecarRec, read_sidecar};
 use super::view::with_suffix;
-use super::{MAGIC_HEADER, Object, Store, be_u32};
+use super::{MAGIC_HEADER, Object, Options, Store, be_u32};
+
+/// What every store wrote with before compression became an option. The
+/// tests written then still run under it, so they keep covering stores that
+/// mix raw and compressed records.
+pub(crate) const ZSTD: Compression = Compression::Zstd { level: 0 };
+
+/// The default options plus [`ZSTD`].
+pub(crate) fn zstd_opts() -> Options {
+    Options::new().compression(ZSTD)
+}
 
 /// Deterministic splitmix64 stream.
 pub(crate) struct Rng(pub u64);
@@ -115,7 +125,7 @@ pub(crate) fn build_body(objs: &[Object]) -> (Vec<u8>, Vec<IndexEntry>) {
     let mut body = MAGIC_HEADER.to_vec();
     let mut entries = Vec::new();
     for o in objs {
-        let rec = encode_record(o.key, &o.data).expect("encode_record");
+        let rec = encode_record_with(o.key, &o.data, ZSTD).expect("encode_record");
         entries.push(IndexEntry {
             k: o.key,
             off: body.len() as u64,

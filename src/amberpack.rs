@@ -11,8 +11,8 @@
 //! End      0x00
 //! ```
 //!
-//! Each record is the same self-describing, CRC-protected, per-record-zstd unit
-//! packstore writes on disk; a wire pack is just those records framed by a
+//! Each record is the same self-describing, CRC-protected, individually
+//! compressed unit packstore writes on disk; a wire pack is just those records framed by a
 //! magic and an explicit end marker, so a truncated stream is detected rather
 //! than read as a clean EOF. The [`Reader`] validates framing, CRC, and key
 //! canonicality and decodes each payload (its `Iterator` impl, Go's `All`), or
@@ -26,12 +26,15 @@
 //! produced and are rejected by the [`Reader`].
 //!
 //! Compatibility note: record *headers* and raw (uncompressed) records are
-//! byte-identical with the Go implementation. zstd-compressed payload frames
-//! are not byte-identical (Go uses `klauspost/compress`, this port uses
-//! libzstd), but each side decodes the other's frames; see PORTING.md.
+//! byte-identical with the Go implementation. Compressed payloads are not
+//! (Go uses `klauspost/compress` and `pierrec/lz4`, this port libzstd and
+//! liblz4, and the two map levels differently), but each side decodes what
+//! the other wrote; see PORTING.md.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::str::FromStr;
 
 use crate::key::Key;
 
@@ -45,7 +48,10 @@ thread_local! {
 pub const REC_HEADER_SIZE: usize = 46;
 
 const TAG_CHUNK: u8 = 0x01;
-const FLAG_ZSTD: u8 = 0x01;
+/// The codec ids a record's flags byte holds.
+pub(crate) const CODEC_RAW: u8 = 0;
+pub(crate) const CODEC_ZSTD: u8 = 1;
+pub(crate) const CODEC_LZ4: u8 = 2;
 
 /// Bounds one object's payload, stored or decoded. The length fields are
 /// untrusted and size allocations. Real objects are ~1 MiB.
@@ -88,6 +94,10 @@ pub enum Error {
         /// The payload length in bytes.
         len: usize,
     },
+    /// A [`Compression`] the codec does not take, or text that does not name
+    /// one (Go: `ErrInvalidCompression`).
+    #[error("amberpack: invalid compression: {0}")]
+    InvalidCompression(String),
     /// An I/O error from the underlying writer. (The [`Reader`] never returns
     /// this: exactly like Go, every stream read failure is classified
     /// `Malformed`.)
@@ -104,6 +114,128 @@ impl Error {
     /// Go's `errors.Is(err, ErrMalformed)`.
     pub fn is_malformed(&self) -> bool {
         matches!(self, Error::Malformed(_))
+    }
+
+    /// Go's `errors.Is(err, ErrInvalidCompression)`.
+    pub fn is_invalid_compression(&self) -> bool {
+        matches!(self, Error::InvalidCompression(_))
+    }
+}
+
+/// The highest level each algorithm takes.
+const MAX_ZSTD_LEVEL: i32 = 22;
+const MAX_LZ4_LEVEL: i32 = 12;
+
+/// How a record's payload is compressed: an algorithm and its level. The
+/// default is no compression. Level 0 selects the algorithm's default: 3 for
+/// zstd, the fast compressor for lz4. zstd takes levels up to 22 and lz4 up
+/// to 12, where 1 and above are its high-compression levels.
+///
+/// Go: `Compression{Algorithm, Level}`. The Go encoders have fewer distinct
+/// levels and map a level to the nearest one they have; this crate uses the
+/// level as given. The level changes what is written and never how it is
+/// read.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compression {
+    /// The payload is stored as it is.
+    #[default]
+    None,
+    /// The payload is one zstd frame.
+    Zstd {
+        /// 0 to 22; 0 means 3.
+        level: i32,
+    },
+    /// The payload is one LZ4 block.
+    Lz4 {
+        /// 0 to 12; 0 means the fast compressor.
+        level: i32,
+    },
+}
+
+impl Compression {
+    /// The codec id a record compressed this way carries.
+    pub(crate) fn codec(&self) -> u8 {
+        match self {
+            Compression::None => CODEC_RAW,
+            Compression::Zstd { .. } => CODEC_ZSTD,
+            Compression::Lz4 { .. } => CODEC_LZ4,
+        }
+    }
+
+    /// Reports whether the level is one the algorithm takes (Go: `Validate`).
+    pub fn validate(&self) -> Result<(), Error> {
+        let (name, level, max) = match *self {
+            Compression::None => return Ok(()),
+            Compression::Zstd { level } => ("zstd", level, MAX_ZSTD_LEVEL),
+            Compression::Lz4 { level } => ("lz4", level, MAX_LZ4_LEVEL),
+        };
+        if !(0..=max).contains(&level) {
+            return Err(Error::InvalidCompression(format!(
+                "{name} level {level}, want 0 to {max}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The text form [`FromStr`] reads: `none`, `zstd`, `zstd:19`, `lz4`,
+/// `lz4:9`. A level of 0 is left out (Go: `Compression.String`).
+impl fmt::Display for Compression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (name, level) = match *self {
+            Compression::None => return f.write_str("none"),
+            Compression::Zstd { level } => ("zstd", level),
+            Compression::Lz4 { level } => ("lz4", level),
+        };
+        if level == 0 {
+            f.write_str(name)
+        } else {
+            write!(f, "{name}:{level}")
+        }
+    }
+}
+
+/// Reads the text form: `none`, `zstd`, `zstd:LEVEL`, `lz4` or `lz4:LEVEL`.
+/// The result is valid (Go: `ParseCompression`).
+impl FromStr for Compression {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Compression, Error> {
+        let (name, level_text) = match s.split_once(':') {
+            Some((name, level)) => (name, Some(level)),
+            None => (s, None),
+        };
+        if !matches!(name, "none" | "zstd" | "lz4") {
+            return Err(Error::InvalidCompression(format!(
+                "{s:?}: want none, zstd[:LEVEL] or lz4[:LEVEL]"
+            )));
+        }
+        let level = match level_text {
+            None => 0,
+            // The plain decimal form only: parse also takes a sign and
+            // leading zeros.
+            Some(text) => match text.parse::<i32>() {
+                Ok(n) if n.to_string() == text => n,
+                _ => {
+                    return Err(Error::InvalidCompression(format!(
+                        "{s:?}: bad level {text:?}"
+                    )));
+                }
+            },
+        };
+        let c = match name {
+            "none" if level != 0 => {
+                return Err(Error::InvalidCompression(format!(
+                    "none takes no level, got {level}"
+                )));
+            }
+            "none" => Compression::None,
+            "zstd" => Compression::Zstd { level },
+            _ => Compression::Lz4 { level },
+        };
+        c.validate()?;
+        Ok(c)
     }
 }
 
@@ -127,23 +259,61 @@ fn payload_fits(n: usize) -> bool {
     n as u64 <= u64::from(MAX_PAYLOAD)
 }
 
-/// Serializes `(k, data)` into a complete record, compressing the payload with
-/// zstd when that makes it strictly smaller. `k` is written as given;
-/// canonical-form validation happens on the read side.
+/// Serializes `(k, data)` into a complete record with the payload stored
+/// raw. It is [`encode_record_with`] with no compression (Go: `EncodeRecord`).
 pub fn encode_record(k: Key, data: &[u8]) -> Result<Vec<u8>, Error> {
+    encode_record_with(k, data, Compression::None)
+}
+
+/// Returns `data` compressed as `c` says, or `None` when the payload is to be
+/// stored raw: `c` is `None`, `data` is empty, or the result is not strictly
+/// smaller. A compressor failure (allocation, in practice impossible) stores
+/// raw too, which is indistinguishable from "did not get smaller". `c` must
+/// be valid.
+fn compress(c: Compression, data: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() {
+        return None;
+    }
+    let out = match c {
+        Compression::None => return None,
+        Compression::Zstd { level } => {
+            let level = if level == 0 {
+                zstd::DEFAULT_COMPRESSION_LEVEL
+            } else {
+                level
+            };
+            zstd::bulk::compress(data, level).ok()?
+        }
+        Compression::Lz4 { level } => {
+            let mode = if level == 0 {
+                lz4::block::CompressionMode::DEFAULT
+            } else {
+                lz4::block::CompressionMode::HIGHCOMPRESSION(level)
+            };
+            // No size prefix: the record's ulen is the block's length.
+            lz4::block::compress(data, Some(mode), false).ok()?
+        }
+    };
+    (out.len() < data.len()).then_some(out)
+}
+
+/// Serializes `(k, data)` into a complete record, compressing the payload as
+/// `c` says when that makes it strictly smaller and storing it raw otherwise.
+/// An invalid `c` is [`Error::InvalidCompression`]. `k` is written as given;
+/// canonical-form validation happens on the read side (Go:
+/// `EncodeRecordWith`).
+pub fn encode_record_with(k: Key, data: &[u8], c: Compression) -> Result<Vec<u8>, Error> {
+    c.validate()?;
     if !payload_fits(data.len()) {
         return Err(Error::TooLarge {
             key: k,
             len: data.len(),
         });
     }
-    // Level 3 is the libzstd default, matching Go's klauspost default level.
-    // A compression failure (allocation, in practice impossible) falls back to
-    // raw storage — indistinguishable from "did not get smaller".
-    let comp = zstd::bulk::compress(data, zstd::DEFAULT_COMPRESSION_LEVEL).ok();
+    let comp = compress(c, data);
     let (payload, flags): (&[u8], u8) = match comp.as_deref() {
-        Some(c) if c.len() < data.len() => (c, FLAG_ZSTD),
-        _ => (data, 0),
+        Some(p) => (p, c.codec()),
+        None => (data, CODEC_RAW),
     };
     let mut rec = vec![0u8; REC_HEADER_SIZE + payload.len()];
     rec[0] = TAG_CHUNK;
@@ -169,7 +339,7 @@ pub fn parse_record(b: &[u8]) -> Result<Record, Error> {
         return Err(Error::Corrupt(format!("unexpected record tag {:#x}", b[0])));
     }
     let flags = b[33];
-    if flags & !FLAG_ZSTD != 0 {
+    if flags > CODEC_LZ4 {
         return Err(Error::Corrupt(format!("unknown record flags {flags:#x}")));
     }
     let ulen = u32::from_be_bytes([b[34], b[35], b[36], b[37]]);
@@ -177,7 +347,7 @@ pub fn parse_record(b: &[u8]) -> Result<Record, Error> {
     if (b.len() as u64) < REC_HEADER_SIZE as u64 + u64::from(slen) {
         return Err(Error::Corrupt("truncated record payload".into()));
     }
-    if flags & FLAG_ZSTD == 0 && ulen != slen {
+    if flags == CODEC_RAW && ulen != slen {
         return Err(Error::Corrupt(format!(
             "raw record with ulen {ulen} != slen {slen}"
         )));
@@ -187,7 +357,7 @@ pub fn parse_record(b: &[u8]) -> Result<Record, Error> {
             "record ulen {ulen} exceeds limit {MAX_PAYLOAD}"
         )));
     }
-    if flags & FLAG_ZSTD != 0 && slen >= ulen {
+    if flags != CODEC_RAW && slen >= ulen {
         return Err(Error::Corrupt(format!(
             "compressed record with slen {slen} >= ulen {ulen}"
         )));
@@ -207,24 +377,35 @@ pub fn parse_record(b: &[u8]) -> Result<Record, Error> {
     })
 }
 
-/// Returns caller-owned payload bytes from a record's stored payload. `stored`
-/// may be a read-only mmap slice and is never retained.
+/// Returns caller-owned payload bytes from a record's stored payload, decoded
+/// as the record's flags byte says. `stored` may be a read-only mmap slice
+/// and is never retained.
 pub fn decode_payload(flags: u8, ulen: u32, stored: &[u8]) -> Result<Vec<u8>, Error> {
-    if flags & FLAG_ZSTD == 0 {
-        return Ok(stored.to_vec());
-    }
-    // The decompression buffer is capped at ulen, so a frame that would expand
-    // past the header's claim fails inside zstd rather than allocating; either
-    // way the record is Corrupt (Go decodes fully, then reports the length
-    // mismatch — same class, slightly different message in that edge).
-    let out = DECOMPRESSOR
-        .with_borrow_mut(|d| -> io::Result<Vec<u8>> {
-            if d.is_none() {
-                *d = Some(zstd::bulk::Decompressor::new()?);
-            }
-            d.as_mut().unwrap().decompress(stored, ulen as usize)
-        })
-        .map_err(|e| Error::Corrupt(format!("zstd: {e}")))?;
+    let out = match flags {
+        CODEC_RAW => return Ok(stored.to_vec()),
+        // The decompression buffer is capped at ulen, so a frame that would
+        // expand past the header's claim fails inside zstd rather than
+        // allocating; either way the record is Corrupt (Go decodes fully,
+        // then reports the length mismatch — same class, slightly different
+        // message in that edge).
+        CODEC_ZSTD => DECOMPRESSOR
+            .with_borrow_mut(|d| -> io::Result<Vec<u8>> {
+                if d.is_none() {
+                    *d = Some(zstd::bulk::Decompressor::new()?);
+                }
+                d.as_mut().unwrap().decompress(stored, ulen as usize)
+            })
+            .map_err(|e| Error::Corrupt(format!("zstd: {e}")))?,
+        // The block carries no length of its own: ulen sizes the output, and
+        // a block that would run past it fails inside liblz4.
+        CODEC_LZ4 => {
+            let size = i32::try_from(ulen)
+                .map_err(|_| Error::Corrupt(format!("lz4: ulen {ulen} out of range")))?;
+            lz4::block::decompress(stored, Some(size))
+                .map_err(|e| Error::Corrupt(format!("lz4: {e}")))?
+        }
+        _ => return Err(Error::Corrupt(format!("unknown record flags {flags:#x}"))),
+    };
     if out.len() != ulen as usize {
         return Err(Error::Corrupt(format!(
             "decompressed to {} bytes, header says {}",
@@ -242,6 +423,7 @@ pub fn decode_payload(flags: u8, ulen: u32, stored: &[u8]) -> Result<Vec<u8>, Er
 pub struct Writer<W: Write> {
     bw: BufWriter<W>,
     wrote_header: bool,
+    compression: Compression,
 }
 
 impl<W: Write> Writer<W> {
@@ -252,7 +434,17 @@ impl<W: Write> Writer<W> {
         Writer {
             bw: BufWriter::new(w),
             wrote_header: false,
+            compression: Compression::None,
         }
+    }
+
+    /// Sets the compression [`Writer::add`] encodes with. The default is no
+    /// compression. An invalid value fails every `add` with
+    /// [`Error::InvalidCompression`]. [`Writer::add_record`] is unaffected:
+    /// it writes records as given (Go: `WithCompression`).
+    pub fn compression(mut self, c: Compression) -> Writer<W> {
+        self.compression = c;
+        self
     }
 
     fn ensure_header(&mut self) -> Result<(), Error> {
@@ -267,7 +459,7 @@ impl<W: Write> Writer<W> {
     /// Appends one object record.
     pub fn add(&mut self, k: Key, data: &[u8]) -> Result<(), Error> {
         self.ensure_header()?;
-        let rec = encode_record(k, data)?;
+        let rec = encode_record_with(k, data, self.compression)?;
         self.bw.write_all(&rec)?;
         Ok(())
     }
@@ -473,6 +665,8 @@ mod tests {
     use super::*;
     use crate::key::Type;
 
+    const ZSTD: Compression = Compression::Zstd { level: 0 };
+
     /// n deterministic pseudo-random bytes (zstd cannot shrink them). The Go
     /// test uses a PCG stream; the property, not the exact bytes, matters.
     fn incompressible(n: usize) -> Vec<u8> {
@@ -549,9 +743,9 @@ mod tests {
     fn record_round_trip_compressed() {
         let data = compressible(64 << 10);
         let k = mk_key(&data);
-        let rec = encode_record(k, &data).unwrap();
+        let rec = encode_record_with(k, &data, ZSTD).unwrap();
         let r = parse_record(&rec).unwrap();
-        assert_eq!(r.flags, FLAG_ZSTD, "repetitive data must compress");
+        assert_eq!(r.flags, CODEC_ZSTD, "repetitive data must compress");
         assert!(r.slen < r.ulen, "compressed slen must be < ulen");
         let got = decode_payload(
             r.flags,
@@ -586,10 +780,10 @@ mod tests {
     #[test]
     fn parse_record_rejects_oversized_ulen() {
         let data = compressible(4096);
-        let mut rec = encode_record(mk_key(&data), &data).unwrap();
+        let mut rec = encode_record_with(mk_key(&data), &data, ZSTD).unwrap();
         assert_eq!(
-            rec[33] & FLAG_ZSTD,
-            FLAG_ZSTD,
+            rec[33] & CODEC_ZSTD,
+            CODEC_ZSTD,
             "test needs a compressed record"
         );
         rec[34..38].copy_from_slice(&u32::MAX.to_be_bytes());
@@ -605,7 +799,7 @@ mod tests {
     fn decode_payload_bomb_stops_at_ulen() {
         let bomb =
             zstd::bulk::compress(&vec![0u8; 64 << 20], zstd::DEFAULT_COMPRESSION_LEVEL).unwrap();
-        let err = decode_payload(FLAG_ZSTD, 1024, &bomb).unwrap_err();
+        let err = decode_payload(CODEC_ZSTD, 1024, &bomb).unwrap_err();
         assert!(err.is_corrupt(), "want Corrupt, got {err:?}");
     }
 
@@ -694,8 +888,8 @@ mod tests {
 
         // compressed slen >= ulen (constructed: flags=zstd, slen == ulen)
         let cdata = compressible(4096);
-        let mut bad = encode_record(mk_key(&cdata), &cdata).unwrap();
-        assert_eq!(bad[33], FLAG_ZSTD);
+        let mut bad = encode_record_with(mk_key(&cdata), &cdata, ZSTD).unwrap();
+        assert_eq!(bad[33], CODEC_ZSTD);
         let s = u32::from_be_bytes([bad[38], bad[39], bad[40], bad[41]]);
         bad[34..38].copy_from_slice(&s.to_be_bytes()); // ulen := slen
         fix_crc(&mut bad);
@@ -721,17 +915,17 @@ mod tests {
     #[test]
     fn decode_payload_errors() {
         // bad zstd frame
-        let err = decode_payload(FLAG_ZSTD, 100, b"not a zstd frame").unwrap_err();
+        let err = decode_payload(CODEC_ZSTD, 100, b"not a zstd frame").unwrap_err();
         assert!(err.is_corrupt(), "bad zstd frame: {err}");
 
         // ulen mismatch: an 11-byte payload claimed as 5
         let comp = zstd::bulk::compress(b"hello world", zstd::DEFAULT_COMPRESSION_LEVEL).unwrap();
-        let err = decode_payload(FLAG_ZSTD, 5, &comp).unwrap_err();
+        let err = decode_payload(CODEC_ZSTD, 5, &comp).unwrap_err();
         assert!(err.is_corrupt(), "ulen mismatch: {err}");
 
         // under-expansion (frame decodes to fewer bytes than ulen): Go's exact
         // message, byte-identical (verified differentially against Go).
-        let err = decode_payload(FLAG_ZSTD, 20, &comp).unwrap_err();
+        let err = decode_payload(CODEC_ZSTD, 20, &comp).unwrap_err();
         assert_eq!(
             err.to_string(),
             "amberpack: corrupt pack data: decompressed to 11 bytes, header says 20"
@@ -740,7 +934,7 @@ mod tests {
         // empty stored bytes with ulen > 0: libzstd decodes zero frames to
         // zero bytes without error (like Go's klauspost), so the length check
         // reports it — pinning that the message stays byte-identical to Go.
-        let err = decode_payload(FLAG_ZSTD, 5, &[]).unwrap_err();
+        let err = decode_payload(CODEC_ZSTD, 5, &[]).unwrap_err();
         assert!(err.is_corrupt(), "empty stored: {err}");
         assert_eq!(
             err.to_string(),
@@ -757,15 +951,15 @@ mod tests {
                         let data = vec![seed; size];
                         let frame =
                             zstd::bulk::compress(&data, zstd::DEFAULT_COMPRESSION_LEVEL).unwrap();
-                        assert!(decode_payload(FLAG_ZSTD, size as u32, b"invalid frame").is_err());
+                        assert!(decode_payload(CODEC_ZSTD, size as u32, b"invalid frame").is_err());
                         assert_eq!(
-                            decode_payload(FLAG_ZSTD, size as u32, &frame).unwrap(),
+                            decode_payload(CODEC_ZSTD, size as u32, &frame).unwrap(),
                             data
                         );
                         if size > 0 {
-                            assert!(decode_payload(FLAG_ZSTD, (size - 1) as u32, &frame).is_err());
+                            assert!(decode_payload(CODEC_ZSTD, (size - 1) as u32, &frame).is_err());
                             assert_eq!(
-                                decode_payload(FLAG_ZSTD, size as u32, &frame).unwrap(),
+                                decode_payload(CODEC_ZSTD, size as u32, &frame).unwrap(),
                                 zstd::bulk::decompress(&frame, size).unwrap()
                             );
                         }
@@ -826,7 +1020,7 @@ mod tests {
             (mk_key(b"alpha"), b"alpha".to_vec()),
             (mk_key(&big), big.clone()),
         ];
-        let mut w = Writer::new(Vec::new());
+        let mut w = Writer::new(Vec::new()).compression(ZSTD);
         for (k, p) in &objs {
             w.add(*k, p).unwrap();
         }
@@ -852,7 +1046,7 @@ mod tests {
             vec![(mk_key(b"alpha"), b"alpha".to_vec()), (mk_key(&big), big)];
         let mut w = Writer::new(Vec::new());
         for (k, p) in &objs {
-            let rec = encode_record(*k, p).unwrap();
+            let rec = encode_record_with(*k, p, ZSTD).unwrap();
             w.add_record(&rec).unwrap();
         }
         let buf = w.finish().unwrap();
@@ -1026,10 +1220,10 @@ mod tests {
             (mk_key(&big), big), // compressed on disk
             (mk_key(&noise), noise),
         ];
-        let mut w = Writer::new(Vec::new());
+        let mut w = Writer::new(Vec::new()).compression(ZSTD);
         let mut want = Vec::new();
         for (i, (k, p)) in objs.iter().enumerate() {
-            let rec = encode_record(*k, p).unwrap();
+            let rec = encode_record_with(*k, p, ZSTD).unwrap();
             if i % 2 == 0 {
                 w.add(*k, p).unwrap();
             } else {
@@ -1100,5 +1294,320 @@ mod tests {
         let mut r = Reader::new(&b"NOTAMBER..."[..]).records();
         assert!(matches!(r.next(), Some(Err(_))));
         assert!(r.next().is_none());
+    }
+
+    #[test]
+    fn compression_validate() {
+        for c in [
+            Compression::None,
+            Compression::Zstd { level: 0 },
+            Compression::Zstd { level: 1 },
+            Compression::Zstd { level: 22 },
+            Compression::Lz4 { level: 0 },
+            Compression::Lz4 { level: 1 },
+            Compression::Lz4 { level: 12 },
+        ] {
+            c.validate().unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        }
+        for c in [
+            Compression::Zstd { level: -1 },
+            Compression::Zstd { level: 23 },
+            Compression::Lz4 { level: -1 },
+            Compression::Lz4 { level: 13 },
+        ] {
+            let err = c.validate().expect_err("must be invalid");
+            assert!(err.is_invalid_compression(), "{c:?}: {err}");
+        }
+        assert_eq!(Compression::default(), Compression::None);
+        assert_eq!(
+            Compression::Zstd { level: 23 }
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "amberpack: invalid compression: zstd level 23, want 0 to 22"
+        );
+    }
+
+    #[test]
+    fn compression_text_form() {
+        for (text, c) in [
+            ("none", Compression::None),
+            ("zstd", Compression::Zstd { level: 0 }),
+            ("zstd:19", Compression::Zstd { level: 19 }),
+            ("lz4", Compression::Lz4 { level: 0 }),
+            ("lz4:9", Compression::Lz4 { level: 9 }),
+        ] {
+            assert_eq!(c.to_string(), text);
+            assert_eq!(text.parse::<Compression>().unwrap(), c, "{text}");
+        }
+        // An explicit level of 0 parses; it prints without the level.
+        for (text, c) in [
+            ("zstd:0", Compression::Zstd { level: 0 }),
+            ("lz4:0", Compression::Lz4 { level: 0 }),
+            ("none:0", Compression::None),
+            ("lz4:12", Compression::Lz4 { level: 12 }),
+        ] {
+            assert_eq!(text.parse::<Compression>().unwrap(), c, "{text}");
+        }
+    }
+
+    #[test]
+    fn compression_parse_rejects_sloppy_text() {
+        for text in [
+            "", " ", "gzip", "ZSTD", "Zstd", " zstd", "zstd ", "zstd:", "zstd:x", "zstd:+3",
+            "zstd:03", "zstd:-1", "zstd:3 ", "zstd:23", "zstd:3:4", "lz4:13", "lz4:-0", "none:1",
+            ":3", "lz4hc",
+        ] {
+            match text.parse::<Compression>() {
+                Err(e) => assert!(e.is_invalid_compression(), "{text:?}: {e}"),
+                Ok(c) => panic!("{text:?} parsed as {c:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn encode_record_default_is_raw() {
+        let data = compressible(64 << 10);
+        let k = mk_key(&data);
+        let rec = encode_record(k, &data).unwrap();
+        assert_eq!(
+            rec,
+            encode_record_with(k, &data, Compression::None).unwrap()
+        );
+        let r = parse_record(&rec).unwrap();
+        assert_eq!(
+            (r.flags, r.ulen, r.slen),
+            (0, data.len() as u32, data.len() as u32)
+        );
+    }
+
+    #[test]
+    fn encode_record_with_round_trip() {
+        let data = compressible(64 << 10);
+        let k = mk_key(&data);
+        for (c, codec) in [
+            (Compression::Zstd { level: 0 }, CODEC_ZSTD),
+            (Compression::Zstd { level: 1 }, CODEC_ZSTD),
+            (Compression::Zstd { level: 9 }, CODEC_ZSTD),
+            (Compression::Zstd { level: 19 }, CODEC_ZSTD),
+            (Compression::Zstd { level: 22 }, CODEC_ZSTD),
+            (Compression::Lz4 { level: 0 }, CODEC_LZ4),
+            (Compression::Lz4 { level: 1 }, CODEC_LZ4),
+            (Compression::Lz4 { level: 6 }, CODEC_LZ4),
+            (Compression::Lz4 { level: 9 }, CODEC_LZ4),
+            (Compression::Lz4 { level: 12 }, CODEC_LZ4),
+        ] {
+            let rec = encode_record_with(k, &data, c).unwrap();
+            let r = parse_record(&rec).unwrap_or_else(|e| panic!("{c}: {e}"));
+            assert_eq!(r.flags, codec, "{c}");
+            assert!(r.slen < r.ulen, "{c}: slen {} ulen {}", r.slen, r.ulen);
+            assert_eq!(rec.len(), REC_HEADER_SIZE + r.slen as usize, "{c}");
+            let got = decode_payload(r.flags, r.ulen, &rec[REC_HEADER_SIZE..]).unwrap();
+            assert_eq!(got, data, "{c}");
+        }
+        // Level 0 is zstd's default, 3.
+        assert_eq!(
+            encode_record_with(k, &data, Compression::Zstd { level: 0 }).unwrap(),
+            encode_record_with(k, &data, Compression::Zstd { level: 3 }).unwrap()
+        );
+    }
+
+    #[test]
+    fn incompressible_payload_falls_back_to_raw() {
+        for c in [
+            Compression::None,
+            Compression::Zstd { level: 0 },
+            Compression::Zstd { level: 19 },
+            Compression::Lz4 { level: 0 },
+            Compression::Lz4 { level: 9 },
+        ] {
+            for data in [vec![], vec![7u8], incompressible(13), incompressible(4096)] {
+                let rec = encode_record_with(mk_key(&data), &data, c).unwrap();
+                let r = parse_record(&rec).unwrap();
+                assert_eq!((r.flags, r.ulen), (0, r.slen), "{c}, {} bytes", data.len());
+                let got = decode_payload(r.flags, r.ulen, &rec[REC_HEADER_SIZE..]).unwrap();
+                assert_eq!(got, data, "{c}");
+            }
+        }
+    }
+
+    /// Payloads around the sizes where a compressor's own framing outweighs
+    /// what it saves. Which codec the record ends up with is the encoder's
+    /// business; that it parses and decodes is not.
+    #[test]
+    fn tiny_payloads_round_trip() {
+        for c in [
+            Compression::Zstd { level: 0 },
+            Compression::Zstd { level: 22 },
+            Compression::Lz4 { level: 0 },
+            Compression::Lz4 { level: 12 },
+        ] {
+            for n in 0..=64usize {
+                let data = vec![b'a'; n];
+                let rec = encode_record_with(mk_key(&data), &data, c).unwrap();
+                let r = parse_record(&rec).unwrap_or_else(|e| panic!("{c}, {n} bytes: {e}"));
+                let got = decode_payload(r.flags, r.ulen, &rec[REC_HEADER_SIZE..]).unwrap();
+                assert_eq!(got, data, "{c}, {n} bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_record_with_rejects_invalid_compression() {
+        let data = compressible(1024);
+        for c in [
+            Compression::Zstd { level: 23 },
+            Compression::Lz4 { level: 13 },
+        ] {
+            let err = encode_record_with(mk_key(&data), &data, c).unwrap_err();
+            assert!(err.is_invalid_compression(), "{c:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_record_rejects_unknown_codec() {
+        let data = incompressible(1024);
+        let rec = encode_record(mk_key(&data), &data).unwrap();
+        for flags in [3u8, 4, 0x80, 0xff] {
+            let mut bad = rec.clone();
+            bad[33] = flags;
+            fix_crc(&mut bad);
+            let err = parse_record(&bad).unwrap_err();
+            assert!(err.is_corrupt(), "flags {flags:#x}: {err}");
+            assert!(err.to_string().contains("unknown record flags"), "{err}");
+        }
+        // A compressed codec on a payload that is not smaller breaks the
+        // invariant.
+        for flags in [CODEC_ZSTD, CODEC_LZ4] {
+            let mut bad = rec.clone();
+            bad[33] = flags;
+            fix_crc(&mut bad);
+            assert!(
+                parse_record(&bad).unwrap_err().is_corrupt(),
+                "flags {flags:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_payload_lz4_errors() {
+        let data = compressible(4096);
+        let block = lz4::block::compress(&data, None, false).unwrap();
+        assert_eq!(
+            decode_payload(CODEC_LZ4, data.len() as u32, &block).unwrap(),
+            data
+        );
+        let cases: [(&str, u32, &[u8]); 7] = [
+            ("garbage", 100, b"definitely not lz4 \xff\xff\xff\xff"),
+            (
+                "truncated block",
+                data.len() as u32,
+                &block[..block.len() / 2],
+            ),
+            ("empty block", data.len() as u32, &[]),
+            ("shorter than ulen", data.len() as u32 + 1, &block),
+            ("longer than ulen", data.len() as u32 - 1, &block),
+            ("much longer", 16, &block),
+            ("claims zero length", 0, &block),
+        ];
+        for (name, ulen, stored) in cases {
+            match decode_payload(CODEC_LZ4, ulen, stored) {
+                Err(e) => assert!(e.is_corrupt(), "{name}: {e}"),
+                Ok(out) => panic!("{name}: decoded {} bytes", out.len()),
+            }
+        }
+        // A bomb stops at ulen: the output buffer is ulen bytes and no more.
+        let bomb = lz4::block::compress(&vec![0u8; 64 << 20], None, false).unwrap();
+        assert!(
+            decode_payload(CODEC_LZ4, 1024, &bomb)
+                .unwrap_err()
+                .is_corrupt()
+        );
+    }
+
+    #[test]
+    fn decode_payload_rejects_unknown_codec() {
+        for flags in [3u8, 0x80, 0xff] {
+            let err = decode_payload(flags, 4, &[1, 2, 3, 4]).unwrap_err();
+            assert!(err.is_corrupt(), "flags {flags:#x}: {err}");
+        }
+    }
+
+    /// The codec id of every record in a wire pack, in order.
+    fn pack_codecs(pack: &[u8]) -> Vec<u8> {
+        Reader::new(pack)
+            .records()
+            .map(|r| r.unwrap().record.flags)
+            .collect()
+    }
+
+    #[test]
+    fn writer_stores_raw_by_default() {
+        let big = b"amber".repeat(50_000);
+        let mut w = Writer::new(Vec::new());
+        w.add(mk_key(&big), &big).unwrap();
+        let out = w.finish().unwrap();
+        assert_eq!(pack_codecs(&out), [CODEC_RAW]);
+        assert!(out.len() >= big.len());
+    }
+
+    #[test]
+    fn writer_with_compression() {
+        let big = b"amber".repeat(50_000);
+        for c in [
+            Compression::Zstd { level: 0 },
+            Compression::Zstd { level: 19 },
+            Compression::Lz4 { level: 0 },
+            Compression::Lz4 { level: 9 },
+        ] {
+            let mut w = Writer::new(Vec::new()).compression(c);
+            w.add(mk_key(&big), &big).unwrap();
+            let out = w.finish().unwrap();
+            assert_eq!(pack_codecs(&out), [c.codec()], "{c}");
+            let objs = collect(Reader::new(&out[..])).unwrap();
+            assert_eq!(objs, vec![(mk_key(&big), big.clone())], "{c}");
+        }
+    }
+
+    #[test]
+    fn reader_reads_a_pack_that_mixes_codecs() {
+        let objs = [
+            b"raw ".repeat(5000),
+            b"zstd ".repeat(5000),
+            b"lz4 ".repeat(5000),
+            Vec::new(),
+        ];
+        let settings = [
+            Compression::None,
+            Compression::Zstd { level: 0 },
+            Compression::Lz4 { level: 0 },
+            Compression::Lz4 { level: 9 },
+        ];
+        let mut w = Writer::new(Vec::new());
+        for (data, c) in objs.iter().zip(settings) {
+            w.add_record(&encode_record_with(mk_key(data), data, c).unwrap())
+                .unwrap();
+        }
+        let out = w.finish().unwrap();
+        // The empty object cannot shrink.
+        assert_eq!(
+            pack_codecs(&out),
+            [CODEC_RAW, CODEC_ZSTD, CODEC_LZ4, CODEC_RAW]
+        );
+        let got = collect(Reader::new(&out[..])).unwrap();
+        let want: Vec<_> = objs.iter().map(|d| (mk_key(d), d.clone())).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn writer_with_invalid_compression_fails_add() {
+        let mut w = Writer::new(Vec::new()).compression(Compression::Zstd { level: 99 });
+        for _ in 0..2 {
+            assert!(
+                w.add(mk_key(b"alpha"), b"alpha")
+                    .unwrap_err()
+                    .is_invalid_compression()
+            );
+        }
     }
 }

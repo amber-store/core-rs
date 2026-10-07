@@ -3,7 +3,7 @@
 The **amberpack** format is how Amber-Store frames content-addressed objects as a
 byte stream. One record codec serves two consumers: packstore's on-disk segment
 files and the wire packs that move objects between stores. The shared unit is
-the **record** — a self-describing, CRC-protected, individually-zstd-compressed
+the **record** — a self-describing, CRC-protected, individually compressed
 CAS object. This document specifies the record and the wire pack that frames a
 set of them. The on-disk segment format (which wraps the same records in a
 header and a self-indexing footer) lives in
@@ -20,11 +20,11 @@ stored payload:
 offset  size  field
 0       1     tag      0x01 (tagChunk)
 1       32    key      the object's 32-byte lookup key
-33      1     flags    bit 0 (0x01) = zstd; all other bits reserved (must be 0)
+33      1     flags    codec id: 0 = raw, 1 = zstd, 2 = lz4; 3–255 reserved (rejected)
 34      4     ulen     uncompressed payload length
 38      4     slen     stored payload length (on the wire / on disk)
 42      4     crc      CRC-32C (Castagnoli) over the whole record
-46      slen  payload  raw object bytes, or zstd frame when the zstd flag is set
+46      slen  payload  raw object bytes, a zstd frame or an LZ4 block, as the codec id says
 ```
 
 Each object is identified by its 32-byte [key](keys.md), whose header byte
@@ -32,16 +32,41 @@ Each object is identified by its 32-byte [key](keys.md), whose header byte
 written verbatim; **canonical-form validation happens on the read side**, never
 on write.
 
-**Compression is opportunistic and per-record.** `EncodeRecord` zstd-compresses
-the payload only when the result is *strictly* smaller than the original; if it
-isn't, the payload is stored raw and the zstd flag stays clear. Two invariants
-follow and are enforced on parse:
+**Compression is per record and is the writer's choice.** For each object the
+writer picks none, zstd or lz4, at a level. A packstore takes the choice as an
+option when it is opened and may be given a function that chooses per object;
+without either it compresses nothing. Whatever is chosen, the compressed
+payload is kept only when it is *strictly* smaller than the original; if it
+isn't, the payload is stored raw under codec 0. Two invariants follow and are
+enforced on parse:
 
-- raw record (`flags & zstd == 0`) ⟹ `ulen == slen`
-- compressed record (`flags & zstd != 0`) ⟹ `slen < ulen`
+- codec 0 ⟹ `ulen == slen`
+- any other codec ⟹ `slen < ulen`
+
+A zstd payload is one zstd frame. An lz4 payload is one LZ4 block: the block
+format, without the frame format's header, size prefix or checksum, so a
+reader needs `ulen` to decode it. The level is not recorded. It changes what
+the writer produces and never how a reader decodes, so two implementations may
+map the same level differently and still read each other's records.
 
 The `ulen`/`slen` split lets a reader size its decompression buffer exactly and
 detect a payload that decompresses to the wrong length.
+
+**Codec ids and earlier releases.** Codecs 0 and 1 are the two values of what
+was a single flag bit for zstd, so records written before lz4 existed are valid as
+they are. A release from before codec 2 (up to 0.9.0) does not handle an lz4
+record safely. Its wire-pack reader and its scrub reject the record as corrupt
+(`unknown record flags`), but its read path tests only the zstd bit: it
+returns the lz4 block itself as the object's bytes, without an error. And when
+it indexes an active segment by scanning it, it takes the first lz4 record for
+a torn tail and truncates the segment there at its next write, losing that
+record and every one after it. Such a release must therefore never read a
+segment that holds one, and the segment format sees to it: an lz4 record is
+only ever written to a segment at format version 3, which those releases
+refuse — the whole store, at open, without touching it
+([packstore.md](packstore.md)). A store that is never written to with lz4
+stays at version 2 and stays readable by them. A later algorithm takes the
+next codec id and, for the same reason, a segment version of its own.
 
 **The CRC covers the whole record with its own field zeroed.** It is computed
 over bytes `[0:42]`, then four zero bytes standing in for the `crc` field, then
@@ -135,3 +160,5 @@ wire pack without re-encoding, and a received record can be appended to a segmen
 without re-framing. The CRC and the raw/compressed invariants are checked
 identically in both settings, and the BLAKE3 payload hash remains the single
 authoritative identity gate wherever an object is about to be stored.
+A copied record keeps the codec it was written with, whatever the
+compression setting of the store or writer that copies it.

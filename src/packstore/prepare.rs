@@ -1,24 +1,24 @@
 //! The write paths' common front: turning an [`Object`] into the record to
 //! append, whichever form it arrived in (Go: `packstore/prepare.go`).
 
-use crate::amberpack::{REC_HEADER_SIZE, Record, decode_payload, encode_record, parse_record};
+use crate::amberpack::{REC_HEADER_SIZE, Record, decode_payload, parse_record};
 use crate::key::Key;
 
 use super::verify::verify_object;
-use super::{Error, Object, corrupt};
+use super::{Error, Object, Options, corrupt};
 
 /// Returns the record to append for `obj` and the payload length the write
-/// stats charge for it. For `data` that is [`encode_record`]'s output after
+/// stats charge for it. For `data` that is the store's encoding ([`Options::encode`]) after
 /// the optional verification; for a pre-encoded `record` it is the record
 /// itself, after [`check_record`]. Every rejection of a record is a
 /// corrupt-class error, a verification failure a verify-class one (Go:
 /// `prepare`).
-pub(super) fn prepare(obj: Object, verify: bool) -> Result<(Vec<u8>, u64), Error> {
+pub(super) fn prepare(cfg: &Options, obj: Object, verify: bool) -> Result<(Vec<u8>, u64), Error> {
     let Some(record) = obj.record else {
         if verify {
             verify_object(obj.key, &obj.data).map_err(Error::Verify)?;
         }
-        let rec = encode_record(obj.key, &obj.data).map_err(Error::Pack)?;
+        let rec = cfg.encode(obj.key, &obj.data)?;
         return Ok((rec, obj.data.len() as u64));
     };
     if !obj.data.is_empty() {

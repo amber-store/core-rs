@@ -164,3 +164,19 @@ pseudo-version `v0.0.13-0.20261007113730-7ec0ab5e3d1a`, to port against. The
 pin then moved to the release, `v0.0.12` → `v0.9.0`, and a full regeneration
 into a scratch directory at that pin reproduced all 19 files byte for byte.
 `vectorgen` itself did not change: it never looked inside a key.
+
+## Compression options
+
+Go made compression a choice and its default none. `vectorgen` now asks for
+zstd at level 0 wherever it relied on the old default: the
+`records_compressed.json` loop, the writer of `pack_go.bin`, and the store
+behind `segments_go`. A full regeneration at the Go branch's head, through the
+pseudo-version `v0.9.1-0.20261007201211-e2b16e91f6e0`, reproduced every
+existing file byte for byte and added `amberpack/records_lz4.json`.
+
+`genSegments` then gained a second store, `segments_go_lz4/`: the same
+objects written with lz4, every segment at format version 3. `segments_go/`
+is written by the same code with zstd and stays byte for byte what it was, at
+version 2. Generated at the Go branch's head with the gate, pseudo-version
+`v0.9.1-0.20261007220247-65990e8b1c8d`; a full regeneration there
+reproduced every file.

@@ -40,6 +40,7 @@ pub use markset::MarkSet;
 pub use parallel::{DEFAULT_BATCH_SIZE, WriteOpts, WriteStats};
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -49,7 +50,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::SystemTime;
 
-use crate::amberpack::{self, REC_HEADER_SIZE, decode_payload, encode_record};
+use crate::amberpack::{self, Compression, REC_HEADER_SIZE, decode_payload, encode_record_with};
 use crate::key::Key;
 
 use footer::SealedSegment;
@@ -77,10 +78,50 @@ pub(crate) const MAGIC_TRAILER: [u8; 8] = *b"AMBERSGF";
 /// foreign header is the caller's to judge (Go: `checkVersion`).
 pub(crate) fn check_version(b: &[u8]) -> Result<(), Error> {
     let n = MAGIC_HEADER.len() - 1;
-    if b.len() <= n || b[..n] != MAGIC_HEADER[..n] || b[n] == MAGIC_HEADER[n] {
+    if b.len() <= n || b[..n] != MAGIC_HEADER[..n] || reads_version(b[n]) {
         return Ok(());
     }
     Err(Error::UnsupportedVersion { found: b[n] })
+}
+
+/// Segment format versions: the last byte of a segment's header. The two
+/// have the same layout; the version says which codecs the segment's records
+/// may use. A segment at `VERSION_BASE` holds only raw and zstd records,
+/// which is all that releases up to 0.9.0 read. Those releases refuse a
+/// segment at any other version, and would misread an lz4 record in one they
+/// accept, so an lz4 record is only ever written to a segment at
+/// `VERSION_LZ4`. A later codec takes a later version in the same way: a
+/// release must refuse the segments whose records it cannot read
+/// (architecture/packstore.md; Go: `versionBase`, `versionLZ4`).
+pub(crate) const VERSION_BASE: u8 = 2;
+pub(crate) const VERSION_LZ4: u8 = 3;
+
+fn reads_version(v: u8) -> bool {
+    v == VERSION_BASE || v == VERSION_LZ4
+}
+
+/// Reports whether `b` is a segment header of a version this release reads
+/// (Go: `isHeader`).
+pub(crate) fn is_header(b: &[u8]) -> bool {
+    let n = MAGIC_HEADER.len() - 1;
+    b.len() == MAGIC_HEADER.len() && b[..n] == MAGIC_HEADER[..n] && reads_version(b[n])
+}
+
+/// The segment header for a format version (Go: `headerAt`).
+pub(crate) fn header_at(version: u8) -> [u8; 8] {
+    let mut h = MAGIC_HEADER;
+    h[MAGIC_HEADER.len() - 1] = version;
+    h
+}
+
+/// The lowest segment version that may hold a record with the given flags
+/// byte (Go: `versionFor`).
+pub(crate) fn version_for(flags: u8) -> u8 {
+    if flags > amberpack::CODEC_ZSTD {
+        VERSION_LZ4
+    } else {
+        VERSION_BASE
+    }
 }
 
 /// The default rotation threshold: the active segment is sealed once it
@@ -92,7 +133,7 @@ const ACTIVE_SUFFIX: &str = ".seg.active";
 
 /// One CAS object to store: its key and either its serialized bytes
 /// (`data`) or, for an object that was encoded elsewhere, the complete
-/// record as [`encode_record`] produced it (`record`). Exactly one of the two
+/// record as [`amberpack::encode_record_with`] produced it (`record`). Exactly one of the two
 /// is set: an object offered as a record carries an empty `data`. A record is
 /// parsed (framing, CRC, canonical key, key equal to `key`) and appended
 /// verbatim, so a caller that already holds encoded records, say a pack it
@@ -139,7 +180,9 @@ pub enum Error {
     /// A segment whose header is this format's magic with another version
     /// byte: data written by a release with a different layout. Such a file
     /// is neither read nor modified (Go: `ErrUnsupportedVersion`).
-    #[error("packstore: unsupported segment format version: {found}, this release reads {}", MAGIC_HEADER[MAGIC_HEADER.len() - 1])]
+    #[error(
+        "packstore: unsupported segment format version: {found}, this release reads {VERSION_BASE} and {VERSION_LZ4}"
+    )]
     UnsupportedVersion {
         /// The version byte the segment carries.
         found: u8,
@@ -247,6 +290,15 @@ impl Error {
         }
     }
 
+    /// Go's `errors.Is(err, amberpack.ErrInvalidCompression)`.
+    pub fn is_invalid_compression(&self) -> bool {
+        match self {
+            Error::Pack(e) => e.is_invalid_compression(),
+            Error::Context { source, .. } => source.is_invalid_compression(),
+            _ => false,
+        }
+    }
+
     /// Go's `errors.Is(err, ErrVerify)`.
     pub fn is_verify(&self) -> bool {
         match self {
@@ -268,11 +320,31 @@ pub(crate) fn corrupt(detail: impl std::fmt::Display) -> Error {
     }
 }
 
-/// Store configuration (Go: the `WithSegmentSize` / `WithSync` options).
-#[derive(Debug, Clone, Copy)]
+/// Chooses the compression for one object (Go: `CompressionFunc`).
+type CompressionFor = Arc<dyn Fn(&Key, &[u8], Compression) -> Compression + Send + Sync>;
+
+/// Store configuration (Go: the `WithSegmentSize` / `WithSync` /
+/// `WithCompression` / `WithCompressionFor` options).
+#[derive(Clone)]
 pub struct Options {
     segment_size: u64,
     sync: bool,
+    compression: Compression,
+    compression_for: Option<CompressionFor>,
+}
+
+impl fmt::Debug for Options {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Options")
+            .field("segment_size", &self.segment_size)
+            .field("sync", &self.sync)
+            .field("compression", &self.compression)
+            .field(
+                "compression_for",
+                &self.compression_for.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for Options {
@@ -280,6 +352,8 @@ impl Default for Options {
         Options {
             segment_size: DEFAULT_SEGMENT_SIZE,
             sync: true,
+            compression: Compression::None,
+            compression_for: None,
         }
     }
 }
@@ -303,6 +377,56 @@ impl Options {
         self.sync = b;
         self
     }
+
+    /// Sets the compression for the objects this store encodes: those given
+    /// to `put`, `put_verified` and `put_verified_deferred`, and those a
+    /// batch carries as data. The default is no compression. The setting
+    /// belongs to this handle and is stored nowhere; reading never depends
+    /// on it, and records that arrive already encoded keep the codec they
+    /// have (Go: `WithCompression`).
+    pub fn compression(mut self, c: Compression) -> Options {
+        self.compression = c;
+        self
+    }
+
+    /// Makes the store ask `f` for every object it encodes, whatever the
+    /// [`Options::compression`] value is. `f` gets the key, the bytes and
+    /// that value: returning it accepts the store's setting, returning
+    /// [`Compression::None`] stores the object raw, and anything else
+    /// overrides the setting for this object. `f` is not asked for an object
+    /// the store already holds, nor for a pre-encoded record.
+    ///
+    /// `f` runs on whichever thread is writing, several at once under
+    /// `write_parallel`. It must not call the store: a repair calls it with
+    /// the store's append lock held. A returned value that does not validate
+    /// fails that object's write with an invalid-compression error (Go:
+    /// `WithCompressionFor`).
+    pub fn compression_for(
+        mut self,
+        f: impl Fn(&Key, &[u8], Compression) -> Compression + Send + Sync + 'static,
+    ) -> Options {
+        self.compression_for = Some(Arc::new(f));
+        self
+    }
+
+    /// Returns the record to append for `(k, data)`, compressed as these
+    /// options say (Go: `Store.encode`).
+    fn encode(&self, k: Key, data: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut c = self.compression;
+        if let Some(f) = &self.compression_for {
+            c = f(&k, data, c);
+        }
+        encode_record_with(k, data, c).map_err(|e| {
+            if e.is_invalid_compression() {
+                Error::Context {
+                    msg: format!("packstore: object {k}"),
+                    source: Box::new(Error::Pack(e)),
+                }
+            } else {
+                Error::Pack(e)
+            }
+        })
+    }
 }
 
 /// The append-only segment this store owns and writes to. Other stores on
@@ -321,6 +445,8 @@ struct ActiveSegment {
 /// touches it (Go: `activeSegment.size`, "accessed only under appendMu").
 struct ActiveWriter {
     seg: Arc<ActiveSegment>,
+    /// The header's format version: which records the segment may hold.
+    version: u8,
     size: u64,
     /// Mirrors the index on disk (`sidecar.rs`), so that the next open does
     /// not have to scan the data. `None` when it could not be written (Go:
@@ -354,6 +480,11 @@ struct AppendState {
     active: Option<ActiveWriter>,
     /// A floor for new segment ids.
     next_id: u64,
+    /// The format version this store creates active segments at, and the
+    /// lowest at which it adopts one. It starts from the compression option
+    /// and is raised for good by the first record that needs more (Go:
+    /// `segVersion`).
+    seg_version: u8,
 }
 
 /// Reader-visible state (Go: fields guarded by `mu`).
@@ -492,6 +623,10 @@ impl Store {
 
     /// [`Store::open`] with explicit [`Options`].
     pub fn open_with(dir: impl AsRef<Path>, cfg: Options) -> Result<Store, Error> {
+        cfg.compression.validate().map_err(|e| Error::Context {
+            msg: "packstore".into(),
+            source: Box::new(Error::Pack(e)),
+        })?;
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)
             .map_err(|e| Error::Other(format!("packstore: creating {}: {e}", dir.display())))?;
@@ -506,6 +641,7 @@ impl Store {
             )));
         }
         let gate = Gate::open(&dir)?;
+        let seg_version = version_for(cfg.compression.codec());
         if let Ok(ls) = list_segments(&dir) {
             remove_orphan_sidecars(&dir, &ls);
         }
@@ -516,6 +652,7 @@ impl Store {
                 dir_f: Some(dir_f),
                 active: None,
                 next_id: 1,
+                seg_version,
             }),
             shared: RwLock::new(Shared {
                 sealed: Vec::new(),
@@ -577,24 +714,43 @@ impl Store {
                 return Err(Error::Failed(msg.clone()));
             }
         }
-        self.ensure_active(ap)?;
-        let Some(aw) = ap.active.as_mut() else {
-            return Err(Error::Closed); // unreachable: ensure_active succeeded
-        };
-        if unpoison(aw.seg.index.read()).contains_key(&k) {
-            // Lost a Put race for this key; the record is already appended.
-            // The winner may have been a deferred put, which has not
-            // synced it.
-            if sync_now && self.cfg.sync && self.deferred.load(Ordering::SeqCst) {
-                if let Err(e) = aw.seg.f.sync_all() {
-                    self.set_failed(&e);
-                    return Err(e.into());
+        // An lz4 record goes into a segment at VERSION_LZ4 only, and a store
+        // that has written one stays at that version: it leaves a segment
+        // early once, not once per segment.
+        let need = version_for(rec[33]);
+        ap.seg_version = ap.seg_version.max(need);
+        loop {
+            self.ensure_active(ap)?;
+            let Some(aw) = ap.active.as_mut() else {
+                return Err(Error::Closed); // unreachable: ensure_active succeeded
+            };
+            if unpoison(aw.seg.index.read()).contains_key(&k) {
+                // Lost a Put race for this key, or took over a segment that
+                // holds it: the record is already appended. Whoever appended
+                // it may have been a deferred put, which has not synced it.
+                if sync_now && self.cfg.sync && self.deferred.load(Ordering::SeqCst) {
+                    if let Err(e) = aw.seg.f.sync_all() {
+                        self.set_failed(&e);
+                        return Err(e.into());
+                    }
+                    aw.sidecar_synced();
+                    self.deferred.store(false, Ordering::SeqCst);
                 }
-                aw.sidecar_synced();
-                self.deferred.store(false, Ordering::SeqCst);
+                return Ok(());
             }
-            return Ok(());
+            if aw.version >= need {
+                break;
+            }
+            // The segment this store holds may not take the record. Its
+            // header is never rewritten: an older release that has read it
+            // would go on to misread what follows. The segment taken instead
+            // is checked for the key like any other: it may be one somebody
+            // left behind.
+            self.leave_active(ap)?;
         }
+        let Some(aw) = ap.active.as_mut() else {
+            return Err(Error::Closed); // unreachable: the loop left one in place
+        };
         let off = aw.size;
         aw.seg.f.write_all_at(rec, off)?;
         let loc = ActiveLoc {
@@ -789,7 +945,7 @@ impl Store {
                 continue;
             }
             let key = obj.key;
-            let rec = match prepare(obj, false) {
+            let rec = match prepare(&self.cfg, obj, false) {
                 Ok((r, _)) => r,
                 Err(e) => return Err(fail(appended, e)),
             };
@@ -824,7 +980,7 @@ impl Store {
             }
             return Ok(());
         }
-        let rec = encode_record(k, data).map_err(Error::Pack)?;
+        let rec = self.cfg.encode(k, data)?;
         self.append(k, &rec, true)
     }
 
@@ -908,7 +1064,7 @@ impl Store {
 
     /// Returns a caller-owned copy of the full on-disk record stored under
     /// `k` — its 46-byte header plus the stored (still-compressed) payload,
-    /// exactly as written by [`encode_record`] — or [`Error::NotFound`] if
+    /// exactly as written by [`amberpack::encode_record_with`] — or [`Error::NotFound`] if
     /// `k` is absent. This is the zero-copy push path: the record is
     /// wire-format-identical, so a caller can hand it to
     /// `amberpack::Writer::add_record` without decompressing and re-encoding.
@@ -1209,6 +1365,12 @@ pub(crate) mod testutil;
 
 #[cfg(test)]
 mod gc_tests;
+
+#[cfg(test)]
+mod compression_tests;
+
+#[cfg(test)]
+mod segment_version_tests;
 
 #[cfg(test)]
 mod store_tests;
