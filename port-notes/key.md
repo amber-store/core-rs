@@ -13,7 +13,7 @@
 | `k.Type()` | `k.type_()` |
 | `k.LengthSize()` | `k.length_size()` (`usize`) |
 | `k.Length()` | `k.length()` (`u64`) |
-| `k.Hash()` | `k.hash()` (`&[u8]`) |
+| `k.Hash()` | `k.hash()` (`Vec<u8>`: a copy in digest order, as in Go since the key stores the hash reversed) |
 | `New` | `Key::new(t, length, serialized) -> Key` — **infallible** (see below) |
 | `NewFromHash` | `Key::new_from_hash(t, length, [u8; 32]) -> Key` — **infallible** |
 | `Parse` | `Key::parse(&[u8]) -> Result<Key, Error>` |
@@ -24,7 +24,7 @@
 
 Extras: `Key::as_bytes(&self) -> &[u8; 32]` and `impl AsRef<[u8]>` (Go call
 sites use `k[:]`; downstream modules — amberpack record bytes, packstore
-fanout on the last key byte — need raw access).
+fanout on the first key byte — need raw access).
 
 ## Decisions a reviewer should check
 
@@ -57,7 +57,8 @@ fanout on the last key byte — need raw access).
 - **Validation order** ported exactly: reserved bit → type valid → canonical
   length (extra test `validate_order_reserved_bit_before_type` pins bit vs.
   type precedence). The canonical-length condition is Go's verbatim:
-  `k[1] == 0 && !(length_size() == 1 && length() == 0)`.
+  `k[30] == 0 && !(length_size() == 1 && length() == 0)`, the byte next to
+  the header since the key was reversed (below).
 - **Error messages** byte-match Go's (`error_messages_match_go`), including
   `Parse`'s `": got %d"` detail carried as `Error::BadKeyLength(usize)`.
 - `length_size_for`: minimal big-endian byte count via
@@ -150,3 +151,24 @@ Only `new_from_hash`'s doc comment changed, as in Go: a `Commit`'s length
 field is a logical size, like a directory's — the commit's own bytes plus the
 length fields of its tree and conflict terms (`commit::footprint`). `key`
 itself still takes the length verbatim. `keys.json` is unaffected.
+
+## The reversed key (Go v0.9.0)
+
+Go PR #25 reverses the 32 bytes after encoding: the truncated hash first, the
+length least significant byte first, the header byte last
+(`architecture/keys.md`). Ported as it is written there, `HEADER_AT` for Go's
+`headerAt`.
+
+- **`hash()` returns `Vec<u8>`**, where it returned a `&[u8]` into the key. The
+  stored bytes are the digest prefix reversed, so handing out a slice would
+  hand out the reversed form; Go's `Hash()` became a copy for the same reason.
+  Nothing in the crate calls it outside tests.
+- **Every hand-written key in the tests moved.** A test that sets the header
+  byte now sets `k.0[31]`. A pinned key of an object that names no other object
+  (a blob, an xattr set, a directory of entries without content keys) is the
+  old one byte-reversed. A pinned key of an object that does name others was
+  computed again by Go, with a throwaway harness on a `replace` onto the Go
+  checkout, together with the object counts and emission digests next to it:
+  the builders cut where the hash of an item says, and an item holds keys.
+- **`verify_object` reads the raw type nibble from the last byte**, the one
+  place outside this module that looked at byte 0.

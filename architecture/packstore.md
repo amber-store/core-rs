@@ -7,7 +7,7 @@ let any number of processes read and write one store at once. It is written so
 that a second implementation can share a store with this one; what it must
 keep to is gathered under [Rules for implementations](#rules-for-implementations),
 which also names the one layout this document does not give. All integers are
-big-endian.
+big-endian; a [key](keys.md) is 32 opaque bytes here, with its hash leading.
 
 ## The directory
 
@@ -25,9 +25,17 @@ share one id space. Several active segments may exist: one per writer that was
 at work at the same time, and whatever they left behind. Anything else in the
 directory is ignored.
 
-A sealed segment is `AMBERSG\x01`, the records, and a footer (seal marker,
+A sealed segment is `AMBERSG\x02`, the records, and a footer (seal marker,
 fanout index, binary fuse filter, 64-byte trailer ending in `AMBERSGF`); an
-active one is the same without the footer. Sealing appends the footer, fsyncs,
+active one is the same without the footer. The index holds the keys in
+bytewise order behind a fanout on their first byte, and the filter is built
+over their first 8 bytes: both rely on a key leading with its hash.
+
+The last byte of `AMBERSG\x02` is the format version. Version `\x01` held keys
+in their earlier byte order (header byte first), indexed and filtered on their
+last bytes. A segment that carries the magic with another version is refused
+with an unsupported-version error and never modified — in particular it is not
+taken for a segment whose header was torn, which would be started over. Sealing appends the footer, fsyncs,
 renames `<id>.seg.active` to `<id>.seg`, fsyncs the directory and removes the
 sidecar. Closing a store does not seal.
 
@@ -280,6 +288,8 @@ above:
   the segment it copied into, then removes the old ones, then syncs the
   directory.
 - **Rely only on durable copies** when skipping a write or a survivor's copy.
+- **Refuse a segment of another format version** and leave it as it is; only a
+  header that is missing or not this format's magic at all may be reset.
 
 The **sealed footer** (index section, filter, trailer) is older than this
 document and is not laid out here yet; `packstore/footer.go` is the reference.

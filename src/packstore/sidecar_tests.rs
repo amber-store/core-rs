@@ -1,6 +1,7 @@
 //! Ported Go tests of the sidecar index and of recovery from it
 //! (`sidecar_test.go`, `recover_sidecar_test.go`).
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +12,7 @@ use crate::amberpack::{REC_HEADER_SIZE, parse_record};
 use crate::key::{Key, Type};
 
 use super::recover::ActiveLoc;
-use super::recover_sidecar::{DataAt, recover_from};
+use super::recover_sidecar::{DataAt, ScanPos, advance, recover_from};
 use super::sidecar::{
     SIDECAR_ENTRY, SIDECAR_MAGIC, SIDECAR_REC_SIZE, SIDECAR_SUFFIX, SidecarRec, SidecarWriter,
     read_sidecar,
@@ -464,4 +465,30 @@ fn wipe_removes_sidecar() {
     );
     s.wipe().unwrap();
     assert_eq!(sidecar_files(dir.path()), Vec::<std::path::PathBuf>::new());
+}
+
+/// Port of Go `TestAdvanceRefusesAnotherFormatVersion`.
+#[test]
+fn advance_refuses_another_format_version() {
+    // A followed segment whose header arrived after the view first saw the
+    // file: a header of another version must not pass for one still missing.
+    let (mut body, _) = build_body(&test_objects(1));
+    body[MAGIC_HEADER.len() - 1] = 0x01;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("0000000000000001.seg.active");
+    fs::write(&path, &body).unwrap();
+    let at = ScanPos {
+        pos: 0,
+        sidecar_end: 0,
+        durable: 0,
+    };
+    let err = advance(
+        &HashMap::new(),
+        at,
+        &File::open(&path).unwrap(),
+        body.len() as i64,
+        &[],
+    )
+    .unwrap_err();
+    assert!(err.is_unsupported_version(), "{err}");
 }

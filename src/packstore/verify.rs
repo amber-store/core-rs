@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::amberpack::{REC_HEADER_SIZE, decode_payload, parse_record};
 use crate::commit::{self, Commit};
-use crate::key::{Key, Type};
+use crate::key::{self, Key, Type};
 
 use super::footer::{IndexEntry, SealedSegment, build_index_section, filter_key};
 use super::{Error, MAGIC_HEADER, Store, unpoison};
@@ -135,7 +135,7 @@ impl SealedSegment {
 /// `verifyObject`).
 pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
     let sum = *blake3::hash(data).as_bytes();
-    let raw_type = k.as_bytes()[0] >> 4;
+    let raw_type = k.as_bytes()[key::SIZE - 1] >> 4;
     let Some(t) = Type::from_u8(raw_type) else {
         // Go: key.NewFromHash rejects the reserved type nibble.
         return Err(format!(

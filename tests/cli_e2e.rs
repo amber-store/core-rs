@@ -560,7 +560,7 @@ fn commit_identity_and_rendering() {
                 "--author",
                 "Ann",
                 "--parent",
-                "5073d980bd63330e7b37ddd0989bea896cd6a35988e973dfc4b1b28808930a7c",
+                "7c0a938088b2b1c4df73e98859a3d66c89ea9b98d0dd377b0e3363bd80d97350",
                 &tree,
             ],
         ),

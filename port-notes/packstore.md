@@ -165,3 +165,22 @@ bits. The hash is still checked first. `packstore` now depends on `commit`
 live commit written under the v0.0.9 rule fails every scrub and every gc copy
 of that record; `architecture/commits.md` states the remedy. The Go test was
 rewritten and so was its port.
+
+## The reversed key and format version 2 (Go v0.9.0)
+
+Go PR #25. The footer index fans out on the key's first byte and its rows are
+in plain key order, the filter is built over the first 8 bytes, and
+`SeenSet` shards on the first byte: the key leads with its hash now, where it
+used to end with it.
+
+Segments are `AMBERSG\x02`. `check_version` (Go `checkVersion`) turns the
+magic with another version byte into `Error::UnsupportedVersion`
+(`is_unsupported_version()`), in `parse_footer`, `scan_active` and `advance`,
+before any of them can take such a header for a torn one. To carry that
+error, `scan_active`, `full_scan`, `recover_segment`, `recover_from`,
+`advance` and `ForeignActive::poll` return the packstore `Error` where they
+returned `io::Error`; `open_foreign` tells a vanished file by `is_not_exist`.
+Go's four tests are ported (`scan_active_refuses_another_format_version`,
+`advance_refuses_another_format_version`,
+`open_refuses_store_of_another_format_version` for an active and for a sealed
+segment), with the three on the index order, the filter input and the shards.

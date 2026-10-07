@@ -917,12 +917,12 @@ mod tests {
                     c.tree = Key::new_from_hash(Type::FileNode, 9, h);
                 }),
                 format!(
-                    "commit tree 100901{} is not a directory key (type FileNode)",
+                    "commit tree {}010910 is not a directory key (type FileNode)",
                     "00".repeat(29)
                 ),
             ),
             (
-                ("non-canonical tree", |c| c.tree.0[0] |= 0x08),
+                ("non-canonical tree", |c| c.tree.0[31] |= 0x08),
                 "commit tree: key: reserved header bit is set".into(),
             ),
             (
@@ -930,7 +930,7 @@ mod tests {
                 format!("commit parent 0: {tree} is not a commit key (type DirLeaf)"),
             ),
             (
-                ("non-canonical parent", |c| c.parents[1].0[0] = 0xf0),
+                ("non-canonical parent", |c| c.parents[1].0[31] = 0xf0),
                 "commit parent 1: key: reserved object type: 15".into(),
             ),
             (
@@ -1163,11 +1163,11 @@ mod tests {
     // `architecture/commits.md`. A key's length field is the commit's own
     // bytes plus its tree's length: 115+1 for the parents, 174+1 for the merge.
     const GOLDEN_PARENT_A: &str =
-        "5074d980bd63330e7b37ddd0989bea896cd6a35988e973dfc4b1b28808930a7c";
+        "8f2a0d816398cc068c636a2859d576a0706ee8e33cd4673e14e81ac87de97450";
     const GOLDEN_PARENT_B: &str =
-        "5074c8825d499d27183b57319a8b637c7868ef9783da1d19369231d0bbe48831";
-    const GOLDEN_KEY: &str = "50afd48693e2ae8418fb83d0459174df45ba5fdddef67376e74ac6893a5abbed";
-    const GOLDEN_BYTES: &str = "a50058202001bbe6a9f5a0146a1f4d0381e9b0ed1ac2f1a979ce9d5ad84e46ff0b58f36b018258205074d980bd63330e7b37ddd0989bea896cd6a35988e973dfc4b1b28808930a7c58205074c8825d499d27183b57319a8b637c7868ef9783da1d19369231d0bbe4883102a40063416e6e016f616e6e406578616d706c652e636f6d021b17979cfe362a000003187803a40063426f620160021b17979cfe362a00010339012b04666d657267650a";
+        "68e165549a26b82280724ed57cdf1f8e7e2390a3b37a8ba9a17cd44becbc7450";
+    const GOLDEN_KEY: &str = "0bfeb34dc3a09fb16c88cd479a7f931a223b73f3836e81c0f9f601c720acaf50";
+    const GOLDEN_BYTES: &str = "a50058206bf3580bff464ed85a9dce79a9f1c21aedb0e981034d1f6a14a0f5a9e6bb0120018258208f2a0d816398cc068c636a2859d576a0706ee8e33cd4673e14e81ac87de97450582068e165549a26b82280724ed57cdf1f8e7e2390a3b37a8ba9a17cd44becbc745002a40063416e6e016f616e6e406578616d706c652e636f6d021b17979cfe362a000003187803a40063426f620160021b17979cfe362a00010339012b04666d657267650a";
 
     #[test]
     fn golden_vector() {
@@ -1375,7 +1375,7 @@ mod tests {
                 format!("commit conflict term 1: {ka} is not a directory key (type Commit)"),
             ),
             (
-                ("non-canonical term", |c| c.conflict_terms[0].0[0] |= 0x08),
+                ("non-canonical term", |c| c.conflict_terms[0].0[31] |= 0x08),
                 "commit conflict term 0: key: reserved header bit is set".into(),
             ),
             (
@@ -1744,8 +1744,8 @@ mod tests {
     // committer without a name, bot@example.com, at Bob's time and zone;
     // message "conflict\n". 258 bytes; length field 258+1+300+70000 = 70559.
     const GOLDEN_CONFLICTED_KEY: &str =
-        "5201139f190aa234ad713392987671d47e7e3292a613c62e3d14a85d614b300b";
-    const GOLDEN_CONFLICTED_BYTES: &str = "a80058202001bbe6a9f5a0146a1f4d0381e9b0ed1ac2f1a979ce9d5ad84e46ff0b58f36b018158205074d980bd63330e7b37ddd0989bea896cd6a35988e973dfc4b1b28808930a7c02a40063416e6e016f616e6e406578616d706c652e636f6d021b17979cfe362a000003187803a40060016f626f74406578616d706c652e636f6d021b17979cfe362a00010339012b0469636f6e666c6963740a0750000102030405060708090a0b0c0d0e0f0882582021012c1111111111111111111111111111111111111111111111111111111111582032011170222222222222222222222222222222222222222222222222222222220983646f7572736066746865697273";
+        "db31bdde6530514479a6a921f92327794b8bd1d7f61173ade7706d0d9f130152";
+    const GOLDEN_CONFLICTED_BYTES: &str = "a80058206bf3580bff464ed85a9dce79a9f1c21aedb0e981034d1f6a14a0f5a9e6bb0120018158208f2a0d816398cc068c636a2859d576a0706ee8e33cd4673e14e81ac87de9745002a40063416e6e016f616e6e406578616d706c652e636f6d021b17979cfe362a000003187803a40060016f626f74406578616d706c652e636f6d021b17979cfe362a00010339012b0469636f6e666c6963740a0750000102030405060708090a0b0c0d0e0f0882582011111111111111111111111111111111111111111111111111111111112c0121582022222222222222222222222222222222222222222222222222222222701101320983646f7572736066746865697273";
 
     #[test]
     fn golden_vector_conflicted() {

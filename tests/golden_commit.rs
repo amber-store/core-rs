@@ -166,11 +166,11 @@ fn golden_commit() {
     for (name, key) in [
         (
             "merge",
-            "50afd48693e2ae8418fb83d0459174df45ba5fdddef67376e74ac6893a5abbed",
+            "0bfeb34dc3a09fb16c88cd479a7f931a223b73f3836e81c0f9f601c720acaf50",
         ),
         (
             "conflicted",
-            "5201139f190aa234ad713392987671d47e7e3292a613c62e3d14a85d614b300b",
+            "db31bdde6530514479a6a921f92327794b8bd1d7f61173ade7706d0d9f130152",
         ),
     ] {
         let c = file

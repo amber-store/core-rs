@@ -2726,11 +2726,11 @@ mod tests {
         let root = db.finish(&mut store.emit()).unwrap();
         assert_eq!(
             root.to_string(),
-            "320e6e59d5ee3dff1246dfea67c179b006d6d18db614d295941794991f47dc38"
+            "0a22bea4cdc75fe41d8d84aab1c4c693ed311cc794ce59243480aa5815770e32"
         );
 
         let keys = reachable_keys(root, store.get()).unwrap();
-        assert_eq!(keys.len(), 1486, "reachable key count");
+        assert_eq!(keys.len(), 1538, "reachable key count");
         let mut h = blake3::Hasher::new();
         for k in &keys {
             h.update(k.as_bytes());
@@ -2742,7 +2742,7 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(
-            digest, "9fd76cbbf8643a98d57cba4fcdd2601eac1035e847a4170291c41c13e86a44ca",
+            digest, "0ce6602ee36e65d01ee46c65aec01b9032b3f296e2f060e26135c9ea98737d64",
             "reachable_keys order differs from the Go oracle"
         );
     }
