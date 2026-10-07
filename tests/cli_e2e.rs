@@ -1057,3 +1057,166 @@ fn commit_show_conflicted_and_nameless() {
         )
     );
 }
+
+/// The total size of the regular files under `dir` (Go: `dirSize`).
+fn dir_size(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .map(|e| {
+            let meta = e.metadata().unwrap();
+            if meta.is_dir() {
+                dir_size(&e.path())
+            } else {
+                meta.len()
+            }
+        })
+        .sum()
+}
+
+// Port of Go TestE2E_Compression.
+#[test]
+fn compression_end_to_end() {
+    let src = TempDir::new().unwrap();
+    write_fixture(src.path());
+    // Numbered lines: they compress well, and unlike one repeated line they
+    // do not chunk into identical pieces that dedup away. About 140 KiB.
+    let text: String = (0..4000)
+        .map(|i| format!("line {i:06} of the compression test\n"))
+        .collect();
+    fs::write(src.path().join("big.txt"), &text).unwrap();
+    let src_s = src.path().display().to_string();
+
+    let mut sizes = std::collections::HashMap::new();
+    for comp in ["none", "zstd:19", "lz4:9"] {
+        let store = TempDir::new().unwrap();
+        let store_s = store.path().display().to_string();
+        run_app(&[
+            "--store",
+            &store_s,
+            "--compression",
+            comp,
+            "ingest",
+            "--no-progress",
+            "--ref",
+            "v1",
+            &src_s,
+        ])
+        .unwrap_or_else(|e| panic!("{comp}: ingest: {e}"));
+        // Read back without the flag: reading never depends on the setting.
+        let dest = TempDir::new().unwrap();
+        let dest_s = dest.path().display().to_string();
+        run_app(&["--store", &store_s, "restore", "ref:v1", &dest_s])
+            .unwrap_or_else(|e| panic!("{comp}: restore: {e}"));
+        assert_eq!(
+            fs::read_to_string(dest.path().join("big.txt")).unwrap(),
+            text,
+            "{comp}"
+        );
+        sizes.insert(comp, dir_size(&store.path().join("packstore")));
+    }
+    assert!(
+        sizes["none"] >= text.len() as u64,
+        "the default store is {} bytes, smaller than the {}-byte file",
+        sizes["none"],
+        text.len()
+    );
+    for comp in ["zstd:19", "lz4:9"] {
+        assert!(
+            sizes[comp] < sizes["none"] / 2,
+            "--compression {comp}: packstore is {} bytes, the uncompressed one {}",
+            sizes[comp],
+            sizes["none"]
+        );
+    }
+}
+
+// Port of Go TestE2E_CompressionRejectsBadValues.
+#[test]
+fn compression_rejects_bad_values() {
+    let src = TempDir::new().unwrap();
+    write_fixture(src.path());
+    let src_s = src.path().display().to_string();
+    let store = TempDir::new().unwrap();
+    let store_s = store.path().display().to_string();
+    for bad in ["gzip", "zstd:23", "zstd:", "lz4:x", "ZSTD", ""] {
+        let err = run_app(&[
+            "--store",
+            &store_s,
+            "--compression",
+            bad,
+            "ingest",
+            "--no-progress",
+            &src_s,
+        ])
+        .expect_err("a bad --compression must fail");
+        assert!(
+            err.contains("invalid compression"),
+            "--compression {bad:?}: {err}"
+        );
+    }
+    assert_eq!(
+        fs::read_dir(store.path()).unwrap().count(),
+        0,
+        "a rejected flag created files"
+    );
+}
+
+// Port of Go TestE2E_GCOverMixedCodecs.
+#[test]
+fn gc_over_mixed_codecs() {
+    let src = TempDir::new().unwrap();
+    write_fixture(src.path());
+    let keep = "kept across both ingests\n".repeat(3000);
+    fs::write(src.path().join("keep.txt"), &keep).unwrap();
+    fs::write(src.path().join("big.txt"), "first version\n".repeat(3000)).unwrap();
+    let src_s = src.path().display().to_string();
+    let store = TempDir::new().unwrap();
+
+    run_seg(
+        store.path(),
+        &[
+            "--compression",
+            "lz4",
+            "ingest",
+            "--no-progress",
+            "--ref",
+            "v1",
+            &src_s,
+        ],
+    )
+    .unwrap_or_else(|e| panic!("first ingest: {e}"));
+    let second = "second version\n".repeat(3000);
+    fs::write(src.path().join("big.txt"), &second).unwrap();
+    run_seg(
+        store.path(),
+        &[
+            "--compression",
+            "zstd:19",
+            "ingest",
+            "--no-progress",
+            "--ref",
+            "v1",
+            &src_s,
+        ],
+    )
+    .unwrap_or_else(|e| panic!("second ingest: {e}"));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    run_seg(
+        store.path(),
+        &["gc", "run", "--grace", "1ms", "--garbage", "0"],
+    )
+    .unwrap_or_else(|e| panic!("gc run: {e}"));
+    let dest = TempDir::new().unwrap();
+    let dest_s = dest.path().display().to_string();
+    run_seg(store.path(), &["restore", "ref:v1", &dest_s])
+        .unwrap_or_else(|e| panic!("restore after gc: {e}"));
+    assert_eq!(
+        fs::read_to_string(dest.path().join("keep.txt")).unwrap(),
+        keep
+    );
+    assert_eq!(
+        fs::read_to_string(dest.path().join("big.txt")).unwrap(),
+        second
+    );
+}

@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 
+use amber_store_core::amberpack::Compression;
 use amber_store_core::chunkers::ByteOpts;
 use amber_store_core::commit::{Commit, Identity};
 use amber_store_core::fstree::{self, Entry};
@@ -50,6 +51,10 @@ struct Cli {
         default_value_t = packstore::DEFAULT_SEGMENT_SIZE
     )]
     segment_size: u64,
+    /// compression for the objects this command writes: none, zstd[:LEVEL]
+    /// or lz4[:LEVEL]
+    #[arg(long, global = true, default_value = "none")]
+    compression: Compression,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -298,7 +303,8 @@ fn open_store(cli: &Cli) -> Result<Stores, CliError> {
         dir.join("packstore"),
         packstore::Options::new()
             .sync(true)
-            .segment_size(cli.segment_size),
+            .segment_size(cli.segment_size)
+            .compression(cli.compression),
     )?;
     let refs = match refstore::Store::open(dir.join("refs"), true) {
         Ok(r) => r,
