@@ -171,5 +171,5 @@ Go made compression a choice and its default none. `vectorgen` now asks for
 zstd at level 0 wherever it relied on the old default: the
 `records_compressed.json` loop, the writer of `pack_go.bin`, and the store
 behind `segments_go`. A full regeneration at the Go branch's head, through the
-pseudo-version in `go.mod`, reproduced every existing file byte for byte and
-added `amberpack/records_lz4.json`.
+pseudo-version `v0.9.1-0.20261007201211-e2b16e91f6e0`, reproduced every
+existing file byte for byte and added `amberpack/records_lz4.json`.
