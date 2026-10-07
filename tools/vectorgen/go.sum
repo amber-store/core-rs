@@ -2,8 +2,8 @@ github.com/FastFilter/xorfilter v0.5.1 h1:UjtPttI1SnKWUmeQKu8Y+4ZvMJv7KP6/NZTsGB
 github.com/FastFilter/xorfilter v0.5.1/go.mod h1:h+9l02/leuyyhepO30BKr25MkZdy7LHcfPRBDRuflXw=
 github.com/PlakarKorp/go-cdc-chunkers v1.0.3 h1:6ozBFcNMHvGe6IsbPcAZUUEAExCgcNx3aa8xiCA6+Qw=
 github.com/PlakarKorp/go-cdc-chunkers v1.0.3/go.mod h1:y7ag92JABKPBDoSOPwedssQ5NIOgjRm4Mu6yTBpmUMY=
-github.com/amber-store/core v0.9.1-0.20261007201211-e2b16e91f6e0 h1:h0ojdmB2EvxNN1eBLRpKeTQ7ZOEfUQitPcZcV8fgAgQ=
-github.com/amber-store/core v0.9.1-0.20261007201211-e2b16e91f6e0/go.mod h1:N5yoWyQhl7aqup9PO4MpQ4RUXi3AFq88+2iZkIapcO0=
+github.com/amber-store/core v0.9.1-0.20261007213325-c4da255edf31 h1:H1NAaAczoJqV/LWDxPhDRPcnZtt4/fA/67TIAHnhAeo=
+github.com/amber-store/core v0.9.1-0.20261007213325-c4da255edf31/go.mod h1:N5yoWyQhl7aqup9PO4MpQ4RUXi3AFq88+2iZkIapcO0=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

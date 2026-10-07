@@ -177,4 +177,6 @@ existing file byte for byte and added `amberpack/records_lz4.json`.
 `genSegments` then gained a second store, `segments_go_lz4/`: the same
 objects written with lz4, every segment at format version 3. `segments_go/`
 is written by the same code with zstd and stays byte for byte what it was, at
-version 2.
+version 2. Generated at the Go branch's head with the gate, pseudo-version
+`v0.9.1-0.20261007213325-c4da255edf31`; a full regeneration there
+reproduced every file.
