@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: amber-store/core
-          ref: 65990e8b1c8d82a2f384603ace7d4b0d7b79dc74 # core compression-options (amber-store/core#26)
+          ref: 927d50215c6fea5dbead9d99768f0859e0c1ae45 # core v0.10.0
           path: amber-go
       - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6 # v1.0.0
         with:

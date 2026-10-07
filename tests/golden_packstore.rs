@@ -146,8 +146,8 @@ fn golden_segments_read_go_store() {
 }
 
 /// The same store written by Go with lz4 (`segments_go_lz4`). Its segments
-/// are at format version 3, the version a segment needs to hold a record
-/// beyond zstd, and lz4 records are in them. Rust opens it, serves every
+/// are at format version 3, the version a segment needs to hold an lz4
+/// record, and lz4 records are in them. Rust opens it, serves every
 /// manifest object byte-exactly, passes a full verify, and resumes the
 /// Go-written version-3 active segment.
 #[test]
