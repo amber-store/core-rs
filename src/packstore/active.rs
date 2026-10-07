@@ -28,7 +28,7 @@ use super::view::{
 };
 use super::{
     ACTIVE_SUFFIX, ActiveSegment, ActiveWriter, AppendState, Error, MAGIC_HEADER, SEALED_SUFFIX,
-    Store, unpoison,
+    Store, VERSION_BASE, header_at, is_header, unpoison,
 };
 
 /// Takes an exclusive flock without waiting (Go: `tryLock`).
@@ -92,8 +92,9 @@ impl Store {
                 .cmp(&a.1.size)
                 .then_with(|| a.1.path.cmp(&b.1.path))
         });
+        let min_version = ap.seg_version;
         for (id, sf) in cands {
-            if self.adopt(ap, *id, &sf.path)? {
+            if self.adopt(ap, *id, &sf.path, min_version)? {
                 return Ok(());
             }
         }
@@ -101,16 +102,30 @@ impl Store {
     }
 
     /// Tries to take the active segment at `path`. It reports false when
-    /// somebody else holds it, when it is gone, or when it turned out to be a
-    /// crashed seal, which is finished here and leaves nothing to append to
-    /// (Go: `adopt`).
-    pub(super) fn adopt(&self, ap: &mut AppendState, id: u64, path: &Path) -> Result<bool, Error> {
+    /// somebody else holds it, when it is gone, when its format version is
+    /// below `min_version`, or when it turned out to be a crashed seal,
+    /// which is finished here and leaves nothing to append to (Go: `adopt`).
+    pub(super) fn adopt(
+        &self,
+        ap: &mut AppendState,
+        id: u64,
+        path: &Path,
+        min_version: u8,
+    ) -> Result<bool, Error> {
         let f = match OpenOptions::new().read(true).write(true).open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
         if !try_lock(&f)? || !is_file_at(&f, path) {
+            return Ok(false);
+        }
+        // A segment below the version this store writes at is left as it is,
+        // for a writer that can use it. One whose header never arrived is
+        // taken: it gets this store's.
+        let mut header = [0u8; MAGIC_HEADER.len()];
+        let has_header = f.read_exact_at(&mut header, 0).is_ok() && is_header(&header);
+        if has_header && header[MAGIC_HEADER.len() - 1] < min_version {
             return Ok(false);
         }
         // The segment is this store's now: only from here on may it be modified.
@@ -131,13 +146,16 @@ impl Store {
             return Ok(false);
         }
         let header_len = MAGIC_HEADER.len() as u64;
+        // Recovery accepted the file, so what was read above is a header.
+        let mut version = header[MAGIC_HEADER.len() - 1];
         let size = if res.data_end < header_len as i64 {
             // The header never became durable, so nothing in the file was
             // ever acknowledged: start it over. Deliberate and silent.
             res.sidecar_end = 0;
             res.missing.clear();
+            version = ap.seg_version;
             f.set_len(0)?;
-            f.write_all_at(&MAGIC_HEADER, 0)?;
+            f.write_all_at(&header_at(version), 0)?;
             header_len
         } else {
             f.set_len(res.data_end as u64)?;
@@ -156,7 +174,12 @@ impl Store {
             drop_foreign(&mut sh, id);
             sh.active = Some(seg.clone());
         }
-        ap.active = Some(ActiveWriter { seg, size, sc });
+        ap.active = Some(ActiveWriter {
+            seg,
+            version,
+            size,
+            sc,
+        });
         Ok(true)
     }
 
@@ -212,7 +235,7 @@ impl Store {
                 }
             }
             let init = (|| -> Result<(), Error> {
-                f.write_all_at(&MAGIC_HEADER, 0)?;
+                f.write_all_at(&header_at(ap.seg_version), 0)?;
                 f.sync_all()?;
                 fs::rename(&tmp, &final_path)?;
                 ap.dir_f.as_ref().ok_or(Error::Closed)?.sync_all()?;
@@ -241,6 +264,7 @@ impl Store {
             }
             ap.active = Some(ActiveWriter {
                 seg,
+                version: ap.seg_version,
                 size: MAGIC_HEADER.len() as u64,
                 sc,
             });
@@ -285,6 +309,32 @@ impl Store {
         Ok(held)
     }
 
+    /// Lets go of the store's active segment as it is: it stays on disk,
+    /// unsealed, for whoever writes next. Does nothing when the store owns
+    /// none. Called under the append lock (Go: `releaseActiveLocked`).
+    pub(super) fn release_active(&self, ap: &mut AppendState) {
+        let Some(aw) = ap.active.take() else {
+            return;
+        };
+        unlock(&aw.seg.f);
+        let mut sh = unpoison(self.shared.write());
+        sh.struct_epoch += 1;
+        sh.active = None;
+        // The segment is now neither this store's nor in its view of the
+        // others', and whoever takes it next changes nothing in the
+        // directory: the next lookup that misses has to list it.
+        sh.dir_mtime = None;
+    }
+
+    /// Gives up the store's active segment so that the next append takes
+    /// another: seals it, or, when nothing is in it yet, lets go of it.
+    /// Called under the append lock (Go: `leaveActiveLocked`).
+    pub(super) fn leave_active(&self, ap: &mut AppendState) -> Result<(), Error> {
+        self.seal_active(ap)?;
+        self.release_active(ap); // empty: sealing left it alone
+        Ok(())
+    }
+
     /// Seals every active segment that no writer holds. A small store's
     /// segments never fill, and the process that wrote them may be long gone:
     /// without this nothing in them could ever be collected. A segment a live
@@ -292,18 +342,9 @@ impl Store {
     /// Called by `compact` under the append lock, after it sealed the store's
     /// own segment (Go: `sealIdleLocked`).
     pub(super) fn seal_idle(&self, ap: &mut AppendState) -> Result<(), Error> {
-        if let Some(aw) = ap.active.take() {
-            // Still owned, so empty: sealing left it alone. Let go of it for
-            // the pass; it is on disk for whoever writes next.
-            unlock(&aw.seg.f);
-            let mut sh = unpoison(self.shared.write());
-            sh.struct_epoch += 1;
-            sh.active = None;
-            // The segment is now neither this store's nor in its view of the
-            // others', and whoever takes it next changes nothing in the
-            // directory: the next lookup that misses has to list it.
-            sh.dir_mtime = None;
-        }
+        // Still owned, so empty: sealing left it alone. Let go of it for the
+        // pass; it is on disk for whoever writes next.
+        self.release_active(ap);
         let ls = list_segments(&self.dir)?;
         let mut ids: Vec<u64> = ls.active.keys().copied().collect();
         // The fullest first: the empty ones cannot be sealed.
@@ -314,7 +355,8 @@ impl Store {
                 .then_with(|| a.cmp(b))
         });
         for id in ids {
-            if !self.adopt(ap, id, &ls.active[&id].path)? {
+            // Whatever its version: it is to be sealed.
+            if !self.adopt(ap, id, &ls.active[&id].path, VERSION_BASE)? {
                 continue;
             }
             self.seal_active(ap)?;

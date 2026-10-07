@@ -211,6 +211,16 @@ not read back, so all three stay indexed, where a fall-back scan would stop at
 the damage and index none. `gc.lock`, which every open creates, is not part of
 the fixture.
 
+### `segments_go_lz4/`
+
+The same store, written by Go with `--compression lz4`'s setting, with its own
+`manifest.json` of the same shape. Its two sealed segments and its active one
+are at **segment format version 3** (`AMBERSG\x03`), the version a segment
+needs to hold a record beyond zstd, and lz4 records are in them
+(`architecture/packstore.md`). The Rust store must open it, serve every
+object, pass a full verify, and resume the version-3 active segment.
+`segments_go/` stays at version 2.
+
 ### `reference.json`
 
 ```json

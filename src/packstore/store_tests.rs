@@ -1447,7 +1447,7 @@ fn scan_active_refuses_another_format_version() {
     // file holds acknowledged data this release cannot read, and resetting
     // it would destroy that data.
     let (body, _) = build_body(&test_objects(2));
-    for version in [0x01u8, 0x03] {
+    for version in [0x01u8, 0x04] {
         let mut old = body.clone();
         old[MAGIC_HEADER.len() - 1] = version;
         let dir = TempDir::new().unwrap();

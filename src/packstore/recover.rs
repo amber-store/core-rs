@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::amberpack::{REC_HEADER_SIZE, parse_record};
 use crate::key::Key;
 
-use super::{Error, MAGIC_HEADER, TAG_SEAL, check_version, footer::parse_footer};
+use super::{Error, MAGIC_HEADER, TAG_SEAL, check_version, footer::parse_footer, is_header};
 
 /// Locates one record inside the active segment (Go: `activeLoc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub(crate) fn scan_active(path: &Path) -> Result<ScanResult, Error> {
     };
     let b = fs::read(path)?;
     check_version(&b)?;
-    if b.len() < MAGIC_HEADER.len() || b[..MAGIC_HEADER.len()] != MAGIC_HEADER {
+    if b.len() < MAGIC_HEADER.len() || !is_header(&b[..MAGIC_HEADER.len()]) {
         // Header never made it to disk; nothing in this file was ever
         // acknowledged (any successful fsync would have persisted the header
         // too). Reset to empty.

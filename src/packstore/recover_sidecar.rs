@@ -20,7 +20,7 @@ use super::sidecar::{
     SidecarWriter, read_sidecar,
 };
 use super::view::with_suffix;
-use super::{Error, MAGIC_HEADER, MAGIC_TRAILER, TAG_SEAL, check_version};
+use super::{Error, MAGIC_HEADER, MAGIC_TRAILER, TAG_SEAL, check_version, is_header};
 
 /// Random-access reads of a data file; a byte slice stands in for one in
 /// tests (Go: `io.ReaderAt`).
@@ -154,7 +154,7 @@ pub(crate) fn recover_from<D: DataAt + ?Sized>(
     if read_sidecar(sidecar, true).1 == 0 || size < header_len {
         return Ok(None);
     }
-    if read_range(data, 0, header_len)? != MAGIC_HEADER {
+    if !is_header(&read_range(data, 0, header_len)?) {
         return Ok(None);
     }
     if size >= header_len + TRAILER_SIZE as i64 {
@@ -229,7 +229,7 @@ pub(crate) fn advance<D: DataAt + ?Sized>(
         }
         let header = read_range(data, 0, header_len)?;
         check_version(&header)?;
-        if header != MAGIC_HEADER {
+        if !is_header(&header) {
             return Ok(Some(unchanged()));
         }
         pos = header_len;

@@ -21,7 +21,10 @@
 #      refused with a stale expectation, and both see the final state.
 #   6. compression: each implementation ingests the tree with zstd and with
 #      lz4 into a store of its own, the OTHER lists and exports it byte for
-#      byte, and each compressed store is smaller than the default one.
+#      byte, and each compressed store is smaller than the default one. Every
+#      segment of a zstd store is at format version 2, which releases up to
+#      0.9.0 read, and every segment of an lz4 store at version 3, which they
+#      refuse.
 set -euo pipefail
 
 RS_REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -106,6 +109,19 @@ for comp in zstd:19 lz4:9; do
     || { echo "FAIL: go store is no smaller with --compression $comp" >&2; exit 1; }
   [ "$(store_bytes "$WORK/store-rs-$tag/packstore")" -lt "$PLAIN_RS" ] \
     || { echo "FAIL: rust store is no smaller with --compression $comp" >&2; exit 1; }
+  # The format version is the last byte of a segment's 8-byte header.
+  if [ "$tag" = lz4 ]; then want=03; else want=02; fi
+  for side in go rs; do
+    checked=0
+    for f in "$WORK/store-$side-$tag/packstore"/*.seg "$WORK/store-$side-$tag/packstore"/*.seg.active; do
+      [ -e "$f" ] || continue
+      got=$(od -An -tx1 -j7 -N1 "$f" | tr -d ' ')
+      [ "$got" = "$want" ] \
+        || { echo "FAIL: $f is at segment version $got with --compression $comp, want $want" >&2; exit 1; }
+      checked=$((checked + 1))
+    done
+    [ "$checked" -gt 0 ] || { echo "FAIL: no segments in store-$side-$tag" >&2; exit 1; }
+  done
 done
 
 echo "== restore (rust, from the go store) -> re-ingest (go) -> same root"

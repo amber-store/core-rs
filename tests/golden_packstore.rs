@@ -9,6 +9,7 @@ mod common;
 use std::fs;
 use std::path::Path;
 
+use amber_store_core::amberpack::{REC_HEADER_SIZE, parse_record};
 use amber_store_core::key::Key;
 use amber_store_core::packstore::{Object, Options, Store, WriteOpts};
 
@@ -31,7 +32,11 @@ fn parse_key(hex_key: &str, ctx: &str) -> Key {
 }
 
 fn load_manifest() -> Option<Manifest> {
-    let bytes = common::load("segments_go/manifest.json")?;
+    load_manifest_of("segments_go")
+}
+
+fn load_manifest_of(fixture: &str) -> Option<Manifest> {
+    let bytes = common::load(&format!("{fixture}/manifest.json"))?;
     let m: Manifest = serde_json::from_slice(&bytes).expect("manifest.json parses");
     assert!(!m.objects.is_empty(), "manifest has no objects");
     assert!(!m.absent.is_empty(), "manifest has no absent keys");
@@ -42,7 +47,11 @@ fn load_manifest() -> Option<Manifest> {
 /// active segment for its own and may truncate it, and every open creates
 /// `gc.lock`, so tests never open the committed directory itself.
 fn copy_fixture(dst: &Path) {
-    let src = common::golden_dir().join("segments_go");
+    copy_fixture_of("segments_go", dst);
+}
+
+fn copy_fixture_of(fixture: &str, dst: &Path) {
+    let src = common::golden_dir().join(fixture);
     for entry in fs::read_dir(&src).expect("fixture dir") {
         let entry = entry.expect("fixture entry");
         fs::copy(entry.path(), dst.join(entry.file_name())).expect("copy fixture file");
@@ -134,6 +143,89 @@ fn golden_segments_read_go_store() {
         "resumed-append object lost"
     );
     s2.verify(|| false).expect("verify after resumed append");
+}
+
+/// The same store written by Go with lz4 (`segments_go_lz4`). Its segments
+/// are at format version 3, the version a segment needs to hold a record
+/// beyond zstd, and lz4 records are in them. Rust opens it, serves every
+/// manifest object byte-exactly, passes a full verify, and resumes the
+/// Go-written version-3 active segment.
+#[test]
+fn golden_segments_read_go_lz4_store() {
+    let Some(m) = load_manifest_of("segments_go_lz4") else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    copy_fixture_of("segments_go_lz4", dir.path());
+
+    let mut segments = 0;
+    let mut lz4_records = 0;
+    for entry in fs::read_dir(dir.path()).expect("fixture copy") {
+        let path = entry.expect("entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !(name.ends_with(".seg") || name.ends_with(".seg.active")) {
+            continue;
+        }
+        let b = fs::read(&path).expect("segment");
+        assert_eq!(&b[..7], b"AMBERSG", "{name}: header");
+        assert_eq!(b[7], 3, "{name}: format version");
+        segments += 1;
+        // A record starts with its tag, 0x01; a footer starts with another byte.
+        let mut off = 8;
+        while off < b.len() && b[off] == 0x01 {
+            let rec = parse_record(&b[off..]).unwrap_or_else(|e| panic!("{name} at {off}: {e}"));
+            if rec.flags == 2 {
+                lz4_records += 1;
+            }
+            off += REC_HEADER_SIZE + rec.slen as usize;
+        }
+    }
+    assert_eq!(segments, 3, "two sealed segments and the active one");
+    assert!(lz4_records > 0, "the fixture holds no lz4 record");
+
+    let s = Store::open_with(dir.path(), Options::new().segment_size(m.segment_size))
+        .expect("open the Go-written lz4 store");
+    for (i, o) in m.objects.iter().enumerate() {
+        let ctx = format!("object {i} ({})", o.key);
+        let k = parse_key(&o.key, &ctx);
+        let got = s.get(k).unwrap_or_else(|e| panic!("{ctx}: get: {e}"));
+        assert_eq!(got, o.payload.bytes(), "{ctx}: payload mismatch");
+    }
+    for (i, h) in m.absent.iter().enumerate() {
+        let k = parse_key(h, &format!("absent {i}"));
+        assert!(
+            !s.has(k).expect("has(absent)"),
+            "absent key {k} reported present"
+        );
+    }
+    s.verify(|| false)
+        .expect("verify on the Go-written lz4 store");
+
+    // Resume the Go-written version-3 active segment with the default
+    // setting: the new record is raw, and a version-3 segment takes it.
+    let extra = common::data(5001, 1234);
+    let extra_key = amber_store_core::key::Key::new(
+        amber_store_core::key::Type::Blob,
+        extra.len() as u64,
+        &extra,
+    );
+    s.put(extra_key, &extra)
+        .expect("put on the resumed Go tail");
+    s.close().expect("close");
+    let s2 =
+        Store::open_with(dir.path(), Options::new().segment_size(m.segment_size)).expect("reopen");
+    for (i, o) in m.objects.iter().enumerate() {
+        let ctx = format!("object {i} ({}) after reopen", o.key);
+        let k = parse_key(&o.key, &ctx);
+        assert_eq!(
+            s2.get(k).unwrap_or_else(|e| panic!("{ctx}: {e}")),
+            o.payload.bytes(),
+            "{ctx}"
+        );
+    }
+    assert_eq!(s2.get(extra_key).expect("get(extra)"), extra);
+    s2.verify(|| false)
+        .expect("verify after the resumed append");
 }
 
 /// The Go-written active segment comes with its sidecar index

@@ -25,8 +25,29 @@ type segmentsManifest struct {
 	Absent      []string    `json:"absent"`
 }
 
-// genSegments writes segments_go/: a real packstore directory with two sealed
-// segments and one unsealed active segment, plus its manifest.
+// genSegments writes segments_go/, a store written with zstd, whose segments
+// are at format version 2, and segments_go_lz4/, the same store written with
+// lz4, whose segments are at format version 3.
+func genSegments(outDir string) error {
+	for _, v := range []struct {
+		name    string
+		c       amberpack.Compression
+		version byte
+	}{
+		{"segments_go", amberpack.Compression{Algorithm: amberpack.Zstd}, 2},
+		{"segments_go_lz4", amberpack.Compression{Algorithm: amberpack.LZ4}, 3},
+	} {
+		if err := genSegmentsAt(outDir, v.name, v.c, v.version); err != nil {
+			return fmt.Errorf("%s: %w", v.name, err)
+		}
+	}
+	return nil
+}
+
+// genSegmentsAt writes a real packstore directory with two sealed segments
+// and one unsealed active segment, plus its manifest. Everything in it is
+// written with compression c, and every segment must come out at the given
+// format version.
 //
 // Method for the unsealed tail: packstore.Store.Close fsyncs and closes the
 // active segment WITHOUT sealing it (sealing only happens when an append
@@ -36,10 +57,10 @@ type segmentsManifest struct {
 // Put three small tail objects — which start the third segment and stay far
 // below the threshold — and Close. The result is exactly the "killed before
 // seal" on-disk state: an active segment with valid records and no footer.
-func genSegments(outDir string) error {
-	dir := filepath.Join(outDir, "segments_go")
+func genSegmentsAt(outDir, name string, c amberpack.Compression, version byte) error {
+	dir := filepath.Join(outDir, name)
 	st, err := packstore.Open(dir, packstore.WithSegmentSize(segmentSize), packstore.WithSync(false),
-		packstore.WithCompression(amberpack.Compression{Algorithm: amberpack.Zstd}))
+		packstore.WithCompression(c))
 	if err != nil {
 		return err
 	}
@@ -78,7 +99,7 @@ func genSegments(outDir string) error {
 	// raw and zstd records.
 	for i := 0; ; i++ {
 		if i >= 200 {
-			return fmt.Errorf("segments_go: 200 objects written without reaching two seals")
+			return fmt.Errorf("200 objects written without reaching two seals")
 		}
 		n, err := sealedCount()
 		if err != nil {
@@ -88,7 +109,7 @@ func genSegments(outDir string) error {
 			break
 		}
 		if n > 2 {
-			return fmt.Errorf("segments_go: overshot to %d sealed segments", n)
+			return fmt.Errorf("overshot to %d sealed segments", n)
 		}
 		var p Payload
 		if i%7 == 3 {
@@ -122,7 +143,7 @@ func genSegments(outDir string) error {
 			return err
 		}
 		if has {
-			return fmt.Errorf("segments_go: absent key %s is unexpectedly stored", k)
+			return fmt.Errorf("absent key %s is unexpectedly stored", k)
 		}
 		man.Absent = append(man.Absent, k.String())
 	}
@@ -147,17 +168,26 @@ func genSegments(outDir string) error {
 		}
 	}
 	if len(sealed) != 2 || len(active) != 1 {
-		return fmt.Errorf("segments_go: got %d sealed + %d active segments, want 2 + 1", len(sealed), len(active))
+		return fmt.Errorf("got %d sealed + %d active segments, want 2 + 1", len(sealed), len(active))
 	}
 	ab, err := os.ReadFile(filepath.Join(dir, active[0]))
 	if err != nil {
 		return err
 	}
+	for _, name := range append(sealed, active...) {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return err
+		}
+		if b[7] != version {
+			return fmt.Errorf("%s is at format version %d, want %d", name, b[7], version)
+		}
+	}
 	if len(ab) <= 8 {
-		return fmt.Errorf("segments_go: active segment has no records (%d bytes)", len(ab))
+		return fmt.Errorf("active segment has no records (%d bytes)", len(ab))
 	}
 	if bytes.HasSuffix(ab, []byte("AMBERSGF")) {
-		return fmt.Errorf("segments_go: active segment unexpectedly carries a footer")
+		return fmt.Errorf("active segment unexpectedly carries a footer")
 	}
 	// The active segment's sidecar index (architecture/packstore.md) is part
 	// of the fixture: magic, one entry per tail record, and the synced record
@@ -165,10 +195,10 @@ func genSegments(outDir string) error {
 	// gc.lock, which every open creates, holds nothing a reader needs.
 	idx, err := os.ReadFile(filepath.Join(dir, active[0]+".idx"))
 	if err != nil {
-		return fmt.Errorf("segments_go: the active segment has no sidecar: %w", err)
+		return fmt.Errorf("the active segment has no sidecar: %w", err)
 	}
 	if want := 8 + 56*(3+1); len(idx) != want {
-		return fmt.Errorf("segments_go: sidecar is %d bytes, want %d", len(idx), want)
+		return fmt.Errorf("sidecar is %d bytes, want %d", len(idx), want)
 	}
 	if err := os.Remove(filepath.Join(dir, "gc.lock")); err != nil {
 		return err

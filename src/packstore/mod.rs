@@ -78,10 +78,49 @@ pub(crate) const MAGIC_TRAILER: [u8; 8] = *b"AMBERSGF";
 /// foreign header is the caller's to judge (Go: `checkVersion`).
 pub(crate) fn check_version(b: &[u8]) -> Result<(), Error> {
     let n = MAGIC_HEADER.len() - 1;
-    if b.len() <= n || b[..n] != MAGIC_HEADER[..n] || b[n] == MAGIC_HEADER[n] {
+    if b.len() <= n || b[..n] != MAGIC_HEADER[..n] || reads_version(b[n]) {
         return Ok(());
     }
     Err(Error::UnsupportedVersion { found: b[n] })
+}
+
+/// Segment format versions: the last byte of a segment's header. The two
+/// have the same layout. A segment at `VERSION_ANY_CODEC` may hold records
+/// of every codec; one at `VERSION_BASE` holds only raw and zstd records,
+/// which is all that releases up to 0.9.0 read. Those releases refuse a
+/// segment at any version but `VERSION_BASE`, and would misread an lz4
+/// record in one they accept, so a record beyond zstd is only ever written
+/// to a segment at `VERSION_ANY_CODEC` (architecture/packstore.md; Go:
+/// `versionBase`, `versionAnyCodec`).
+pub(crate) const VERSION_BASE: u8 = 2;
+pub(crate) const VERSION_ANY_CODEC: u8 = 3;
+
+fn reads_version(v: u8) -> bool {
+    v == VERSION_BASE || v == VERSION_ANY_CODEC
+}
+
+/// Reports whether `b` is a segment header of a version this release reads
+/// (Go: `isHeader`).
+pub(crate) fn is_header(b: &[u8]) -> bool {
+    let n = MAGIC_HEADER.len() - 1;
+    b.len() == MAGIC_HEADER.len() && b[..n] == MAGIC_HEADER[..n] && reads_version(b[n])
+}
+
+/// The segment header for a format version (Go: `headerAt`).
+pub(crate) fn header_at(version: u8) -> [u8; 8] {
+    let mut h = MAGIC_HEADER;
+    h[MAGIC_HEADER.len() - 1] = version;
+    h
+}
+
+/// The lowest segment version that may hold a record with the given flags
+/// byte (Go: `versionFor`).
+pub(crate) fn version_for(flags: u8) -> u8 {
+    if flags > amberpack::CODEC_ZSTD {
+        VERSION_ANY_CODEC
+    } else {
+        VERSION_BASE
+    }
 }
 
 /// The default rotation threshold: the active segment is sealed once it
@@ -140,7 +179,9 @@ pub enum Error {
     /// A segment whose header is this format's magic with another version
     /// byte: data written by a release with a different layout. Such a file
     /// is neither read nor modified (Go: `ErrUnsupportedVersion`).
-    #[error("packstore: unsupported segment format version: {found}, this release reads {}", MAGIC_HEADER[MAGIC_HEADER.len() - 1])]
+    #[error(
+        "packstore: unsupported segment format version: {found}, this release reads {VERSION_BASE} and {VERSION_ANY_CODEC}"
+    )]
     UnsupportedVersion {
         /// The version byte the segment carries.
         found: u8,
@@ -403,6 +444,8 @@ struct ActiveSegment {
 /// touches it (Go: `activeSegment.size`, "accessed only under appendMu").
 struct ActiveWriter {
     seg: Arc<ActiveSegment>,
+    /// The header's format version: which records the segment may hold.
+    version: u8,
     size: u64,
     /// Mirrors the index on disk (`sidecar.rs`), so that the next open does
     /// not have to scan the data. `None` when it could not be written (Go:
@@ -436,6 +479,11 @@ struct AppendState {
     active: Option<ActiveWriter>,
     /// A floor for new segment ids.
     next_id: u64,
+    /// The format version this store creates active segments at, and the
+    /// lowest at which it adopts one. It starts from the compression option
+    /// and is raised for good by the first record that needs more (Go:
+    /// `segVersion`).
+    seg_version: u8,
 }
 
 /// Reader-visible state (Go: fields guarded by `mu`).
@@ -592,6 +640,7 @@ impl Store {
             )));
         }
         let gate = Gate::open(&dir)?;
+        let seg_version = version_for(cfg.compression.codec());
         if let Ok(ls) = list_segments(&dir) {
             remove_orphan_sidecars(&dir, &ls);
         }
@@ -602,6 +651,7 @@ impl Store {
                 dir_f: Some(dir_f),
                 active: None,
                 next_id: 1,
+                seg_version,
             }),
             shared: RwLock::new(Shared {
                 sealed: Vec::new(),
@@ -663,6 +713,11 @@ impl Store {
                 return Err(Error::Failed(msg.clone()));
             }
         }
+        // A record beyond zstd goes into a segment at VERSION_ANY_CODEC only,
+        // and a store that has written one stays at that version: it leaves
+        // a segment early once, not once per segment.
+        let need = version_for(rec[33]);
+        ap.seg_version = ap.seg_version.max(need);
         self.ensure_active(ap)?;
         let Some(aw) = ap.active.as_mut() else {
             return Err(Error::Closed); // unreachable: ensure_active succeeded
@@ -681,6 +736,16 @@ impl Store {
             }
             return Ok(());
         }
+        if aw.version < need {
+            // The segment this store holds may not take the record. Its
+            // header is never rewritten: an older release that has read it
+            // would go on to misread what follows.
+            self.leave_active(ap)?;
+            self.ensure_active(ap)?;
+        }
+        let Some(aw) = ap.active.as_mut() else {
+            return Err(Error::Closed); // unreachable: ensure_active succeeded
+        };
         let off = aw.size;
         aw.seg.f.write_all_at(rec, off)?;
         let loc = ActiveLoc {
@@ -1298,6 +1363,9 @@ mod gc_tests;
 
 #[cfg(test)]
 mod compression_tests;
+
+#[cfg(test)]
+mod segment_version_tests;
 
 #[cfg(test)]
 mod store_tests;

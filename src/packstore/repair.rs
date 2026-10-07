@@ -9,7 +9,7 @@ use super::compact::all_entries;
 use super::footer::{IndexEntry, SealedSegment, build_footer};
 use super::verify::verify_object;
 use super::view::publish_sealed;
-use super::{Error, MAGIC_HEADER, Store, unpoison};
+use super::{Error, MAGIC_HEADER, Store, header_at, unpoison, version_for};
 
 fn valid_record(key: Key, bytes: &[u8]) -> bool {
     let Ok(record) = parse_record(bytes) else {
@@ -148,7 +148,10 @@ impl Store {
                     .write(true)
                     .create_new(true)
                     .open(&temporary)?;
-                file.write_all(&MAGIC_HEADER)?;
+                // The rewritten segment keeps its version, raised when the
+                // replacement is a record that the old one may not hold.
+                let version = segment.version().max(version_for(replacement[33]));
+                file.write_all(&header_at(version))?;
                 let mut offset = MAGIC_HEADER.len() as u64;
                 let mut index = Vec::with_capacity(entries.len());
                 for entry in &entries {

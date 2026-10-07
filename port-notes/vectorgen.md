@@ -173,3 +173,8 @@ zstd at level 0 wherever it relied on the old default: the
 behind `segments_go`. A full regeneration at the Go branch's head, through the
 pseudo-version `v0.9.1-0.20261007201211-e2b16e91f6e0`, reproduced every
 existing file byte for byte and added `amberpack/records_lz4.json`.
+
+`genSegments` then gained a second store, `segments_go_lz4/`: the same
+objects written with lz4, every segment at format version 3. `segments_go/`
+is written by the same code with zstd and stays byte for byte what it was, at
+version 2.

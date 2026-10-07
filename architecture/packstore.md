@@ -25,15 +25,38 @@ share one id space. Several active segments may exist: one per writer that was
 at work at the same time, and whatever they left behind. Anything else in the
 directory is ignored.
 
-A sealed segment is `AMBERSG\x02`, the records, and a footer (seal marker,
+A sealed segment is an 8-byte header (`AMBERSG` and a version byte), the
+records, and a footer (seal marker,
 fanout index, binary fuse filter, 64-byte trailer ending in `AMBERSGF`); an
 active one is the same without the footer. The index holds the keys in
 bytewise order behind a fanout on their first byte, and the filter is built
 over their first 8 bytes: both rely on a key leading with its hash.
 
-The last byte of `AMBERSG\x02` is the format version. Version `\x01` held keys
+The last byte of the header is the format version. There are two, `\x02` and
+`\x03`, with the same layout: they differ in the records they may hold. A
+version-2 segment holds only raw and zstd records; a version-3 segment may
+hold records of any codec ([amberpack.md](amberpack.md#the-record)). The
+reason is the releases up to 0.9.0. They read version 2 alone, and they would
+misread an lz4 record in a segment they accept: their read path returns the
+lz4 block as the object's bytes, and their scan of an active segment
+truncates at the first one. A segment they refuse they leave alone. So a
+record beyond zstd is only ever written to a version-3 segment, and a store
+that has taken one is refused by those releases as a whole, at open.
+
+A writer creates version-2 segments, unless its compression setting is lz4,
+in which case it creates version-3 ones from the start. When a record beyond
+zstd is about to be appended to a version-2 segment — whether the writer
+encoded it, was handed it encoded, or is copying it in a compaction — the
+writer leaves that segment, sealing it or, if it is empty, letting go of it
+as it is, and continues in a version-3 one. From then on it creates version-3
+segments, so it pays for one early seal and not for one per segment. A header
+is never rewritten: a running older release may already have read it. A
+store that never takes such a record stays at version 2.
+
+Version `\x01` held keys
 in their earlier byte order (header byte first), indexed and filtered on their
-last bytes. A segment that carries the magic with another version is refused
+last bytes. A segment that carries the magic with a version other than 2 and
+3 is refused
 with an unsupported-version error and never modified — in particular it is not
 taken for a segment whose header was torn, which would be started over. Sealing appends the footer, fsyncs,
 renames `<id>.seg.active` to `<id>.seg`, fsyncs the directory and removes the
@@ -121,7 +144,9 @@ sealed or reaped since the listing), recovers it with the owner's rights and
 appends to it. Only when every active segment is held by a live writer does it
 create one. Serial writers therefore keep filling one segment to the segment
 size; the number of active segments is bounded by the peak number of
-simultaneous writers and drifts back to one as they fill.
+simultaneous writers and drifts back to one as they fill. A writer that has
+moved to version-3 segments passes over a version-2 one, leaving it for a
+writer that can use it; a writer at version 2 adopts either.
 
 **Creating** a segment with an id above every id in the directory:
 
@@ -288,8 +313,14 @@ above:
   the segment it copied into, then removes the old ones, then syncs the
   directory.
 - **Rely only on durable copies** when skipping a write or a survivor's copy.
-- **Refuse a segment of another format version** and leave it as it is; only a
-  header that is missing or not this format's magic at all may be reset.
+- **Refuse a segment of a format version other than 2 and 3** and leave it as
+  it is; only a header that is missing or not this format's magic at all may
+  be reset.
+- **A record beyond zstd only in a version-3 segment.** Never append one to a
+  version-2 segment, and never rewrite a header: leave the segment and
+  continue in a version-3 one. A repair that rewrites a sealed segment keeps
+  its version, raised to 3 when the replacement record needs it. A scrub
+  reports such a record in a version-2 segment as corruption.
 
 The **sealed footer** (index section, filter, trailer) is older than this
 document and is not laid out here yet; `packstore/footer.go` is the reference.

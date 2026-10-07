@@ -15,13 +15,13 @@ use super::{CompactOpts, Object, Options, Store, WriteOpts};
 use crate::amberpack::{Compression, REC_HEADER_SIZE, encode_record_with};
 use crate::key::Key;
 
-const LZ4: Compression = Compression::Lz4 { level: 0 };
-const LZ4_9: Compression = Compression::Lz4 { level: 9 };
-const ZSTD_19: Compression = Compression::Zstd { level: 19 };
+pub(super) const LZ4: Compression = Compression::Lz4 { level: 0 };
+pub(super) const LZ4_9: Compression = Compression::Lz4 { level: 9 };
+pub(super) const ZSTD_19: Compression = Compression::Zstd { level: 19 };
 
-const RAW: u8 = 0;
-const CODEC_ZSTD: u8 = 1;
-const CODEC_LZ4: u8 = 2;
+pub(super) const RAW: u8 = 0;
+pub(super) const CODEC_ZSTD: u8 = 1;
+pub(super) const CODEC_LZ4: u8 = 2;
 
 fn codec_id(c: Compression) -> u8 {
     match c {
@@ -32,20 +32,20 @@ fn codec_id(c: Compression) -> u8 {
 }
 
 /// The codec id of `k`'s stored record (Go: `codecOf`).
-fn codec_of(s: &Store, k: Key) -> u8 {
+pub(super) fn codec_of(s: &Store, k: Key) -> u8 {
     s.get_record(k).unwrap()[33]
 }
 
 /// Opens a store with `opts` and nothing else: no compression unless they
 /// say so (Go: `rawStore`).
-fn raw_store(opts: Options) -> (TempDir, Store) {
+pub(super) fn raw_store(opts: Options) -> (TempDir, Store) {
     let dir = TempDir::new().unwrap();
     let s = Store::open_with(dir.path(), opts.sync(false)).unwrap();
     (dir, s)
 }
 
 /// n compressible objects that differ from one another (Go: `distinct`).
-fn distinct(n: usize) -> Vec<Object> {
+pub(super) fn distinct(n: usize) -> Vec<Object> {
     (0..n)
         .map(|i| {
             let mut data = compressible(4096);
@@ -56,7 +56,7 @@ fn distinct(n: usize) -> Vec<Object> {
         .collect()
 }
 
-fn must_get(s: &Store, o: &Object) {
+pub(super) fn must_get(s: &Store, o: &Object) {
     assert_eq!(s.get(o.key).unwrap(), o.data, "get({})", o.key);
 }
 

@@ -49,9 +49,9 @@ pub const REC_HEADER_SIZE: usize = 46;
 
 const TAG_CHUNK: u8 = 0x01;
 /// The codec ids a record's flags byte holds.
-const CODEC_RAW: u8 = 0;
-const CODEC_ZSTD: u8 = 1;
-const CODEC_LZ4: u8 = 2;
+pub(crate) const CODEC_RAW: u8 = 0;
+pub(crate) const CODEC_ZSTD: u8 = 1;
+pub(crate) const CODEC_LZ4: u8 = 2;
 
 /// Bounds one object's payload, stored or decoded. The length fields are
 /// untrusted and size allocations. Real objects are ~1 MiB.
@@ -155,7 +155,7 @@ pub enum Compression {
 
 impl Compression {
     /// The codec id a record compressed this way carries.
-    fn codec(&self) -> u8 {
+    pub(crate) fn codec(&self) -> u8 {
         match self {
             Compression::None => CODEC_RAW,
             Compression::Zstd { .. } => CODEC_ZSTD,

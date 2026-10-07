@@ -219,8 +219,12 @@ with `is_invalid_compression()` on either error type.
 Full port: store open/scan (segment file naming from `packstore.go`), active
 segment append + recovery tail-scan (`recover.go`), sealing with footer
 (`footer.go` — already-specified layouts; fanout on the **first** key byte,
-filter over the first 8, both relying on a key leading with its hash; a
-segment of another format version is refused with
+filter over the first 8, both relying on a key leading with its hash; segment
+format versions 2 and 3, `VERSION_BASE` and `VERSION_ANY_CODEC` (Go:
+`versionBase`, `versionAnyCodec`), where only a version-3 segment may hold a
+record beyond zstd and a store moves to version 3 at its first such record,
+so that releases up to 0.9.0 refuse the store instead of misreading it; a
+segment of any other format version is refused with
 `Error::UnsupportedVersion`, Go `ErrUnsupportedVersion`, and left as it is),
 sealed-segment mmap reads (`memmap2`, bounds-checked, no CRC on hot path),
 `has`/`get`/`getRecord`/`storedSize`/`locate`, options (`WithSegmentSize`,
