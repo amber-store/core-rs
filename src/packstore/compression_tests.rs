@@ -478,3 +478,170 @@ fn mixed_codec_store() {
     }
     s.verify(|| false).unwrap();
 }
+
+/// The callback rejects one object in the middle of a run: what was written
+/// before it stays, the rejected object is absent, and the store keeps
+/// working (Go: `TestCompressionForInvalidValueMidRun`).
+#[test]
+fn compression_for_invalid_value_mid_run() {
+    const REJECT: usize = 20;
+    let objs = distinct(40);
+    let open = |bad: &Arc<AtomicBool>| {
+        let flag = Arc::clone(bad);
+        raw_store(
+            Options::new()
+                .compression(ZSTD)
+                .compression_for(move |_, data, def| {
+                    // distinct's low index byte
+                    if flag.load(Ordering::SeqCst) && data[data.len() - 2] as usize == REJECT {
+                        Compression::Lz4 { level: 99 }
+                    } else {
+                        def
+                    }
+                }),
+        )
+    };
+    let bad = Arc::new(AtomicBool::new(true));
+
+    // A batch keeps exactly the objects before the rejected one.
+    let (_dir, s) = open(&bad);
+    let err = s.write_batch(obj_seq(&objs, None)).unwrap_err();
+    assert!(err.is_invalid_compression(), "write_batch: {err}");
+    assert!(
+        err.to_string().contains(&objs[REJECT].key.to_string()),
+        "write_batch error {err} does not name the rejected object"
+    );
+    for (i, o) in objs.iter().enumerate() {
+        assert_eq!(s.has(o.key).unwrap(), i < REJECT, "object {i}");
+    }
+    for o in &objs[..REJECT] {
+        must_get(&s, o);
+    }
+
+    // A parallel run stops, the rejected object is absent, what it stored
+    // reads back, and the store is not poisoned.
+    let (_dir, s) = open(&bad);
+    let (stats, res) = s.write_parallel(obj_seq(&objs, None), parallel(4));
+    let err = res.unwrap_err();
+    assert!(err.is_invalid_compression(), "write_parallel: {err}");
+    let mut stored = 0;
+    for (i, o) in objs.iter().enumerate() {
+        let has = s.has(o.key).unwrap();
+        assert!(!(i == REJECT && has), "the rejected object was stored");
+        if has {
+            stored += 1;
+            must_get(&s, o);
+        }
+    }
+    assert_eq!(stored, stats.stored, "the stats and the store disagree");
+    s.verify(|| false).unwrap();
+    bad.store(false, Ordering::SeqCst);
+    s.write_parallel(obj_seq(&objs, None), parallel(4))
+        .1
+        .unwrap();
+    for o in &objs {
+        must_get(&s, o);
+    }
+}
+
+/// "name size" for every entry of `dir`, sorted (Go: `listDir`).
+fn list_dir(dir: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            format!(
+                "{} {}",
+                e.file_name().to_string_lossy(),
+                e.metadata().unwrap().len()
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A repair whose replacement cannot be encoded fails before it changes
+/// anything on disk: the active segment stays active, and the repair goes
+/// through once the callback behaves (Go:
+/// `TestRejectedRepairLeavesTheStoreUntouched`).
+#[test]
+fn rejected_repair_leaves_the_store_untouched() {
+    let objs = test_objects(4);
+    let (dir, path, entries) = write_sealed_file(&objs);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[entries[0].off as usize + REC_HEADER_SIZE] ^= 0x40;
+    fs::write(&path, bytes).unwrap();
+
+    let bad = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&bad);
+    let s = Store::open_with(
+        dir.path(),
+        Options::new()
+            .sync(false)
+            .compression(ZSTD)
+            .compression_for(move |_, _, def| {
+                if flag.load(Ordering::SeqCst) {
+                    Compression::Zstd { level: 99 }
+                } else {
+                    def
+                }
+            }),
+    )
+    .unwrap();
+    let later = blob_obj(b"a later object, in a new active segment");
+    s.put(later.key, &later.data).unwrap();
+
+    let before = list_dir(dir.path());
+    bad.store(true, Ordering::SeqCst);
+    let err = s.put_verified(objs[0].key, &objs[0].data).unwrap_err();
+    assert!(err.is_invalid_compression(), "put_verified: {err}");
+    assert_eq!(
+        list_dir(dir.path()),
+        before,
+        "a rejected repair changed the store directory"
+    );
+
+    bad.store(false, Ordering::SeqCst);
+    s.put_verified(objs[0].key, &objs[0].data).unwrap();
+    must_get(&s, &objs[0]);
+    must_get(&s, &later);
+    s.verify(|| false).unwrap();
+}
+
+/// A deferred put that the callback rejects wrote nothing, so it leaves no
+/// unsynced-record flag behind for the next dedup hit to pay for.
+#[test]
+fn rejected_deferred_put_sets_no_flag() {
+    let (_dir, s) =
+        raw_store(Options::new().compression_for(|_, _, _| Compression::Zstd { level: 99 }));
+    let o = blob_obj(&compressible(4096));
+    let err = s.put_verified_deferred(o.key, &o.data).unwrap_err();
+    assert!(err.is_invalid_compression(), "{err}");
+    assert!(!s.deferred.load(Ordering::SeqCst));
+    assert!(!s.has(o.key).unwrap());
+}
+
+/// A run whose only writer fails must still return. The distributor can be
+/// blocked sending into a full channel at that moment, and nothing wakes it
+/// if the writers simply leave. Run on its own thread so that a regression
+/// fails the test rather than hanging the suite.
+#[test]
+fn write_parallel_returns_when_its_writer_fails_with_the_channel_full() {
+    let (_dir, s) =
+        raw_store(Options::new().compression_for(|_, _, _| Compression::Zstd { level: 99 }));
+    let s = Arc::new(s);
+    let objs = distinct(64);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let store = Arc::clone(&s);
+    std::thread::spawn(move || {
+        let (_, res) = store.write_parallel(obj_seq(&objs, None), parallel(1));
+        let _ = tx.send(res.map_err(|e| e.is_invalid_compression()));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(res) => assert_eq!(res, Err(true), "want an invalid-compression error"),
+        Err(_) => panic!(
+            "write_parallel did not return: the distributor is stuck sending to writers that gave up"
+        ),
+    }
+}

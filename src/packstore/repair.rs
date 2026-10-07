@@ -95,11 +95,12 @@ impl Store {
         }
 
         if !found {
+            // Encode first: an object the callback rejects wrote nothing.
+            let record = self.cfg.encode(key, data)?;
             if !sync_now {
                 self.deferred
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            let record = self.cfg.encode(key, data)?;
             return self.append_locked(&mut ap, key, &record, sync_now);
         }
         if !damaged {
@@ -117,10 +118,12 @@ impl Store {
             }
             return Ok(());
         }
+        // Encode before anything changes: a replacement the callback makes
+        // impossible fails the repair with the store as it was.
+        let replacement = self.cfg.encode(key, data)?;
         // Seal from the live index before replacement. Reopening a corrupt
         // active tail would otherwise discard records after the damaged one.
         self.seal_active(&mut ap)?;
-        let replacement = self.cfg.encode(key, data)?;
         let segments = unpoison(self.shared.read()).sealed.clone();
         let mut repaired = false;
         for segment in segments {
