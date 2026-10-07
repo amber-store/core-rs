@@ -10,6 +10,9 @@ This crate is the Rust port of
 (pinned at v0.9.0, see [`PORTING.md`](PORTING.md)), intended to be embedded as a **library** in other Rust
 projects. The format is specified in [`architecture/`](architecture/).
 
+From 0.9.0 on the crate carries the version of the Go release it is at parity
+with: core-rs `X.Y.Z` and Go core `vX.Y.Z` read and write the same formats.
+
 ## Compatibility with the Go implementation
 
 The port is **byte-compatible** at the content-addressing layer and
