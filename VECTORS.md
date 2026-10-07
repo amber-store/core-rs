@@ -148,12 +148,21 @@ Records whose splitmix payloads do **not** compress (flag stays 0), so bytes
 are implementation-independent. `record_hex` present only for payloads
 ≤ 256 bytes; `record_blake3` always. Includes the empty payload.
 
-- `records_compressed.json`: Go-encoded records with compressible payloads —
+- `records_compressed.json`: Go-encoded zstd records (level 0) of compressible payloads —
   decode-only vectors (Rust must parse and recover the payload; byte equality
   is **not** expected from a Rust encoder):
 
 ```json
 { "cases": [ { "record_hex": "...", "key": "<64 hex>", "payload": {..} } ] }
+```
+
+- `records_lz4.json`: Go-encoded lz4 records of the same compressible
+  payloads, at level 0 (the fast compressor) and at level 9 (high
+  compression) — decode-only vectors, like the zstd ones (a Rust encoder
+  produces different blocks):
+
+```json
+{ "cases": [ { "record_hex": "...", "key": "<64 hex>", "payload": {..}, "level": 0 } ] }
 ```
 
 - `pack_go.bin`: a wire pack written by Go containing **every object of the

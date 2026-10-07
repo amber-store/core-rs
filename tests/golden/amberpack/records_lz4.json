@@ -1,0 +1,144 @@
+{
+  "cases": [
+    {
+      "record_hex": "01a450ab3dd26b211ed9981ea7fcad077b1a39a3ec1d619a3048b203d3e8e8030102000003e80000001af24abc7e1f000100ffffffc4000200000200b00000000000000000000000",
+      "key": "a450ab3dd26b211ed9981ea7fcad077b1a39a3ec1d619a3048b203d3e8e80301",
+      "payload": {
+        "kind": "const",
+        "byte": 0,
+        "len": 1000
+      },
+      "level": 0
+    },
+    {
+      "record_hex": "0132d1b82f869c2dc611a61aaa6167cec7a2a4937e04167d7b81ae16b74888130102000013880000002a4d28481f1fab0100ffffffffffffffffffffffffffffffffffffff74000200000200b0ababababababababababab",
+      "key": "32d1b82f869c2dc611a61aaa6167cec7a2a4937e04167d7b81ae16b748881301",
+      "payload": {
+        "kind": "const",
+        "byte": 171,
+        "len": 5000
+      },
+      "level": 0
+    },
+    {
+      "record_hex": "01ab8eef88d5f3614dfef84c9ed92b3901cc5b20b25884e3a793c33cd61020030102000003200000001e118458211f110100ff7d1f220100ff6b000200e02222222222222222222222222222",
+      "key": "ab8eef88d5f3614dfef84c9ed92b3901cc5b20b25884e3a793c33cd610200301",
+      "payload": {
+        "kind": "concat",
+        "parts": [
+          {
+            "kind": "const",
+            "byte": 17,
+            "len": 400
+          },
+          {
+            "kind": "const",
+            "byte": 34,
+            "len": 400
+          }
+        ]
+      },
+      "level": 0
+    },
+    {
+      "record_hex": "016c4534e069a0e6697d19f864ec1d110b650ee9f3bb5afa98f597704022ba130102000013ba0000005e349f8425ff25940e28203a3f4902075fae2e76a1f0fe2cbee390d865da376e69a6a192ed07efdc53ad3d2b05f42fa0b81ede5bcc7057d9d500000200ffffffffffffffffffffffffffffffffffffff74000200e00000000000000000000000000000",
+      "key": "6c4534e069a0e6697d19f864ec1d110b650ee9f3bb5afa98f597704022ba1301",
+      "payload": {
+        "kind": "concat",
+        "parts": [
+          {
+            "kind": "splitmix",
+            "seed": 710,
+            "len": 50
+          },
+          {
+            "kind": "const",
+            "byte": 0,
+            "len": 5000
+          }
+        ]
+      },
+      "level": 0
+    },
+    {
+      "record_hex": "01a3727b640536d3f7fe008cce8b817e8fece7b589b855bd6056bd7c93400d03020200030d40000003271c37dbff1f420100ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff29000200000200b04242424242424242424242",
+      "key": "a3727b640536d3f7fe008cce8b817e8fece7b589b855bd6056bd7c93400d0302",
+      "payload": {
+        "kind": "const",
+        "byte": 66,
+        "len": 200000
+      },
+      "level": 0
+    },
+    {
+      "record_hex": "01a450ab3dd26b211ed9981ea7fcad077b1a39a3ec1d619a3048b203d3e8e8030102000003e8000000189354fc012f00000100ffffffc8e00000000000000000000000000000",
+      "key": "a450ab3dd26b211ed9981ea7fcad077b1a39a3ec1d619a3048b203d3e8e80301",
+      "payload": {
+        "kind": "const",
+        "byte": 0,
+        "len": 1000
+      },
+      "level": 9
+    },
+    {
+      "record_hex": "0132d1b82f869c2dc611a61aaa6167cec7a2a4937e04167d7b81ae16b7488813010200001388000000280ab814d22fabab0100ffffffffffffffffffffffffffffffffffffff78e0abababababababababababababab",
+      "key": "32d1b82f869c2dc611a61aaa6167cec7a2a4937e04167d7b81ae16b748881301",
+      "payload": {
+        "kind": "const",
+        "byte": 171,
+        "len": 5000
+      },
+      "level": 9
+    },
+    {
+      "record_hex": "01ab8eef88d5f3614dfef84c9ed92b3901cc5b20b25884e3a793c33cd6102003010200000320000000158faddf802f11110100ff7c1f220100ff767022222222222222",
+      "key": "ab8eef88d5f3614dfef84c9ed92b3901cc5b20b25884e3a793c33cd610200301",
+      "payload": {
+        "kind": "concat",
+        "parts": [
+          {
+            "kind": "const",
+            "byte": 17,
+            "len": 400
+          },
+          {
+            "kind": "const",
+            "byte": 34,
+            "len": 400
+          }
+        ]
+      },
+      "level": 9
+    },
+    {
+      "record_hex": "016c4534e069a0e6697d19f864ec1d110b650ee9f3bb5afa98f597704022ba130102000013ba0000005365c1276eff24940e28203a3f4902075fae2e76a1f0fe2cbee390d865da376e69a6a192ed07efdc53ad3d2b05f42fa0b81ede5bcc7057d9d5000100ffffffffffffffffffffffffffffffffffffff807000000000000000",
+      "key": "6c4534e069a0e6697d19f864ec1d110b650ee9f3bb5afa98f597704022ba1301",
+      "payload": {
+        "kind": "concat",
+        "parts": [
+          {
+            "kind": "splitmix",
+            "seed": 710,
+            "len": 50
+          },
+          {
+            "kind": "const",
+            "byte": 0,
+            "len": 5000
+          }
+        ]
+      },
+      "level": 9
+    },
+    {
+      "record_hex": "01a3727b640536d3f7fe008cce8b817e8fece7b589b855bd6056bd7c93400d03020200030d4000000325487e92cb2f42420100ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff2de04242424242424242424242424242",
+      "key": "a3727b640536d3f7fe008cce8b817e8fece7b589b855bd6056bd7c93400d0302",
+      "payload": {
+        "kind": "const",
+        "byte": 66,
+        "len": 200000
+      },
+      "level": 9
+    }
+  ]
+}

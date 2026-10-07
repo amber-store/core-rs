@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/packstore"
 )
@@ -37,7 +38,8 @@ type segmentsManifest struct {
 // seal" on-disk state: an active segment with valid records and no footer.
 func genSegments(outDir string) error {
 	dir := filepath.Join(outDir, "segments_go")
-	st, err := packstore.Open(dir, packstore.WithSegmentSize(segmentSize), packstore.WithSync(false))
+	st, err := packstore.Open(dir, packstore.WithSegmentSize(segmentSize), packstore.WithSync(false),
+		packstore.WithCompression(amberpack.Compression{Algorithm: amberpack.Zstd}))
 	if err != nil {
 		return err
 	}

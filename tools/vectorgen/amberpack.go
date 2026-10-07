@@ -32,10 +32,26 @@ type compressedRecordsFile struct {
 	Cases []compressedRecordCase `json:"cases"`
 }
 
+type lz4RecordCase struct {
+	RecordHex string  `json:"record_hex"`
+	Key       string  `json:"key"`
+	Payload   Payload `json:"payload"`
+	Level     int     `json:"level"`
+}
+
+type lz4RecordsFile struct {
+	Cases []lz4RecordCase `json:"cases"`
+}
+
+// zstdDefault is what the Go encoder did before compression became a choice;
+// the vectors generated then are generated with it still.
+var zstdDefault = amberpack.Compression{Algorithm: amberpack.Zstd}
+
 // recFlags returns the flag byte of an encoded record.
 func recFlags(rec []byte) byte { return rec[33] }
 
 // genAmberpack writes amberpack/records_raw.json, records_compressed.json,
+// records_lz4.json,
 // pack_go.bin (every golden-fstree object, manifest order) and pack_empty.bin.
 func genAmberpack(outDir string, tree *goldenTree) error {
 	dir := filepath.Join(outDir, "amberpack")
@@ -107,11 +123,11 @@ func genAmberpack(outDir string, tree *goldenTree) error {
 		if err != nil {
 			return err
 		}
-		rec, err := amberpack.EncodeRecord(k, data)
+		rec, err := amberpack.EncodeRecordWith(k, data, zstdDefault)
 		if err != nil {
 			return err
 		}
-		if recFlags(rec)&0x01 == 0 {
+		if recFlags(rec) != 0x01 {
 			return fmt.Errorf("records_compressed: payload %v did not compress", p)
 		}
 		comp.Cases = append(comp.Cases, compressedRecordCase{
@@ -124,13 +140,42 @@ func genAmberpack(outDir string, tree *goldenTree) error {
 		return err
 	}
 
+	// --- records_lz4.json: the same compressible payloads as lz4 records, at
+	// the fast level and at an HC level; decode-only vectors for Rust.
+	lz4File := lz4RecordsFile{}
+	for _, level := range []int{0, 9} {
+		for _, p := range compCases {
+			data := p.Materialize()
+			k, err := key.New(key.Blob, uint64(len(data)), data)
+			if err != nil {
+				return err
+			}
+			rec, err := amberpack.EncodeRecordWith(k, data, amberpack.Compression{Algorithm: amberpack.LZ4, Level: level})
+			if err != nil {
+				return err
+			}
+			if recFlags(rec) != 0x02 {
+				return fmt.Errorf("records_lz4: payload %v at level %d did not compress", p, level)
+			}
+			lz4File.Cases = append(lz4File.Cases, lz4RecordCase{
+				RecordHex: hex.EncodeToString(rec),
+				Key:       k.String(),
+				Payload:   p,
+				Level:     level,
+			})
+		}
+	}
+	if err := writeJSON(filepath.Join(dir, "records_lz4.json"), lz4File); err != nil {
+		return err
+	}
+
 	// --- pack_go.bin: a wire pack of every golden-fstree object in manifest
 	// order.
 	packF, err := os.Create(filepath.Join(dir, "pack_go.bin"))
 	if err != nil {
 		return err
 	}
-	w := amberpack.NewWriter(packF)
+	w := amberpack.NewWriter(packF, amberpack.WithCompression(zstdDefault))
 	for _, k := range tree.sorted {
 		if err := w.Add(fstree.Object{Key: k, Bytes: tree.objs[k]}); err != nil {
 			packF.Close()

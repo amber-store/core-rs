@@ -6,7 +6,8 @@ mod common;
 use std::collections::HashMap;
 
 use amber_store_core::amberpack::{
-    REC_HEADER_SIZE, Reader, Writer, decode_payload, encode_record, parse_record,
+    Compression, REC_HEADER_SIZE, Reader, Writer, decode_payload, encode_record,
+    encode_record_with, parse_record,
 };
 use amber_store_core::key::Key;
 
@@ -140,11 +141,71 @@ fn golden_records_compressed() {
         assert_eq!(got, payload, "case {i}: Go payload round-trip");
 
         // Rust re-encode: compresses too (flag 1) and round-trips.
-        let enc = encode_record(k, &payload).unwrap_or_else(|e| panic!("case {i}: encode: {e}"));
+        let enc = encode_record_with(k, &payload, Compression::Zstd { level: 0 })
+            .unwrap_or_else(|e| panic!("case {i}: encode: {e}"));
         assert_eq!(enc[33], 1, "case {i}: Rust encoder must set the zstd flag");
         let r2 = parse_record(&enc).unwrap_or_else(|e| panic!("case {i}: parse own record: {e}"));
         assert_eq!(r2.key, k, "case {i}: own key");
         assert_eq!(r2.flags, 1, "case {i}: own flags");
+        let got2 = decode_payload(r2.flags, r2.ulen, &enc[REC_HEADER_SIZE..])
+            .unwrap_or_else(|e| panic!("case {i}: decode own payload: {e}"));
+        assert_eq!(got2, payload, "case {i}: own payload round-trip");
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Lz4File {
+    cases: Vec<Lz4Case>,
+}
+
+#[derive(serde::Deserialize)]
+struct Lz4Case {
+    record_hex: String,
+    key: String,
+    payload: common::Payload,
+    level: i32,
+}
+
+/// Go-encoded lz4 records, at the fast level and at an HC level: parse +
+/// decode recovers the payload exactly. A Rust re-encode at the same level is
+/// NOT byte-compared (liblz4 and Go's pierrec/lz4 produce different blocks),
+/// but it must carry codec 2 and round-trip.
+#[test]
+fn golden_records_lz4() {
+    let Some(bytes) = common::load("amberpack/records_lz4.json") else {
+        return;
+    };
+    let file: Lz4File = serde_json::from_slice(&bytes).expect("records_lz4.json parses");
+    assert!(!file.cases.is_empty(), "records_lz4.json has no cases");
+    let levels: std::collections::BTreeSet<i32> = file.cases.iter().map(|c| c.level).collect();
+    assert!(
+        levels.contains(&0) && levels.len() > 1,
+        "want the fast level and an HC level"
+    );
+
+    for (i, c) in file.cases.iter().enumerate() {
+        let k = parse_key(&c.key, &format!("case {i}"));
+        let payload = c.payload.bytes();
+        let rec = hex::decode(&c.record_hex).unwrap_or_else(|e| panic!("case {i}: hex: {e}"));
+
+        let r = parse_record(&rec).unwrap_or_else(|e| panic!("case {i}: parse Go record: {e}"));
+        assert_eq!(r.key, k, "case {i}: key");
+        assert_eq!(r.flags, 2, "case {i}: Go record must carry the lz4 codec");
+        assert_eq!(r.ulen as usize, payload.len(), "case {i}: ulen");
+        assert!(r.slen < r.ulen, "case {i}: compressed slen < ulen");
+        assert_eq!(
+            rec.len(),
+            REC_HEADER_SIZE + r.slen as usize,
+            "case {i}: record length"
+        );
+        let got = decode_payload(r.flags, r.ulen, &rec[REC_HEADER_SIZE..])
+            .unwrap_or_else(|e| panic!("case {i}: decode Go payload: {e}"));
+        assert_eq!(got, payload, "case {i}: Go payload round-trip");
+
+        let enc = encode_record_with(k, &payload, Compression::Lz4 { level: c.level })
+            .unwrap_or_else(|e| panic!("case {i}: encode: {e}"));
+        let r2 = parse_record(&enc).unwrap_or_else(|e| panic!("case {i}: parse own record: {e}"));
+        assert_eq!(r2.flags, 2, "case {i}: own flags");
         let got2 = decode_payload(r2.flags, r2.ulen, &enc[REC_HEADER_SIZE..])
             .unwrap_or_else(|e| panic!("case {i}: decode own payload: {e}"));
         assert_eq!(got2, payload, "case {i}: own payload round-trip");
