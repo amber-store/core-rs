@@ -124,7 +124,12 @@ impl Store {
         // for a writer that can use it. One whose header never arrived is
         // taken: it gets this store's.
         let mut header = [0u8; MAGIC_HEADER.len()];
-        let has_header = f.read_exact_at(&mut header, 0).is_ok() && is_header(&header);
+        let has_header = match f.read_exact_at(&mut header, 0) {
+            Ok(()) => is_header(&header),
+            // Short is fine: the header never arrived.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => false,
+            Err(e) => return Err(e.into()),
+        };
         if has_header && header[MAGIC_HEADER.len() - 1] < min_version {
             return Ok(false);
         }
@@ -146,7 +151,15 @@ impl Store {
             return Ok(false);
         }
         let header_len = MAGIC_HEADER.len() as u64;
-        // Recovery accepted the file, so what was read above is a header.
+        if res.data_end >= header_len as i64 && !has_header {
+            // Recovery found records behind something that is not a header
+            // this release reads: it cannot have, and nothing may be
+            // appended here.
+            return Err(super::corrupt(format!(
+                "{}: records behind an unreadable header",
+                path.display()
+            )));
+        }
         let mut version = header[MAGIC_HEADER.len() - 1];
         let size = if res.data_end < header_len as i64 {
             // The header never became durable, so nothing in the file was

@@ -85,18 +85,19 @@ pub(crate) fn check_version(b: &[u8]) -> Result<(), Error> {
 }
 
 /// Segment format versions: the last byte of a segment's header. The two
-/// have the same layout. A segment at `VERSION_ANY_CODEC` may hold records
-/// of every codec; one at `VERSION_BASE` holds only raw and zstd records,
+/// have the same layout; the version says which codecs the segment's records
+/// may use. A segment at `VERSION_BASE` holds only raw and zstd records,
 /// which is all that releases up to 0.9.0 read. Those releases refuse a
-/// segment at any version but `VERSION_BASE`, and would misread an lz4
-/// record in one they accept, so a record beyond zstd is only ever written
-/// to a segment at `VERSION_ANY_CODEC` (architecture/packstore.md; Go:
-/// `versionBase`, `versionAnyCodec`).
+/// segment at any other version, and would misread an lz4 record in one they
+/// accept, so an lz4 record is only ever written to a segment at
+/// `VERSION_LZ4`. A later codec takes a later version in the same way: a
+/// release must refuse the segments whose records it cannot read
+/// (architecture/packstore.md; Go: `versionBase`, `versionLZ4`).
 pub(crate) const VERSION_BASE: u8 = 2;
-pub(crate) const VERSION_ANY_CODEC: u8 = 3;
+pub(crate) const VERSION_LZ4: u8 = 3;
 
 fn reads_version(v: u8) -> bool {
-    v == VERSION_BASE || v == VERSION_ANY_CODEC
+    v == VERSION_BASE || v == VERSION_LZ4
 }
 
 /// Reports whether `b` is a segment header of a version this release reads
@@ -117,7 +118,7 @@ pub(crate) fn header_at(version: u8) -> [u8; 8] {
 /// byte (Go: `versionFor`).
 pub(crate) fn version_for(flags: u8) -> u8 {
     if flags > amberpack::CODEC_ZSTD {
-        VERSION_ANY_CODEC
+        VERSION_LZ4
     } else {
         VERSION_BASE
     }
@@ -180,7 +181,7 @@ pub enum Error {
     /// byte: data written by a release with a different layout. Such a file
     /// is neither read nor modified (Go: `ErrUnsupportedVersion`).
     #[error(
-        "packstore: unsupported segment format version: {found}, this release reads {VERSION_BASE} and {VERSION_ANY_CODEC}"
+        "packstore: unsupported segment format version: {found}, this release reads {VERSION_BASE} and {VERSION_LZ4}"
     )]
     UnsupportedVersion {
         /// The version byte the segment carries.
@@ -713,38 +714,42 @@ impl Store {
                 return Err(Error::Failed(msg.clone()));
             }
         }
-        // A record beyond zstd goes into a segment at VERSION_ANY_CODEC only,
-        // and a store that has written one stays at that version: it leaves
-        // a segment early once, not once per segment.
+        // An lz4 record goes into a segment at VERSION_LZ4 only, and a store
+        // that has written one stays at that version: it leaves a segment
+        // early once, not once per segment.
         let need = version_for(rec[33]);
         ap.seg_version = ap.seg_version.max(need);
-        self.ensure_active(ap)?;
-        let Some(aw) = ap.active.as_mut() else {
-            return Err(Error::Closed); // unreachable: ensure_active succeeded
-        };
-        if unpoison(aw.seg.index.read()).contains_key(&k) {
-            // Lost a Put race for this key; the record is already appended.
-            // The winner may have been a deferred put, which has not
-            // synced it.
-            if sync_now && self.cfg.sync && self.deferred.load(Ordering::SeqCst) {
-                if let Err(e) = aw.seg.f.sync_all() {
-                    self.set_failed(&e);
-                    return Err(e.into());
+        loop {
+            self.ensure_active(ap)?;
+            let Some(aw) = ap.active.as_mut() else {
+                return Err(Error::Closed); // unreachable: ensure_active succeeded
+            };
+            if unpoison(aw.seg.index.read()).contains_key(&k) {
+                // Lost a Put race for this key, or took over a segment that
+                // holds it: the record is already appended. Whoever appended
+                // it may have been a deferred put, which has not synced it.
+                if sync_now && self.cfg.sync && self.deferred.load(Ordering::SeqCst) {
+                    if let Err(e) = aw.seg.f.sync_all() {
+                        self.set_failed(&e);
+                        return Err(e.into());
+                    }
+                    aw.sidecar_synced();
+                    self.deferred.store(false, Ordering::SeqCst);
                 }
-                aw.sidecar_synced();
-                self.deferred.store(false, Ordering::SeqCst);
+                return Ok(());
             }
-            return Ok(());
-        }
-        if aw.version < need {
+            if aw.version >= need {
+                break;
+            }
             // The segment this store holds may not take the record. Its
             // header is never rewritten: an older release that has read it
-            // would go on to misread what follows.
+            // would go on to misread what follows. The segment taken instead
+            // is checked for the key like any other: it may be one somebody
+            // left behind.
             self.leave_active(ap)?;
-            self.ensure_active(ap)?;
         }
         let Some(aw) = ap.active.as_mut() else {
-            return Err(Error::Closed); // unreachable: ensure_active succeeded
+            return Err(Error::Closed); // unreachable: the loop left one in place
         };
         let off = aw.size;
         aw.seg.f.write_all_at(rec, off)?;

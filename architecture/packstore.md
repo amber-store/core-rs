@@ -35,23 +35,31 @@ over their first 8 bytes: both rely on a key leading with its hash.
 The last byte of the header is the format version. There are two, `\x02` and
 `\x03`, with the same layout: they differ in the records they may hold. A
 version-2 segment holds only raw and zstd records; a version-3 segment may
-hold records of any codec ([amberpack.md](amberpack.md#the-record)). The
+hold lz4 records as well ([amberpack.md](amberpack.md#the-record)). The
 reason is the releases up to 0.9.0. They read version 2 alone, and they would
 misread an lz4 record in a segment they accept: their read path returns the
 lz4 block as the object's bytes, and their scan of an active segment
-truncates at the first one. A segment they refuse they leave alone. So a
-record beyond zstd is only ever written to a version-3 segment, and a store
-that has taken one is refused by those releases as a whole, at open.
+truncates at the first one. A segment they refuse they leave alone. So an
+lz4 record is only ever written to a version-3 segment, and a store that
+holds such a segment is refused by those releases as a whole, at open. A
+later codec takes a later version in the same way: a release has to refuse
+the segments whose records it cannot read, and this one too would take a
+record of a codec it does not know for a torn tail.
 
 A writer creates version-2 segments, unless its compression setting is lz4,
-in which case it creates version-3 ones from the start. When a record beyond
-zstd is about to be appended to a version-2 segment — whether the writer
+in which case it creates version-3 ones from the start. When an lz4 record
+is about to be appended to a version-2 segment — whether the writer
 encoded it, was handed it encoded, or is copying it in a compaction — the
 writer leaves that segment, sealing it or, if it is empty, letting go of it
 as it is, and continues in a version-3 one. From then on it creates version-3
 segments, so it pays for one early seal and not for one per segment. A header
-is never rewritten: a running older release may already have read it. A
-store that never takes such a record stays at version 2.
+is never rewritten: a running older release may already have read it. The
+segment the writer continues in is checked for the record like any other: it
+may be one somebody left behind. An empty version-2 segment that was let go
+stays where it is until a version-2 writer takes it. A segment whose header
+never arrived, which its next writer starts over, gets that writer's version.
+A store whose writers are never set to lz4 and never take an lz4 record stays
+at version 2.
 
 Version `\x01` held keys
 in their earlier byte order (header byte first), indexed and filtered on their
@@ -316,11 +324,14 @@ above:
 - **Refuse a segment of a format version other than 2 and 3** and leave it as
   it is; only a header that is missing or not this format's magic at all may
   be reset.
-- **A record beyond zstd only in a version-3 segment.** Never append one to a
+- **An lz4 record only in a version-3 segment.** Never append one to a
   version-2 segment, and never rewrite a header: leave the segment and
-  continue in a version-3 one. A repair that rewrites a sealed segment keeps
-  its version, raised to 3 when the replacement record needs it. A scrub
-  reports such a record in a version-2 segment as corruption.
+  continue in a version-3 one, checking it for the record first. A repair
+  that rewrites a sealed segment keeps its version, raised to 3 when the
+  replacement record needs it. A scrub, which covers sealed segments, reports
+  an lz4 record in a version-2 one as corruption. Sealing idle segments for a
+  compaction takes them whatever their version. A later codec needs a later
+  version.
 
 The **sealed footer** (index section, filter, trailer) is older than this
 document and is not laid out here yet; `packstore/footer.go` is the reference.

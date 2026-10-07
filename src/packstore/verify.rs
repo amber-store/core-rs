@@ -54,14 +54,11 @@ impl SealedSegment {
                 verify: false,
             })?;
             if version_for(rec.flags) > self.version() {
-                return Err(Error::Corrupt {
-                    msg: format!(
-                        "amberpack: corrupt pack data: {path}: record at offset {off}: codec {} in a version-{} segment",
-                        rec.flags,
-                        self.version()
-                    ),
-                    verify: false,
-                });
+                return Err(super::corrupt(format!(
+                    "{path}: record at offset {off}: codec {} in a version-{} segment",
+                    rec.flags,
+                    self.version()
+                )));
             }
             let payload_at = off + REC_HEADER_SIZE;
             let payload = decode_payload(

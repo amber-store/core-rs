@@ -376,3 +376,93 @@ fn open_refuses_a_version_beyond_the_ones_it_reads() {
     let err = Store::open(dir.path()).expect_err("a version-4 segment must be refused");
     assert!(err.is_unsupported_version(), "{err}");
 }
+
+/// A handle has to leave its version-2 segment for an lz4 record and, in
+/// doing so, adopts a version-3 segment another writer left behind — one
+/// that already holds that very record, not yet known durable. The record
+/// must not be appended to the segment a second time: a sealed segment with
+/// a key twice fails the scrub (Go:
+/// `TestLeavingForAVersion3SegmentChecksItForTheKey`).
+#[test]
+fn leaving_for_a_version_3_segment_checks_it_for_the_key() {
+    let dir = TempDir::new().unwrap();
+    let objs = distinct(2);
+    let (k0, k1) = (&objs[0], &objs[1]);
+
+    // W writes k1 as lz4 without syncing and stays open: its version-3
+    // segment is taken, so H below has to make one of its own.
+    let w = Store::open_with(dir.path(), Options::new().sync(false).compression(LZ4)).unwrap();
+    w.put(k1.key, &k1.data).unwrap();
+
+    let lz4_on = Arc::new(AtomicBool::new(false));
+    let h = Store::open_with(dir.path(), switchable(&lz4_on).sync(true)).unwrap();
+    h.put(k0.key, &k0.data).unwrap();
+    w.close().unwrap();
+
+    // H now puts k1 as lz4: it leaves its version-2 segment and adopts W's.
+    lz4_on.store(true, Ordering::SeqCst);
+    h.put(k1.key, &k1.data).unwrap();
+
+    let records: usize = sealed_files(dir.path())
+        .into_iter()
+        .chain(active_files(dir.path()))
+        .map(|p| segment_records(&p).1.len())
+        .sum();
+    assert_eq!(records, 2, "{:?}", segment_versions(dir.path()));
+    // Sealed, the segment must pass the scrub.
+    {
+        let mut ap = h.append_lock();
+        h.seal_active(&mut ap).unwrap();
+    }
+    h.verify(|| false).unwrap();
+    must_get(&h, k0);
+    must_get(&h, k1);
+}
+
+/// Two lz4 records in a version-3 segment; one is damaged and repaired with
+/// a zstd replacement. The other lz4 record is still there, so the segment
+/// must stay at version 3 (Go: `TestRepairKeepsTheVersionOfAVersion3Segment`).
+#[test]
+fn repair_keeps_the_version_of_a_version_3_segment() {
+    let lz4_on = Arc::new(AtomicBool::new(true));
+    let dir = TempDir::new().unwrap();
+    let s = Store::open_with(dir.path(), switchable(&lz4_on)).unwrap();
+    let objs = distinct(2);
+    for o in &objs {
+        s.put(o.key, &o.data).unwrap();
+    }
+    {
+        let mut ap = s.append_lock();
+        s.seal_active(&mut ap).unwrap();
+    }
+    let path = sealed_files(dir.path()).remove(0);
+    assert_eq!(segment_records(&path), (3, vec![CODEC_LZ4, CODEC_LZ4]));
+    // The first record's payload starts right behind the segment header and
+    // the record header.
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[MAGIC_HEADER.len() + REC_HEADER_SIZE] ^= 0x40;
+    fs::write(&path, bytes).unwrap();
+
+    lz4_on.store(false, Ordering::SeqCst);
+    assert!(
+        s.verify(|| false).is_err(),
+        "the damage must be visible to the scrub"
+    );
+    for o in &objs {
+        s.put_verified(o.key, &o.data).unwrap();
+    }
+    let (version, codecs) = segment_records(&path);
+    assert_eq!(
+        version, 3,
+        "a repair must not lower the version: {codecs:?}"
+    );
+    assert_eq!(codecs.len(), 2);
+    assert!(
+        codecs.contains(&CODEC_ZSTD) && codecs.contains(&CODEC_LZ4),
+        "{codecs:?}"
+    );
+    for o in &objs {
+        must_get(&s, o);
+    }
+    s.verify(|| false).unwrap();
+}

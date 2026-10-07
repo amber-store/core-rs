@@ -61,12 +61,12 @@ returns the lz4 block itself as the object's bytes, without an error. And when
 it indexes an active segment by scanning it, it takes the first lz4 record for
 a torn tail and truncates the segment there at its next write, losing that
 record and every one after it. Such a release must therefore never read a
-segment that holds one, and the segment format sees to it: a record beyond
-zstd is only ever written to a segment at format version 3, which those
-releases refuse — the whole store, at open, without touching it
-([packstore.md](packstore.md)). A store that never takes an lz4 record stays
-at version 2 and stays readable by them. A later algorithm takes the next id
-and goes into version-3 segments as well.
+segment that holds one, and the segment format sees to it: an lz4 record is
+only ever written to a segment at format version 3, which those releases
+refuse — the whole store, at open, without touching it
+([packstore.md](packstore.md)). A store that is never written to with lz4
+stays at version 2 and stays readable by them. A later algorithm takes the
+next codec id and, for the same reason, a segment version of its own.
 
 **The CRC covers the whole record with its own field zeroed.** It is computed
 over bytes `[0:42]`, then four zero bytes standing in for the `crc` field, then
