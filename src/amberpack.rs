@@ -11,8 +11,8 @@
 //! End      0x00
 //! ```
 //!
-//! Each record is the same self-describing, CRC-protected, individually compressed unit
-//! packstore writes on disk; a wire pack is just those records framed by a
+//! Each record is the same self-describing, CRC-protected, individually
+//! compressed unit packstore writes on disk; a wire pack is just those records framed by a
 //! magic and an explicit end marker, so a truncated stream is detected rather
 //! than read as a clean EOF. The [`Reader`] validates framing, CRC, and key
 //! canonicality and decodes each payload (its `Iterator` impl, Go's `All`), or
@@ -423,6 +423,7 @@ pub fn decode_payload(flags: u8, ulen: u32, stored: &[u8]) -> Result<Vec<u8>, Er
 pub struct Writer<W: Write> {
     bw: BufWriter<W>,
     wrote_header: bool,
+    compression: Compression,
 }
 
 impl<W: Write> Writer<W> {
@@ -433,7 +434,17 @@ impl<W: Write> Writer<W> {
         Writer {
             bw: BufWriter::new(w),
             wrote_header: false,
+            compression: Compression::None,
         }
+    }
+
+    /// Sets the compression [`Writer::add`] encodes with. The default is no
+    /// compression. An invalid value fails every `add` with
+    /// [`Error::InvalidCompression`]. [`Writer::add_record`] is unaffected:
+    /// it writes records as given (Go: `WithCompression`).
+    pub fn compression(mut self, c: Compression) -> Writer<W> {
+        self.compression = c;
+        self
     }
 
     fn ensure_header(&mut self) -> Result<(), Error> {
@@ -448,7 +459,7 @@ impl<W: Write> Writer<W> {
     /// Appends one object record.
     pub fn add(&mut self, k: Key, data: &[u8]) -> Result<(), Error> {
         self.ensure_header()?;
-        let rec = encode_record(k, data)?;
+        let rec = encode_record_with(k, data, self.compression)?;
         self.bw.write_all(&rec)?;
         Ok(())
     }
@@ -1009,7 +1020,7 @@ mod tests {
             (mk_key(b"alpha"), b"alpha".to_vec()),
             (mk_key(&big), big.clone()),
         ];
-        let mut w = Writer::new(Vec::new());
+        let mut w = Writer::new(Vec::new()).compression(ZSTD);
         for (k, p) in &objs {
             w.add(*k, p).unwrap();
         }
@@ -1035,7 +1046,7 @@ mod tests {
             vec![(mk_key(b"alpha"), b"alpha".to_vec()), (mk_key(&big), big)];
         let mut w = Writer::new(Vec::new());
         for (k, p) in &objs {
-            let rec = encode_record(*k, p).unwrap();
+            let rec = encode_record_with(*k, p, ZSTD).unwrap();
             w.add_record(&rec).unwrap();
         }
         let buf = w.finish().unwrap();
@@ -1209,10 +1220,10 @@ mod tests {
             (mk_key(&big), big), // compressed on disk
             (mk_key(&noise), noise),
         ];
-        let mut w = Writer::new(Vec::new());
+        let mut w = Writer::new(Vec::new()).compression(ZSTD);
         let mut want = Vec::new();
         for (i, (k, p)) in objs.iter().enumerate() {
-            let rec = encode_record(*k, p).unwrap();
+            let rec = encode_record_with(*k, p, ZSTD).unwrap();
             if i % 2 == 0 {
                 w.add(*k, p).unwrap();
             } else {
@@ -1519,6 +1530,84 @@ mod tests {
         for flags in [3u8, 0x80, 0xff] {
             let err = decode_payload(flags, 4, &[1, 2, 3, 4]).unwrap_err();
             assert!(err.is_corrupt(), "flags {flags:#x}: {err}");
+        }
+    }
+
+    /// The codec id of every record in a wire pack, in order.
+    fn pack_codecs(pack: &[u8]) -> Vec<u8> {
+        Reader::new(pack)
+            .records()
+            .map(|r| r.unwrap().record.flags)
+            .collect()
+    }
+
+    #[test]
+    fn writer_stores_raw_by_default() {
+        let big = b"amber".repeat(50_000);
+        let mut w = Writer::new(Vec::new());
+        w.add(mk_key(&big), &big).unwrap();
+        let out = w.finish().unwrap();
+        assert_eq!(pack_codecs(&out), [CODEC_RAW]);
+        assert!(out.len() >= big.len());
+    }
+
+    #[test]
+    fn writer_with_compression() {
+        let big = b"amber".repeat(50_000);
+        for c in [
+            Compression::Zstd { level: 0 },
+            Compression::Zstd { level: 19 },
+            Compression::Lz4 { level: 0 },
+            Compression::Lz4 { level: 9 },
+        ] {
+            let mut w = Writer::new(Vec::new()).compression(c);
+            w.add(mk_key(&big), &big).unwrap();
+            let out = w.finish().unwrap();
+            assert_eq!(pack_codecs(&out), [c.codec()], "{c}");
+            let objs = collect(Reader::new(&out[..])).unwrap();
+            assert_eq!(objs, vec![(mk_key(&big), big.clone())], "{c}");
+        }
+    }
+
+    #[test]
+    fn reader_reads_a_pack_that_mixes_codecs() {
+        let objs = [
+            b"raw ".repeat(5000),
+            b"zstd ".repeat(5000),
+            b"lz4 ".repeat(5000),
+            Vec::new(),
+        ];
+        let settings = [
+            Compression::None,
+            Compression::Zstd { level: 0 },
+            Compression::Lz4 { level: 0 },
+            Compression::Lz4 { level: 9 },
+        ];
+        let mut w = Writer::new(Vec::new());
+        for (data, c) in objs.iter().zip(settings) {
+            w.add_record(&encode_record_with(mk_key(data), data, c).unwrap())
+                .unwrap();
+        }
+        let out = w.finish().unwrap();
+        // The empty object cannot shrink.
+        assert_eq!(
+            pack_codecs(&out),
+            [CODEC_RAW, CODEC_ZSTD, CODEC_LZ4, CODEC_RAW]
+        );
+        let got = collect(Reader::new(&out[..])).unwrap();
+        let want: Vec<_> = objs.iter().map(|d| (mk_key(d), d.clone())).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn writer_with_invalid_compression_fails_add() {
+        let mut w = Writer::new(Vec::new()).compression(Compression::Zstd { level: 99 });
+        for _ in 0..2 {
+            assert!(
+                w.add(mk_key(b"alpha"), b"alpha")
+                    .unwrap_err()
+                    .is_invalid_compression()
+            );
         }
     }
 }
