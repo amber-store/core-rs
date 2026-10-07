@@ -180,3 +180,10 @@ is written by the same code with zstd and stays byte for byte what it was, at
 version 2. Generated at the Go branch's head with the gate, pseudo-version
 `v0.9.1-0.20261007220247-65990e8b1c8d`; a full regeneration there
 reproduced every file.
+
+## Go v0.10.0 (2026-10-08)
+
+The pin moved from the branch's pseudo-version to the release, `v0.10.0`
+(`927d502`, the merge of Go PR #26). A full regeneration into a scratch
+directory at that pin reproduced all 25 files of `tests/golden` byte for
+byte. `vectorgen` itself did not change with the pin.

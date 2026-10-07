@@ -7,7 +7,7 @@ its content.
 
 This crate is the Rust port of
 [`github.com/amber-store/core`](https://github.com/amber-store/core)
-(pinned at v0.9.0, see [`PORTING.md`](PORTING.md)), intended to be embedded as a **library** in other Rust
+(pinned at v0.10.0, see [`PORTING.md`](PORTING.md)), intended to be embedded as a **library** in other Rust
 projects. The format is specified in [`architecture/`](architecture/).
 
 From 0.9.0 on the crate carries the version of the Go release it is at parity
