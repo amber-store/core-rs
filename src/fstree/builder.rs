@@ -423,12 +423,12 @@ mod tests {
         // key ‖ bytes in emit order.
         assert_eq!(
             root.to_string(),
-            "3202461152e56c8a9ed1aa2ad5656f2b117ebc7e685f539c432f815c05a51f37"
+            "2eb3469c97cfd45b01f15676971bffee226a981bde1ab0dcc09aaaa8c54a0232"
         );
-        assert_eq!(c.objs.len(), 1257, "emitted object count");
+        assert_eq!(c.objs.len(), 1285, "emitted object count");
         assert_eq!(
             c.digest_hex(),
-            "4a9b0c0846cb507a873425ab4b34cc0ee9cdf56d0a6c18b37fbe5054c1962b38"
+            "d787aaa22ca0d59e709d030b3e6daa07d4780174d420d08018cd8d812f766134"
         );
     }
 
@@ -450,12 +450,12 @@ mod tests {
         let root = db.finish(&mut c.emit()).unwrap();
         assert_eq!(
             root.to_string(),
-            "202b28b4dde93f1191318271713dc55c16a0fa32522a1913cb83066b7309b7ae"
+            "aeb709736b0683cb13192a5232faa0165cc53d7171823191113fe9ddb4282b20"
         );
         assert_eq!(c.objs.len(), 1);
         assert_eq!(
             c.digest_hex(),
-            "550c64f87004407800260e3efffaee6423c15fb7e3b35c9ad191d695933be778"
+            "d4be5b7be50d62feae51e3a5edecd76988eb6263b65e6d28cf2e94a0b4fd52c0"
         );
     }
 
@@ -515,13 +515,13 @@ mod tests {
         // Differential oracle (Go at the pinned commit).
         assert_eq!(
             root.to_string(),
-            "121e886843c684a13438af8c12ece3155512d7631aa0ab48dc0e05fb9a57e4ce"
+            "2868a1999f0876f338b1ff9ecb8ebc918ac3256ff049c7ed9d33973768881e12"
         );
         assert_eq!(root.length(), 2_001_000, "Σ blob sizes 1..=2000");
-        assert_eq!(c.objs.len(), 482, "emitted object count");
+        assert_eq!(c.objs.len(), 484, "emitted object count");
         assert_eq!(
             c.digest_hex(),
-            "ebc6d63710b1c5308b777729f1ea20fe9431e874b1be3aeac2e51fb558838fb6"
+            "85bc39bd1b5482c0583a80a084b117d162b005873b72b25bbad42a6dee2f5a2d"
         );
     }
 

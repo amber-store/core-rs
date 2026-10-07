@@ -20,7 +20,7 @@ use super::sidecar::{
     SidecarWriter, read_sidecar,
 };
 use super::view::with_suffix;
-use super::{MAGIC_HEADER, MAGIC_TRAILER, TAG_SEAL};
+use super::{Error, MAGIC_HEADER, MAGIC_TRAILER, TAG_SEAL, check_version};
 
 /// Random-access reads of a data file; a byte slice stands in for one in
 /// tests (Go: `io.ReaderAt`).
@@ -103,7 +103,7 @@ impl Recovered {
 /// Recovers the active segment at `path` by the sidecar's reading rules
 /// (`sidecar.rs`), falling back to a full scan of the data when the sidecar
 /// cannot be used (Go: `recoverSegment`).
-pub(crate) fn recover_segment(path: &Path) -> io::Result<Recovered> {
+pub(crate) fn recover_segment(path: &Path) -> Result<Recovered, Error> {
     // The sidecar first, the data's length after: a live owner writes a
     // record before its entry, so the data read later covers whatever the
     // sidecar read earlier speaks of. An unreadable sidecar is a missing
@@ -122,7 +122,7 @@ pub(crate) fn recover_segment(path: &Path) -> io::Result<Recovered> {
 
 /// Recovery without a sidecar: every record is read and checked (Go:
 /// `fullScan`).
-pub(crate) fn full_scan(path: &Path) -> io::Result<Recovered> {
+pub(crate) fn full_scan(path: &Path) -> Result<Recovered, Error> {
     let res = scan_active(path)?;
     let mut missing: Vec<SidecarRec> = res
         .index
@@ -149,7 +149,7 @@ pub(crate) fn recover_from<D: DataAt + ?Sized>(
     data: &D,
     size: i64,
     sidecar: &[u8],
-) -> io::Result<Option<Recovered>> {
+) -> Result<Option<Recovered>, Error> {
     let header_len = MAGIC_HEADER.len() as i64;
     if read_sidecar(sidecar, true).1 == 0 || size < header_len {
         return Ok(None);
@@ -214,7 +214,7 @@ pub(crate) fn advance<D: DataAt + ?Sized>(
     data: &D,
     size: i64,
     tail: &[u8],
-) -> io::Result<Option<Advanced>> {
+) -> Result<Option<Advanced>, Error> {
     let unchanged = || Advanced {
         added: Vec::new(),
         missing: Vec::new(),
@@ -227,7 +227,9 @@ pub(crate) fn advance<D: DataAt + ?Sized>(
         if size < header_len {
             return Ok(Some(unchanged()));
         }
-        if read_range(data, 0, header_len)? != MAGIC_HEADER {
+        let header = read_range(data, 0, header_len)?;
+        check_version(&header)?;
+        if header != MAGIC_HEADER {
             return Ok(Some(unchanged()));
         }
         pos = header_len;

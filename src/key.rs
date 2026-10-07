@@ -99,11 +99,19 @@ pub enum Error {
 /// key. Accessors assume the key is canonical (produced by [`Key::new`],
 /// [`Key::new_from_hash`], or [`Key::parse`]).
 ///
+/// The bytes are the (header, length, hash) encoding of
+/// `architecture/keys.md` reversed: the truncated hash comes first and the
+/// header byte last, so keys sort and bucket uniformly on their leading
+/// bytes.
+///
 /// The inner byte array is public, mirroring Go's transparent `[32]byte`;
 /// bytes obtained from untrusted input must go through [`Key::parse`] (or
 /// [`Key::validate`]) before the accessors are used.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Key(pub [u8; SIZE]);
+
+/// The index of the header byte: the last one (Go: `headerAt`).
+const HEADER_AT: usize = SIZE - 1;
 
 /// Returns the minimum number of bytes needed to hold `length` big-endian with
 /// no leading zero. Zero is the special case: a single `0x00` byte.
@@ -125,8 +133,8 @@ impl Key {
 
     /// Assembles a canonical key from a CAS object type, a logical payload
     /// length, and a precomputed full 256-bit BLAKE3 digest. The digest is
-    /// truncated to its leading bytes to fill the key. `length` is used
-    /// verbatim: for `Blob`/`XattrSet` it is the serialized byte length; for
+    /// truncated to its leading bytes to fill the key, and the whole encoding
+    /// is byte-reversed (see [`Key`]). `length` is used verbatim: for `Blob`/`XattrSet` it is the serialized byte length; for
     /// `FileNode`/`DirLeaf`/`DirNode` and `Commit` it is a logical size (see
     /// `architecture/types.md`).
     ///
@@ -136,10 +144,11 @@ impl Key {
     pub fn new_from_hash(t: Type, length: u64, full_hash: [u8; SIZE]) -> Key {
         let ls = length_size_for(length);
         let mut k = [0u8; SIZE];
-        k[0] = (t as u8) << 4 | (ls as u8 - 1);
-        let buf = length.to_be_bytes();
-        k[1..1 + ls].copy_from_slice(&buf[8 - ls..]);
-        k[1 + ls..].copy_from_slice(&full_hash[..SIZE - 1 - ls]);
+        k[HEADER_AT] = (t as u8) << 4 | (ls as u8 - 1);
+        k[HEADER_AT - ls..HEADER_AT].copy_from_slice(&length.to_le_bytes()[..ls]);
+        let hash = &mut k[..HEADER_AT - ls];
+        hash.copy_from_slice(&full_hash[..HEADER_AT - ls]);
+        hash.reverse();
         Key(k)
     }
 
@@ -158,17 +167,17 @@ impl Key {
 
     /// Reports whether the key is canonical: the reserved bit is clear, the
     /// type is defined (0..5), and the length field is minimally encoded (its
-    /// first byte is non-zero, except for the single `0x00` byte that encodes
-    /// a zero length).
+    /// most significant byte, the one next to the header, is non-zero, except
+    /// for the single `0x00` byte that encodes a zero length).
     pub fn validate(&self) -> Result<(), Error> {
-        if self.0[0] & 0x08 != 0 {
+        if self.0[HEADER_AT] & 0x08 != 0 {
             return Err(Error::ReservedBitSet);
         }
-        let raw_type = self.0[0] >> 4;
+        let raw_type = self.0[HEADER_AT] >> 4;
         if !Type::is_valid(raw_type) {
             return Err(Error::ReservedType(raw_type));
         }
-        if self.0[1] == 0 && !(self.length_size() == 1 && self.length() == 0) {
+        if self.0[HEADER_AT - 1] == 0 && !(self.length_size() == 1 && self.length() == 0) {
             return Err(Error::NonCanonicalLength);
         }
         Ok(())
@@ -183,7 +192,7 @@ impl Key {
     /// [`Key::validate`] first, so reaching the panic is a caller bug (raw
     /// construction without validation).
     pub fn type_(&self) -> Type {
-        let raw = self.0[0] >> 4;
+        let raw = self.0[HEADER_AT] >> 4;
         match Type::from_u8(raw) {
             Some(t) => t,
             None => panic!("key: accessor on non-canonical key: reserved object type {raw}"),
@@ -192,21 +201,25 @@ impl Key {
 
     /// Returns the number of bytes the payload-length field occupies (1..8).
     pub fn length_size(&self) -> usize {
-        (self.0[0] & 0x07) as usize + 1
+        (self.0[HEADER_AT] & 0x07) as usize + 1
     }
 
-    /// Decodes the big-endian payload-length field.
+    /// Decodes the payload-length field, which sits just before the header
+    /// byte, least significant byte first.
     pub fn length(&self) -> u64 {
         let ls = self.length_size();
         let mut buf = [0u8; 8];
-        buf[8 - ls..].copy_from_slice(&self.0[1..1 + ls]);
-        u64::from_be_bytes(buf)
+        buf[..ls].copy_from_slice(&self.0[HEADER_AT - ls..HEADER_AT]);
+        u64::from_le_bytes(buf)
     }
 
-    /// Returns the truncated payload hash bytes
-    /// (`len == SIZE - 1 - length_size()`).
-    pub fn hash(&self) -> &[u8] {
-        &self.0[1 + self.length_size()..]
+    /// Returns the truncated payload hash (`len == SIZE - 1 - length_size()`)
+    /// in digest order, a copy: the key stores it reversed (Go: `Hash`,
+    /// likewise a copy).
+    pub fn hash(&self) -> Vec<u8> {
+        let mut h = self.0[..HEADER_AT - self.length_size()].to_vec();
+        h.reverse();
+        h
     }
 
     /// The key's raw bytes (Go: `k[:]`).
@@ -250,24 +263,27 @@ mod tests {
     fn accessors_single_byte_length() {
         // Blob, length 255 (length_size 1), 30-byte hash.
         let mut k = Key([0u8; SIZE]);
-        k.0[0] = 0x00; // type 0, reserved 0, length_size-1 = 0
-        k.0[1] = 0xFF; // length = 255
-        for i in 2..SIZE {
+        k.0[31] = 0x00; // type 0, reserved 0, length_size-1 = 0
+        k.0[30] = 0xFF; // length = 255
+        for i in 0..30 {
             k.0[i] = i as u8;
         }
         assert_eq!(k.type_(), Type::Blob);
         assert_eq!(k.length_size(), 1);
         assert_eq!(k.length(), 255);
         assert_eq!(k.hash().len(), 30);
-        assert_eq!(k.hash(), &k.0[2..]);
+        // The hash is stored reversed; hash() hands it back in digest order.
+        let mut want = k.0[..30].to_vec();
+        want.reverse();
+        assert_eq!(k.hash(), want);
     }
 
     #[test]
     fn accessors_multi_byte_length() {
         // FileNode, length 65536 (length_size 3): header = (1<<4) | (3-1) = 0x12.
         let mut k = Key([0u8; SIZE]);
-        k.0[0] = 0x12;
-        (k.0[1], k.0[2], k.0[3]) = (0x01, 0x00, 0x00); // 0x010000 = 65536
+        k.0[31] = 0x12;
+        (k.0[30], k.0[29], k.0[28]) = (0x01, 0x00, 0x00); // 0x010000 = 65536, low byte first
         assert_eq!(k.type_(), Type::FileNode);
         assert_eq!(k.length_size(), 3);
         assert_eq!(k.length(), 65536);
@@ -285,6 +301,45 @@ mod tests {
         assert_eq!(k.length(), 1000);
         assert_eq!(k.length_size(), 2);
         assert_eq!(k.hash(), &full[..SIZE - 1 - 2]);
+    }
+
+    /// Port of Go `TestNewFromHash_Layout`.
+    #[test]
+    fn new_from_hash_layout() {
+        // The key is the (header, big-endian length, hash prefix) encoding
+        // with its 32 bytes reversed: hash first, header last.
+        let mut full = [0u8; SIZE];
+        for (i, b) in full.iter_mut().enumerate() {
+            *b = i as u8 + 1;
+        }
+        let k = Key::new_from_hash(Type::DirNode, 1000, full);
+        // DirNode, two length bytes, 1000.
+        let mut unflipped = vec![0x31, 0x03, 0xE8];
+        unflipped.extend_from_slice(&full[..29]);
+        for (i, b) in unflipped.iter().enumerate() {
+            assert_eq!(k.0[SIZE - 1 - i], *b, "k[{}] (key {k})", SIZE - 1 - i);
+        }
+    }
+
+    /// Port of Go `TestNewFromHash_LowEntropyFieldsAtTheEnd`.
+    #[test]
+    fn new_from_hash_low_entropy_fields_at_the_end() {
+        // Keys of one type and length differ only in their hash, so they
+        // share their tail (length, header) and spread uniformly on their
+        // first byte.
+        const N: usize = 4096;
+        let mut first = std::collections::HashSet::new();
+        let tail = Key::new(Type::Blob, 200, &[0, 0]).0[SIZE - 2..].to_vec();
+        for i in 0..N {
+            let k = Key::new(Type::Blob, 200, &[i as u8, (i >> 8) as u8]);
+            first.insert(k.0[0]);
+            assert_eq!(&k.0[SIZE - 2..], &tail[..], "key {i}");
+        }
+        assert_eq!(
+            first.len(),
+            256,
+            "{N} keys must cover every first-byte value"
+        );
     }
 
     #[test]
@@ -334,6 +389,12 @@ mod tests {
         // new must equal new_from_hash on the same content's digest.
         let k2 = Key::new_from_hash(Type::Blob, 0, full);
         assert_eq!(k, k2);
+        // The whole key: the 30-byte hash prefix reversed, the length, the
+        // header.
+        assert_eq!(
+            k.to_string(),
+            "1fe4ca939accb712c1adc925cb9b49c9dc36ea4d40a0a6a1f9f5b94913af0000"
+        );
     }
 
     #[test]
@@ -396,15 +457,15 @@ mod tests {
     #[test]
     fn validate_reserved_bit() {
         let mut k = Key::new_from_hash(Type::Blob, 1, [0u8; SIZE]);
-        k.0[0] |= 0x08; // set the reserved bit
+        k.0[31] |= 0x08; // set the reserved bit
         assert_eq!(k.validate(), Err(Error::ReservedBitSet));
     }
 
     #[test]
     fn validate_reserved_type() {
         let mut k = Key([0u8; SIZE]);
-        k.0[0] = 6 << 4; // type 6, length_size 1
-        k.0[1] = 0x01;
+        k.0[31] = 6 << 4; // type 6, length_size 1
+        k.0[30] = 0x01;
         assert_eq!(k.validate(), Err(Error::ReservedType(6)));
     }
 
@@ -413,8 +474,8 @@ mod tests {
         // Blob, length_size 2 (header low bits = 1), length bytes 0x00 0x05:
         // leading zero with a non-zero value -> non-canonical.
         let mut k = Key([0u8; SIZE]);
-        k.0[0] = 0x01;
-        (k.0[1], k.0[2]) = (0x00, 0x05);
+        k.0[31] = 0x01;
+        (k.0[30], k.0[29]) = (0x00, 0x05);
         assert_eq!(k.validate(), Err(Error::NonCanonicalLength));
     }
 
@@ -431,8 +492,8 @@ mod tests {
         // Both the reserved bit and a reserved type set: Go checks the
         // reserved bit first.
         let mut k = Key([0u8; SIZE]);
-        k.0[0] = 5 << 4 | 0x08;
-        k.0[1] = 0x01;
+        k.0[31] = 5 << 4 | 0x08;
+        k.0[30] = 0x01;
         assert_eq!(k.validate(), Err(Error::ReservedBitSet));
     }
 
@@ -450,7 +511,7 @@ mod tests {
     #[test]
     fn new_from_hash_commit() {
         let k = Key::new_from_hash(Type::Commit, 100, [0u8; SIZE]);
-        assert_eq!(k.0[0], 0x50, "type 5, one length byte");
+        assert_eq!(k.0[31], 0x50, "type 5, one length byte");
         assert_eq!(k.type_(), Type::Commit);
         assert_eq!(k.length(), 100);
         assert_eq!(k.validate(), Ok(()));
@@ -524,7 +585,7 @@ mod tests {
     #[should_panic(expected = "reserved object type")]
     fn type_accessor_panics_on_reserved_nibble() {
         let mut k = Key([0u8; SIZE]);
-        k.0[0] = 7 << 4;
+        k.0[31] = 7 << 4;
         let _ = k.type_();
     }
 

@@ -209,8 +209,8 @@ pub(crate) enum Opened {
 pub(crate) fn open_foreign(id: u64, sf: &SegFile) -> Result<Opened, Error> {
     let res = match recover_segment(&sf.path) {
         Ok(res) => res,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Opened::Gone),
-        Err(e) => return Err(e.into()),
+        Err(e) if is_not_exist(&e) => return Ok(Opened::Gone),
+        Err(e) => return Err(e),
     };
     if res.sealed {
         return match SealedSegment::open(&sf.path, id) {
@@ -253,14 +253,14 @@ impl ForeignActive {
     /// store's lock, or, when the refresh fails on something else, neither —
     /// a position that moved on without its entries would lose them for good
     /// (Go: `poll`).
-    fn poll(&self) -> io::Result<Option<Polled>> {
+    fn poll(&self) -> Result<Option<Polled>, Error> {
         let st = unpoison(self.state.read());
         let at = st.scan.at;
         let mut tail = Vec::new();
         match File::open(with_suffix(&self.path, SIDECAR_SUFFIX)) {
             // No sidecar, or gone with a seal: the data's tail still reads.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
             Ok(sf) => {
                 let len = sf.metadata()?.len() as i64;
                 if len < at.sidecar_end {

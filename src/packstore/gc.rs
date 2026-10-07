@@ -128,10 +128,9 @@ impl Store {
         Err(Error::UnknownSegment)
     }
 
-    /// Walks segment `id`'s footer index in index order (fanout on the key's
-    /// last byte, then full key), calling `f` with each entry's key, record
-    /// offset and stored payload length. No pack body is read (Go:
-    /// `ScanIndex`).
+    /// Walks segment `id`'s footer index in index order (ascending key
+    /// order), calling `f` with each entry's key, record offset and stored
+    /// payload length. No pack body is read (Go: `ScanIndex`).
     pub fn scan_index(&self, id: u64, mut f: impl FnMut(Key, u64, u32)) -> Result<(), Error> {
         let seg = self.pin_segment(id)?;
         let fv = &seg.fv;

@@ -196,13 +196,13 @@ mod tests {
         let k = Key::new(Type::Blob, 100, b"x");
         assert_eq!(
             k.to_string(),
-            "00643ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d",
+            "8d5497c63a49c025af4e80f66ba5856a09d40ab7ac02649a78f605d8e73a6400",
             "baseline key differs from the Go oracle"
         );
         k
     }
 
-    const K1_BSTR: &str = "582000643ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d";
+    const K1_BSTR: &str = "58208d5497c63a49c025af4e80f66ba5856a09d40ab7ac02649a78f605d8e73a6400";
 
     // Every case below reproduces a Go oracle output: encMode.Marshal with
     // fxamacker CoreDetEncOptions + NilContainerAsEmpty at cbor v2.9.2.
@@ -226,7 +226,7 @@ mod tests {
                     content_key: k.as_bytes().to_vec(),
                     ..Default::default()
                 }],
-                "81a6004166011981a4021903e8031903e8041b17979cfe362a000005582000643ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d",
+                "81a6004166011981a4021903e8031903e8041b17979cfe362a00000558208d5497c63a49c025af4e80f66ba5856a09d40ab7ac02649a78f605d8e73a6400",
             ),
             (
                 "entry_neg_mtime",
@@ -334,7 +334,7 @@ mod tests {
                     xattrs_key: k.as_bytes().to_vec(),
                     ..Default::default()
                 }],
-                "81a60040010002000300040009582000643ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d",
+                "81a6004001000200030004000958208d5497c63a49c025af4e80f66ba5856a09d40ab7ac02649a78f605d8e73a6400",
             ),
             (
                 "entry_both_xattrs",
@@ -343,7 +343,7 @@ mod tests {
                     xattrs_key: k.as_bytes().to_vec(),
                     ..Default::default()
                 }],
-                "81a70040010002000300040008a009582000643ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d",
+                "81a70040010002000300040008a00958208d5497c63a49c025af4e80f66ba5856a09d40ab7ac02649a78f605d8e73a6400",
             ),
             (
                 "entry_mode_boundaries",
@@ -543,7 +543,7 @@ mod tests {
         let o = encode_blob(&[]);
         assert_eq!(
             o.key.to_string(),
-            "0000af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f"
+            "1fe4ca939accb712c1adc925cb9b49c9dc36ea4d40a0a6a1f9f5b94913af0000"
         );
         assert_eq!(o.key.length(), 0);
         assert!(o.bytes.is_empty());
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn encode_dir_leaf_bad_keys_error_text() {
         let mut bad = vec![0u8; 32];
-        bad[0] = 0x08; // reserved header bit
+        bad[31] = 0x08; // reserved header bit
         let e = Entry {
             name: b"f".to_vec(),
             content_key: bad.clone(),
@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn encode_dir_node_bad_keys_error_text() {
         let mut bad = vec![0u8; 32];
-        bad[0] = 0x08;
+        bad[31] = 0x08;
         let err = encode_dir_node(&[DirPair {
             sep_name: b"a".to_vec(),
             child_key: bad,
@@ -802,7 +802,7 @@ mod tests {
         assert_eq!(o.bytes.len(), 131092);
         assert_eq!(
             o.key.to_string(),
-            "22020014f6c97410712f3f8a2e6caf84e2071cb6c9feb19d44e1f7699be56d5d"
+            "5d6de59b69f7e1449db1fec9b61c07e284af6c2e8a3f2f711074c9f614000222"
         );
     }
 }

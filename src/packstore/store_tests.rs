@@ -915,7 +915,7 @@ fn non_segment_files_are_ignored() {
 // Footer tests (Go: footer_test.go).
 
 /// Returns `k` with byte `i` replaced by `b` (the mutation keeps the key
-/// canonical: only hash-tail bytes are touched).
+/// canonical: only hash bytes are touched).
 fn key_set_byte(k: Key, i: usize, b: u8) -> Key {
     let mut raw = *k.as_bytes();
     raw[i] = b;
@@ -949,22 +949,53 @@ fn index_section_absent_key() {
 
 #[test]
 fn index_section_single_entry_and_edge_buckets() {
-    // Force last bytes 0x00 and 0xFF to cover the b==0 lower bound and the
+    // Force first bytes 0x00 and 0xFF to cover the b==0 lower bound and the
     // final bucket.
-    for last in [0x00u8, 0xFF, 0x80] {
+    for first in [0x00u8, 0xFF, 0x80] {
         let mut e = test_entries(1)[0];
-        e.k = key_set_byte(e.k, 31, last);
+        e.k = key_set_byte(e.k, 0, first);
         let idx = build_index_section(&[e]);
         let (fanout, rows) = parse_index_section(&idx, 1).unwrap();
         let (off, slen) = search_index(&fanout, rows, e.k)
-            .unwrap_or_else(|| panic!("last={last:#x}: key not found"));
-        assert_eq!((off, slen), (e.off, e.slen), "last={last:#x}");
-        let miss = key_set_byte(e.k, 30, e.k.as_bytes()[30] ^ 0xFF);
+            .unwrap_or_else(|| panic!("first={first:#x}: key not found"));
+        assert_eq!((off, slen), (e.off, e.slen), "first={first:#x}");
+        let miss = key_set_byte(e.k, 1, e.k.as_bytes()[1] ^ 0xFF);
         assert!(
             search_index(&fanout, rows, miss).is_none(),
-            "last={last:#x}: absent key found"
+            "first={first:#x}: absent key found"
         );
     }
+}
+
+/// Port of Go `TestIndexSectionIsInKeyOrder`.
+#[test]
+fn index_section_is_in_key_order() {
+    // The fanout is on the key's first byte, so the rows are simply the keys
+    // in bytewise order.
+    let mut entries = test_entries(1000);
+    for (i, e) in entries.iter_mut().enumerate() {
+        // Objects of every type and of many lengths.
+        let t = Type::from_u8((i % 6) as u8).unwrap();
+        e.k = Key::new(t, i as u64 * 1000, e.k.as_bytes());
+    }
+    let idx = build_index_section(&entries);
+    let (_, rows) = parse_index_section(&idx, entries.len() as u64).unwrap();
+    for i in 1..entries.len() {
+        let prev = &rows[(i - 1) * INDEX_ENTRY_SIZE..][..32];
+        let cur = &rows[i * INDEX_ENTRY_SIZE..][..32];
+        assert!(prev < cur, "row {i} does not sort after row {}", i - 1);
+    }
+}
+
+/// Port of Go `TestFilterKeySeparatesKeysOfOneTypeAndLength`.
+#[test]
+fn filter_key_separates_keys_of_one_type_and_length() {
+    // The filter input must come from the hash end of the key. Keys with an
+    // 8-byte length field end in nine bytes of length and header, which are
+    // the same for every object of that type and length.
+    let a = Key::new(Type::FileNode, 1 << 60, b"a");
+    let b = Key::new(Type::FileNode, 1 << 60, b"b");
+    assert_ne!(filter_key(a), filter_key(b), "keys {a} and {b}");
 }
 
 #[test]
@@ -1022,13 +1053,13 @@ fn index_section_empty_and_empty_bucket() {
         "found key in empty index"
     );
 
-    // Deterministic empty-bucket miss: one entry with last byte 0x10, search
-    // a key with last byte 0x20 (a guaranteed-empty bucket).
+    // Deterministic empty-bucket miss: one entry with first byte 0x10, search
+    // a key with first byte 0x20 (a guaranteed-empty bucket).
     let mut e = test_entries(1)[0];
-    e.k = key_set_byte(e.k, 31, 0x10);
+    e.k = key_set_byte(e.k, 0, 0x10);
     let idx = build_index_section(&[e]);
     let (fanout, rows) = parse_index_section(&idx, 1).unwrap();
-    let probe = key_set_byte(e.k, 31, 0x20);
+    let probe = key_set_byte(e.k, 0, 0x20);
     assert!(
         search_index(&fanout, rows, probe).is_none(),
         "found key in empty bucket"
@@ -1059,17 +1090,22 @@ fn filter_section_false_positive_rate() {
 }
 
 #[test]
-fn filter_section_duplicate_tails() {
-    // Two entries with an identical 8-byte tail must not break the build.
+fn filter_section_duplicate_heads() {
+    // Two entries with an identical 8-byte head must not break the build.
     let mut entries = test_entries(2);
     let mut raw = *entries[1].k.as_bytes();
-    raw[24..32].copy_from_slice(&entries[0].k.as_bytes()[24..32]);
+    raw[..8].copy_from_slice(&entries[0].k.as_bytes()[..8]);
     entries[1].k = Key::parse(&raw).unwrap();
+    assert_eq!(
+        filter_key(entries[0].k),
+        filter_key(entries[1].k),
+        "the two keys do not share their filter input"
+    );
     let sec = build_filter_section(&entries).unwrap();
     let f = parse_filter_section(&sec).unwrap();
     assert!(
         f.contains(filter_key(entries[0].k)) && f.contains(filter_key(entries[1].k)),
-        "false negative on duplicate tails"
+        "false negative on duplicate heads"
     );
 }
 
@@ -1091,14 +1127,14 @@ fn index_section_golden_bytes() {
     // Pin the on-disk encoding against symmetric encode/decode bugs: two
     // fixed entries, exact expected bytes.
     let mut raw1 = [0u8; 32];
-    raw1[0] = 0x01; // Blob, 2-byte length field
-    raw1[1] = 0x05;
-    raw1[31] = 0x02;
+    raw1[31] = 0x00; // Blob, 1-byte length field
+    raw1[30] = 0x05; // length 5
+    raw1[0] = 0x02;
     let k1 = Key::parse(&raw1).unwrap();
     let mut raw2 = [0u8; 32];
-    raw2[0] = 0x01;
-    raw2[1] = 0x07;
-    raw2[31] = 0x01; // sorts before k1 (last byte)
+    raw2[31] = 0x00;
+    raw2[30] = 0x07;
+    raw2[0] = 0x01; // sorts before k1 (first byte)
     let k2 = Key::parse(&raw2).unwrap();
     let idx = build_index_section(&[
         IndexEntry {
@@ -1119,7 +1155,7 @@ fn index_section_golden_bytes() {
     assert_eq!(super::be_u32(&idx, 8), 2, "fanout[2]");
     assert_eq!(super::be_u32(&idx, 1020), 2, "fanout[255]");
 
-    // First entry must be k2 (last byte 0x01): key bytes, then off/slen BE.
+    // First entry must be k2 (first byte 0x01): key bytes, then off/slen BE.
     let e0 = &idx[FANOUT_SIZE..FANOUT_SIZE + INDEX_ENTRY_SIZE];
     assert_eq!(&e0[..32], k2.as_bytes());
     assert_eq!(&e0[32..40], &[0, 0, 0, 0, 0, 0, 0, 8]);
@@ -1401,6 +1437,60 @@ fn scan_active_bad_header_resets() {
         let res = scan_active(&active_file(&dir, b)).unwrap();
         assert_eq!(res.size, 0, "bad header");
         assert!(res.index.is_empty() && !res.sealed, "bad header");
+    }
+}
+
+/// Port of Go `TestScanActiveRefusesAnotherFormatVersion`.
+#[test]
+fn scan_active_refuses_another_format_version() {
+    // A header that is ours but of another version is not a torn header: the
+    // file holds acknowledged data this release cannot read, and resetting
+    // it would destroy that data.
+    let (body, _) = build_body(&test_objects(2));
+    for version in [0x01u8, 0x03] {
+        let mut old = body.clone();
+        old[MAGIC_HEADER.len() - 1] = version;
+        let dir = TempDir::new().unwrap();
+        let err = match scan_active(&active_file(&dir, &old)) {
+            Ok(_) => panic!("version {version}: scan accepted the segment"),
+            Err(e) => e,
+        };
+        assert!(err.is_unsupported_version(), "version {version}: {err}");
+    }
+}
+
+/// Port of Go `TestOpenRefusesStoreOfAnotherFormatVersion`.
+#[test]
+fn open_refuses_store_of_another_format_version() {
+    // Segments written before the key layout changed carry format version 1.
+    // Opening such a store must fail and leave every file as it was. The
+    // segment size is small enough to seal, or large enough not to.
+    for (suffix, seg_size) in [(".seg.active", 1u64 << 30), (".seg", 4 << 10)] {
+        let dir = TempDir::new().unwrap();
+        let s = Store::open_with(
+            dir.path(),
+            Options::new().segment_size(seg_size).sync(false),
+        )
+        .unwrap();
+        put_all(&s, &test_objects(40));
+        s.close().unwrap();
+        drop(s);
+        let segs = files_with_suffix(dir.path(), suffix);
+        assert!(!segs.is_empty(), "{suffix}: no segment");
+        let mut old = fs::read(&segs[0]).unwrap();
+        old[MAGIC_HEADER.len() - 1] = 0x01;
+        fs::write(&segs[0], &old).unwrap();
+
+        let err = match Store::open(dir.path()) {
+            Ok(_) => panic!("{suffix}: open accepted a version 1 segment"),
+            Err(e) => e,
+        };
+        assert!(err.is_unsupported_version(), "{suffix}: {err}");
+        assert_eq!(
+            fs::read(&segs[0]).unwrap(),
+            old,
+            "{suffix}: the refused segment was modified"
+        );
     }
 }
 

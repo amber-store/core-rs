@@ -51,7 +51,7 @@ mod tests {
     }
 
     /// Hex of key.New(Blob, 100, "x"), the oracle's reference key.
-    const KH: &str = "00643ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d";
+    const KH: &str = "8d5497c63a49c025af4e80f66ba5856a09d40ab7ac02649a78f605d8e73a6400";
 
     #[test]
     fn file_node_ok_cases() {
@@ -153,7 +153,7 @@ mod tests {
             ),
             (
                 "elem_key_invalid",
-                format!("815820 08 {}", &KH[2..]),
+                format!("815820 {} 08", &KH[..62]),
                 "fstree: file node child 0: key: reserved header bit is set",
             ),
             (
@@ -477,7 +477,7 @@ mod tests {
                 "xk_ok",
                 format!("81a1095820{KH}"),
                 Reenc(
-                    "81a60040010002000300040009582000643ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d",
+                    "81a6004001000200030004000958208d5497c63a49c025af4e80f66ba5856a09d40ab7ac02649a78f605d8e73a6400",
                 ),
             ),
             (
@@ -975,7 +975,7 @@ mod tests {
                 "ok",
                 format!("8182 4161 5820{KH}"),
                 Reenc(
-                    "81824161582000643ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d",
+                    "8182416158208d5497c63a49c025af4e80f66ba5856a09d40ab7ac02649a78f605d8e73a6400",
                 ),
             ),
             ("empty", "80".into(), Reenc("80")),
@@ -1019,13 +1019,13 @@ mod tests {
             (
                 "pair_elem_null",
                 format!("8182 f6 5820{KH}"),
-                Reenc("818240582000643ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d"),
+                Reenc("81824058208d5497c63a49c025af4e80f66ba5856a09d40ab7ac02649a78f605d8e73a6400"),
             ),
             (
                 "indef_pair",
                 format!("81 9f 4161 5820{KH} ff"),
                 Reenc(
-                    "81824161582000643ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d",
+                    "8182416158208d5497c63a49c025af4e80f66ba5856a09d40ab7ac02649a78f605d8e73a6400",
                 ),
             ),
             (

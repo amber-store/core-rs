@@ -28,7 +28,7 @@ offset  size  field
 ```
 
 Each object is identified by its 32-byte [key](keys.md), whose header byte
-encodes the [CAS object type](types.md) and a length field. The key here is
+(its last) encodes the [CAS object type](types.md) and a length field. The key here is
 written verbatim; **canonical-form validation happens on the read side**, never
 on write.
 
@@ -79,7 +79,7 @@ root key** — like a git pack. It is the unit a store's `inbox` receives, and
 the unit object transfer between stores is built on. Layout:
 
 ```
-Magic    "AMBERPK\x03"   8 bytes, plaintext
+Magic    "AMBERPK\x04"   8 bytes, plaintext
 Records  zero or more — each one EncodeRecord output (46-byte header + payload)
 End      0x00            one byte (tagEnd)
 ```
@@ -105,11 +105,13 @@ the payload hash.
 
 ### Magic and versioning
 
-The trailing byte of the magic is the format version. Only `\x03` is produced
+The trailing byte of the magic is the format version. Only `\x04` is produced
 and accepted today. Versions `\x01` (uncompressed whole-stream) and `\x02`
-(whole-stream zstd) were earlier stream formats; they are no longer written and
-are **rejected** by the reader. Bumping the version byte is the migration lever
-if the framing ever changes incompatibly.
+(whole-stream zstd) were earlier stream formats, and `\x03` was this framing
+with keys in their earlier byte order (header byte first, see
+[keys.md](keys.md#byte-order)); they are no longer written and are **rejected**
+by the reader, which names the version it met. Bumping the version byte is the
+migration lever if the framing or the key layout ever changes incompatibly.
 
 ### Error classes
 

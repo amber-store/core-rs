@@ -5,7 +5,7 @@
 //! pack) carrying no root key. Layout:
 //!
 //! ```text
-//! Magic    "AMBERPK\x03"   8 bytes  (plaintext)
+//! Magic    "AMBERPK\x04"   8 bytes  (plaintext)
 //! Records  repeat: one encode_record output each — a 46-byte header
 //!          (tag 0x01 + key[32] + flags + ulen + slen + CRC) followed by the payload
 //! End      0x00
@@ -21,8 +21,9 @@
 //! parallel write with Verify).
 //!
 //! Versions 1 and 2 (`AMBERPK\x01` / `AMBERPK\x02`) were the older uncompressed
-//! and whole-stream-zstd stream formats; they are no longer produced and are
-//! rejected by the [`Reader`].
+//! and whole-stream-zstd stream formats, and version 3 was this layout with
+//! keys in their earlier byte order (header byte first); they are no longer
+//! produced and are rejected by the [`Reader`].
 //!
 //! Compatibility note: record *headers* and raw (uncompressed) records are
 //! byte-identical with the Go implementation. zstd-compressed payload frames
@@ -51,7 +52,7 @@ const FLAG_ZSTD: u8 = 0x01;
 pub const MAX_PAYLOAD: u32 = 256 << 20;
 
 /// Identifies the wire pack format and its version (the trailing byte).
-const PACK_MAGIC: &[u8; 8] = b"AMBERPK\x03";
+const PACK_MAGIC: &[u8; 8] = b"AMBERPK\x04";
 
 /// Marks the end of the record stream. A record begins with `TAG_CHUNK`
 /// (0x01, written by [`encode_record`]), so the two are distinguished on the
@@ -343,6 +344,13 @@ impl<R: Read> Reader<R> {
         if matches!(self.state, ReaderState::Magic) {
             let mut magic = [0u8; PACK_MAGIC.len()];
             self.read_full(&mut magic, "reading magic")?;
+            let v = PACK_MAGIC.len() - 1;
+            if magic[..v] == PACK_MAGIC[..v] && magic[v] != PACK_MAGIC[v] {
+                return Err(Error::Malformed(format!(
+                    "pack format version {}, this release reads {}",
+                    magic[v], PACK_MAGIC[v]
+                )));
+            }
             if &magic != PACK_MAGIC {
                 return Err(Error::Malformed("bad magic".into()));
             }
@@ -667,7 +675,7 @@ mod tests {
         // does not validate keys (callers supply canonical keys), parse_record
         // must.
         let mut kk = k;
-        kk.0[0] = 0xF0; // type 15: reserved
+        kk.0[31] = 0xF0; // type 15: reserved
         let bad = encode_record(kk, &data).unwrap();
         let err = parse_record(&bad).unwrap_err();
         assert!(err.is_corrupt(), "non-canonical key: {err}");
@@ -854,14 +862,19 @@ mod tests {
 
     #[test]
     fn reader_rejects_legacy_versions() {
-        for magic in [b"AMBERPK\x01", b"AMBERPK\x02"] {
+        // Version 3 is the current framing with keys in the earlier byte
+        // order.
+        for magic in [b"AMBERPK\x01", b"AMBERPK\x02", b"AMBERPK\x03"] {
             let mut buf = magic.to_vec();
             buf.push(TAG_END);
             let err = collect(Reader::new(&buf[..])).unwrap_err();
             assert!(err.is_malformed(), "magic {magic:?}: {err}");
             assert_eq!(
                 err.to_string(),
-                "amberpack: malformed pack stream: bad magic"
+                format!(
+                    "amberpack: malformed pack stream: pack format version {}, this release reads 4",
+                    magic[7]
+                )
             );
         }
     }
@@ -870,7 +883,7 @@ mod tests {
     fn empty_stream_is_valid() {
         let w = Writer::new(Vec::new());
         let buf = w.finish().unwrap();
-        assert_eq!(buf, b"AMBERPK\x03\x00");
+        assert_eq!(buf, b"AMBERPK\x04\x00");
         let got = collect(Reader::new(&buf[..])).unwrap();
         assert!(got.is_empty());
     }
@@ -895,7 +908,7 @@ mod tests {
         // A record whose key has the reserved type nibble set, so Key::parse
         // fails in parse_record. encode_record writes the key as given.
         let mut k = mk_key(b"payload");
-        k.0[0] = 0xF0; // reserved type nibble -> Key::parse fails
+        k.0[31] = 0xF0; // reserved type nibble -> Key::parse fails
         let mut body = encode_record(k, b"payload").unwrap();
         body.push(TAG_END);
         let err = collect(Reader::new(&wire_pack(&body)[..])).unwrap_err();

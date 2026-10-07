@@ -887,7 +887,7 @@ mod tests {
 
     /// The canonical CBOR encoding of Reference{Name:"n", Key:<blob "hello">,
     /// User:"u", CreatedAt:42}, pinned byte-for-byte from the Go test suite.
-    const GOLDEN_HEX: &str = "a400616e0158200005ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a6702617503182a";
+    const GOLDEN_HEX: &str = "a400616e015820674a62c508e9868ab74ec1f86e50b34b8de5c591445e928286b33d168fea050002617503182a";
 
     fn golden_record() -> Reference {
         Reference {
@@ -1082,7 +1082,7 @@ mod tests {
     #[test]
     fn decode_rejects_extra_map_key() {
         let extra = hex::decode(
-            "a500616e0158200005ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a6702617503182a096178",
+            "a500616e015820674a62c508e9868ab74ec1f86e50b34b8de5c591445e928286b33d168fea050002617503182a096178",
         )
         .unwrap();
         assert_eq!(Reference::decode(&extra).unwrap_err(), Error::NotCanonical);
@@ -1129,7 +1129,7 @@ mod tests {
     #[test]
     fn decode_rejects_non_canonical_encoding() {
         let non_canon = hex::decode(
-            "a400616e0158200005ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a670261750319002a",
+            "a400616e015820674a62c508e9868ab74ec1f86e50b34b8de5c591445e928286b33d168fea05000261750319002a",
         )
         .unwrap();
         assert_eq!(

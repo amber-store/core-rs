@@ -1,6 +1,6 @@
 //! Persists Amber-Store CAS objects in log-structured, append-only segment
 //! (pack) files. Sealed segments are immutable, mmap'd whole, and self-indexed
-//! by a footer (fanout index on the last key byte + binary fuse filter + fixed
+//! by a footer (fanout index on the first key byte + binary fuse filter + fixed
 //! trailer). An active segment is indexed in its owner's memory and, for
 //! everybody else and for the next open, by a sidecar file beside it
 //! (`sidecar.rs`). There is no global index. A directory may be open in any
@@ -65,11 +65,23 @@ use view::{
 /// First byte of the footer (Go: `tagSeal`).
 pub(crate) const TAG_SEAL: u8 = 0xF0;
 
-/// The 8-byte active/sealed segment file header (Go: `magicHeader`).
-pub(crate) const MAGIC_HEADER: [u8; 8] = *b"AMBERSG\x01";
+/// The 8-byte active/sealed segment file header; its last byte is the format
+/// version (Go: `magicHeader`).
+pub(crate) const MAGIC_HEADER: [u8; 8] = *b"AMBERSG\x02";
 
 /// The 8-byte magic at the very end of a sealed segment (Go: `magicTrailer`).
 pub(crate) const MAGIC_TRAILER: [u8; 8] = *b"AMBERSGF";
+
+/// Returns [`Error::UnsupportedVersion`] when `b` starts with the segment
+/// magic of another format version, and `Ok` otherwise: a missing, torn or
+/// foreign header is the caller's to judge (Go: `checkVersion`).
+pub(crate) fn check_version(b: &[u8]) -> Result<(), Error> {
+    let n = MAGIC_HEADER.len() - 1;
+    if b.len() <= n || b[..n] != MAGIC_HEADER[..n] || b[n] == MAGIC_HEADER[n] {
+        return Ok(());
+    }
+    Err(Error::UnsupportedVersion { found: b[n] })
+}
 
 /// The default rotation threshold: the active segment is sealed once it
 /// reaches this many bytes (Go: `DefaultSegmentSize`).
@@ -124,6 +136,14 @@ pub enum Error {
     /// (Go: `ErrUnknownSegment`).
     #[error("packstore: no such segment")]
     UnknownSegment,
+    /// A segment whose header is this format's magic with another version
+    /// byte: data written by a release with a different layout. Such a file
+    /// is neither read nor modified (Go: `ErrUnsupportedVersion`).
+    #[error("packstore: unsupported segment format version: {found}, this release reads {}", MAGIC_HEADER[MAGIC_HEADER.len() - 1])]
+    UnsupportedVersion {
+        /// The version byte the segment carries.
+        found: u8,
+    },
     /// Structural corruption: bad record framing, bad footer, scrub findings
     /// (Go: `ErrCorrupt`, which aliases `amberpack.ErrCorrupt` — `msg` holds
     /// the complete diagnostic text, including that prefix where Go's
@@ -204,6 +224,15 @@ impl Error {
         match self {
             Error::UnknownSegment => true,
             Error::Context { source, .. } => source.is_unknown_segment(),
+            _ => false,
+        }
+    }
+
+    /// Go's `errors.Is(err, ErrUnsupportedVersion)`.
+    pub fn is_unsupported_version(&self) -> bool {
+        match self {
+            Error::UnsupportedVersion { .. } => true,
+            Error::Context { source, .. } => source.is_unsupported_version(),
             _ => false,
         }
     }

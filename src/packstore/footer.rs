@@ -9,12 +9,12 @@ use memmap2::Mmap;
 
 use crate::amberpack::{REC_HEADER_SIZE, decode_payload};
 use crate::binaryfuse::{BinaryFuse16, SECTION_HEADER_SIZE};
-use crate::key::{self, Key};
+use crate::key::Key;
 
 use super::view::FileIdent;
-use super::{Error, MAGIC_HEADER, MAGIC_TRAILER, TAG_SEAL, be_u32, corrupt};
+use super::{Error, MAGIC_HEADER, MAGIC_TRAILER, TAG_SEAL, be_u32, check_version, corrupt};
 
-/// 256 cumulative u32 counts on the key's last byte.
+/// 256 cumulative u32 counts on the key's first byte.
 pub(crate) const FANOUT_SIZE: usize = 256 * 4;
 /// One index row: key (32) + offset (8) + stored length (4).
 pub(crate) const INDEX_ENTRY_SIZE: usize = 32 + 8 + 4;
@@ -36,13 +36,11 @@ pub(crate) struct IndexEntry {
     pub slen: u32,
 }
 
-/// Orders by (last key byte, full key): the fanout is on the last byte
-/// because byte 0 is type/length-size and clusters, while the hash tail is
-/// uniformly distributed (Go: `compareEntries`).
+/// Orders by key. The fanout is on the first byte, which is uniformly
+/// distributed: a key leads with its hash and ends with its length and
+/// header, which cluster (Go: `compareEntries`).
 fn compare_entries(a: &IndexEntry, b: &IndexEntry) -> std::cmp::Ordering {
-    a.k.as_bytes()[key::SIZE - 1]
-        .cmp(&b.k.as_bytes()[key::SIZE - 1])
-        .then_with(|| a.k.as_bytes().cmp(b.k.as_bytes()))
+    a.k.as_bytes().cmp(b.k.as_bytes())
 }
 
 /// Serializes the index section (fanout + sorted entries). It does not mutate
@@ -56,7 +54,7 @@ pub(crate) fn build_index_section(entries: &[IndexEntry]) -> Vec<u8> {
     let mut out = vec![0u8; FANOUT_SIZE + es.len() * INDEX_ENTRY_SIZE];
     let mut counts = [0u32; 256];
     for e in &es {
-        counts[e.k.as_bytes()[key::SIZE - 1] as usize] += 1;
+        counts[e.k.as_bytes()[0] as usize] += 1;
     }
     let mut cum = 0u32;
     for (b, count) in counts.iter().enumerate() {
@@ -107,30 +105,21 @@ pub(crate) fn parse_index_section(b: &[u8], key_count: u64) -> Result<([u32; 256
     Ok((fanout, &b[FANOUT_SIZE..]))
 }
 
-/// The filter input for `k`: the last 8 bytes of the key, which lie in the
+/// The filter input for `k`: the first 8 bytes of the key, which lie in the
 /// uniformly distributed truncated-hash region (Go: `filterKey`).
 pub(crate) fn filter_key(k: Key) -> u64 {
     let b = k.as_bytes();
-    u64::from_be_bytes([
-        b[key::SIZE - 8],
-        b[key::SIZE - 7],
-        b[key::SIZE - 6],
-        b[key::SIZE - 5],
-        b[key::SIZE - 4],
-        b[key::SIZE - 3],
-        b[key::SIZE - 2],
-        b[key::SIZE - 1],
-    ])
+    u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
 /// Builds and serializes a binary fuse filter over the entries' keys.
-/// Duplicate 8-byte tails are deduplicated before the build (Go:
+/// Duplicate 8-byte heads are deduplicated before the build (Go:
 /// `buildFilterSection`).
 pub(crate) fn build_filter_section(entries: &[IndexEntry]) -> Result<Vec<u8>, Error> {
-    let mut tails: Vec<u64> = entries.iter().map(|e| filter_key(e.k)).collect();
-    tails.sort_unstable();
-    tails.dedup();
-    let f = BinaryFuse16::new(&tails)
+    let mut heads: Vec<u64> = entries.iter().map(|e| filter_key(e.k)).collect();
+    heads.sort_unstable();
+    heads.dedup();
+    let f = BinaryFuse16::new(&heads)
         .map_err(|e| Error::Other(format!("packstore: building fuse filter: {e}")))?;
     Ok(f.section_bytes())
 }
@@ -143,7 +132,7 @@ pub(crate) fn parse_filter_section(b: &[u8]) -> Result<BinaryFuse16, Error> {
     BinaryFuse16::parse_section(b).map_err(corrupt)
 }
 
-/// Finds `k` in a parsed index section: fanout bucket on the last byte, then
+/// Finds `k` in a parsed index section: fanout bucket on the first byte, then
 /// binary search on the full key within the bucket (Go: `searchIndex`).
 pub(crate) fn search_index(fanout: &[u32; 256], entries: &[u8], k: Key) -> Option<(u64, u32)> {
     let pos = search_index_pos(fanout, entries, k)?;
@@ -155,7 +144,7 @@ pub(crate) fn search_index(fanout: &[u32; 256], entries: &[u8], k: Key) -> Optio
 /// Returns `k`'s entry position within the index section (Go:
 /// `searchIndexPos`).
 pub(crate) fn search_index_pos(fanout: &[u32; 256], entries: &[u8], k: Key) -> Option<usize> {
-    let b = k.as_bytes()[key::SIZE - 1];
+    let b = k.as_bytes()[0];
     let lo = if b > 0 { fanout[b as usize - 1] } else { 0 } as usize;
     let n = fanout[b as usize] as usize - lo;
     let row = |i: usize| &entries[(lo + i) * INDEX_ENTRY_SIZE..(lo + i + 1) * INDEX_ENTRY_SIZE];
@@ -250,6 +239,7 @@ pub(crate) fn parse_footer(mm: &[u8]) -> Result<FooterView, Error> {
     if mm.len() < MIN_SEALED_LEN {
         return Err(corrupt(format!("file too short: {} bytes", mm.len())));
     }
+    check_version(mm)?;
     if mm[..MAGIC_HEADER.len()] != MAGIC_HEADER {
         return Err(corrupt("bad header magic"));
     }

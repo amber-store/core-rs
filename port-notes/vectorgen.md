@@ -141,3 +141,26 @@ budget of a compaction pass, `UnreachableFrom`, `DirectoryReader`, and the
 lookup that does not decode the directory object. None touches a format. The
 pin moved `v0.0.11` → `v0.0.12`. A full regeneration into a scratch directory
 at the new pin reproduced all 19 files byte for byte.
+
+## Go v0.9.0 (2026-10-07)
+
+Fourteen of the 19 files changed. Go v0.9.0 reverses the bytes of a key (Go
+PR #25, `architecture/keys.md`), which changes every key and, through the
+keys they hold, the bytes and the keys of file nodes, directories and commits.
+It also bumps the segment format to `AMBERSG\x02` and the wire pack to
+`AMBERPK\x04`. Changed: `keys.json`, `reference.json`, `commit.json`,
+`fstree/manifest.json` and `objects.bin`, the four files under `amberpack/`,
+and the five under `segments_go/`. Unchanged, since none holds a key:
+`amberignore.json`, `filters.json`, `item_chunker.json`, `ultracdc.json` and
+`tar_go.tar`.
+
+The golden tree has 3038 objects where it had 3046. Its 3014 blobs and its
+xattr set are the same objects under byte-reversed keys; the tree above them
+is cut elsewhere, because the builders cut where the hash of an item says and
+an item holds a key: 5 file nodes for 4, 17 directory leaves for 26.
+
+The files were first generated from the head of the Go PR, through the
+pseudo-version `v0.0.13-0.20261007113730-7ec0ab5e3d1a`, to port against. The
+pin then moved to the release, `v0.0.12` → `v0.9.0`, and a full regeneration
+into a scratch directory at that pin reproduced all 19 files byte for byte.
+`vectorgen` itself did not change: it never looked inside a key.

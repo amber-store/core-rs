@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::thread;
 
-use crate::key::{self, Key};
+use crate::key::Key;
 
 use super::prepare::prepare;
 use super::{Error, Object, Store, unpoison};
@@ -40,7 +40,7 @@ pub struct WriteOpts {
     pub verify: bool,
 }
 
-/// A concurrency-safe set of keys, sharded on the key's last byte (uniformly
+/// A concurrency-safe set of keys, sharded on the key's first byte (uniformly
 /// distributed) to spread lock contention across writers (Go: `seenSet`).
 struct SeenSet {
     shards: [Mutex<HashSet<Key>>; 256],
@@ -56,7 +56,7 @@ impl SeenSet {
     /// Records `k` and reports true if it was not already present (Go:
     /// `addIfAbsent`).
     fn add_if_absent(&self, k: Key) -> bool {
-        unpoison(self.shards[k.as_bytes()[key::SIZE - 1] as usize].lock()).insert(k)
+        unpoison(self.shards[k.as_bytes()[0] as usize].lock()).insert(k)
     }
 }
 
@@ -242,5 +242,28 @@ impl Store {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testutil::test_entries;
+    use super::*;
+
+    /// Port of Go `TestSeenSetSpreadsKeysOfOneTypeAndLength`.
+    #[test]
+    fn seen_set_spreads_keys_of_one_type_and_length() {
+        // The shard must come from the hash end of the key: objects of one
+        // type and length share their length and header bytes.
+        let s = SeenSet::new();
+        for e in test_entries(2000) {
+            assert!(s.add_if_absent(e.k), "key {} reported as already seen", e.k);
+        }
+        let used = s
+            .shards
+            .iter()
+            .filter(|sh| !unpoison(sh.lock()).is_empty())
+            .count();
+        assert!(used >= 200, "2000 keys landed in {used} of 256 shards");
     }
 }

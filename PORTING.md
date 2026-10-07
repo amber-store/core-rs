@@ -2,8 +2,9 @@
 
 This crate is a port of `github.com/amber-store/core` (Go; formerly
 `jobs-build/amber-store-core`), pinned at commit
-`b78d78ea6f287472c70a1370d73f2208d4d06f92` (tag `v0.0.12`, the merge of PR
-#22, the copy budget of a compaction pass). Not yet ported from that range:
+`b767e13202d92a52d994077784c26906ff684f64` (tag `v0.9.0`, the merge of PR
+#25, the reversed key). From that release on the two are released under the
+same version number. Not yet ported from that range:
 Go PR #8's `inbox.WithGate`. The Go sources are the normative reference
 wherever this document or `architecture/` is silent; clone the parent fresh
 when porting (the checkout at `/Users/dragan/jobs-build/amber-store-core`
@@ -191,8 +192,8 @@ Record codec per `architecture/amberpack.md`: 46-byte header, CRC-32C over
 the record with the CRC field zeroed, compress-only-if-strictly-smaller
 (libzstd default level), parse validations in Go's order with equivalent
 error classification (`Corrupt` vs `Malformed`), 256 MiB `slen` cap on the
-stream reader, magic `AMBERPK\x03`, `tagEnd = 0x00`, explicit rejection of
-versions 1 and 2. Writer streams records then the end marker; reader is an
+stream reader, magic `AMBERPK\x04`, `tagEnd = 0x00`, explicit rejection of
+versions 1 to 3, naming the version met. Writer streams records then the end marker; reader is an
 iterator that validates each record fully (including key canonicality) but
 not payload hashes, or (`records`) hands each validated record over
 undecoded with its parsed header — the read-side counterpart of
@@ -202,7 +203,10 @@ undecoded with its parsed header — the read-side counterpart of
 
 Full port: store open/scan (segment file naming from `packstore.go`), active
 segment append + recovery tail-scan (`recover.go`), sealing with footer
-(`footer.go` — already-specified layouts; fanout on the **last** key byte),
+(`footer.go` — already-specified layouts; fanout on the **first** key byte,
+filter over the first 8, both relying on a key leading with its hash; a
+segment of another format version is refused with
+`Error::UnsupportedVersion`, Go `ErrUnsupportedVersion`, and left as it is),
 sealed-segment mmap reads (`memmap2`, bounds-checked, no CRC on hot path),
 `has`/`get`/`getRecord`/`storedSize`/`locate`, options (`WithSegmentSize`,
 `WithSync`), `missing.go` (filter-then-index), `verify.go` (scrub),

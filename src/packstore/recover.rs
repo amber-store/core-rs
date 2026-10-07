@@ -2,13 +2,12 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io;
 use std::path::Path;
 
 use crate::amberpack::{REC_HEADER_SIZE, parse_record};
 use crate::key::Key;
 
-use super::{MAGIC_HEADER, TAG_SEAL, footer::parse_footer};
+use super::{Error, MAGIC_HEADER, TAG_SEAL, check_version, footer::parse_footer};
 
 /// Locates one record inside the active segment (Go: `activeLoc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,13 +33,14 @@ pub(crate) struct ScanResult {
 /// invalid byte and truncates there. Acknowledged (fsynced) data is always
 /// before that boundary: fsync covers the whole file, so a valid record can
 /// only be preceded by valid bytes (Go: `scanActive`).
-pub(crate) fn scan_active(path: &Path) -> io::Result<ScanResult> {
+pub(crate) fn scan_active(path: &Path) -> Result<ScanResult, Error> {
     let mut res = ScanResult {
         size: 0,
         index: HashMap::new(),
         sealed: false,
     };
     let b = fs::read(path)?;
+    check_version(&b)?;
     if b.len() < MAGIC_HEADER.len() || b[..MAGIC_HEADER.len()] != MAGIC_HEADER {
         // Header never made it to disk; nothing in this file was ever
         // acknowledged (any successful fsync would have persisted the header
