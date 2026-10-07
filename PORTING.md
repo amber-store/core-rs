@@ -29,12 +29,15 @@ lags GitHub). The CI interop job pins the same Go commit in
 
 **Interoperable but not byte-identical** (each side reads the other's output):
 
-- zstd-compressed record payloads: Go uses `klauspost/compress` (default
-  level, EncodeAll), Rust uses libzstd (`zstd` crate, default level 3). The
-  compress-only-if-strictly-smaller rule is identical, but compressed frames —
-  and therefore record CRCs, segment bodies, and pack bytes containing them —
-  differ between implementations. Correctness is unaffected: keys hash the
-  *uncompressed* object bytes.
+- Compressed record payloads. For zstd, Go uses `klauspost/compress`
+  (EncodeAll, four tiers) and Rust libzstd (the `zstd` crate, 22 levels); for
+  lz4, Go uses `pierrec/lz4/v4` (HC levels up to 9) and Rust liblz4 (the
+  `lz4` crate, HC levels up to 12). A level therefore means the nearest tier
+  in Go and exactly itself in Rust. The compress-only-if-strictly-smaller
+  rule is identical, but compressed payloads — and therefore record CRCs,
+  segment bodies, and pack bytes containing them — differ between
+  implementations. Correctness is unaffected: keys hash the *uncompressed*
+  object bytes.
 - Segment *files* additionally depend on write order (Go's parallel writer is
   scheduling-dependent), so they are not reproducible run-to-run even in Go.
 - An active segment's sidecar index and the store's `gc.lock`
@@ -64,6 +67,7 @@ time if need be):
 | `zeebo/blake3` | `blake3` |
 | `hash/crc32` Castagnoli | `crc32c` |
 | `klauspost/compress/zstd` | `zstd` (libzstd) |
+| `pierrec/lz4/v4` | `lz4` (liblz4) |
 | `FastFilter/xorfilter` BinaryFuse[uint16] | ported in `src/binaryfuse.rs` |
 | `PlakarKorp/go-cdc-chunkers` ultracdc | ported in `src/chunkers.rs` |
 | `fxamacker/cbor` (core deterministic) | hand-rolled in `src/cbor.rs` |
@@ -189,15 +193,26 @@ directory that holds a commit keeps the commit, its tree and its history.
 ### `amberpack` (Go: `amberpack/`)
 
 Record codec per `architecture/amberpack.md`: 46-byte header, CRC-32C over
-the record with the CRC field zeroed, compress-only-if-strictly-smaller
-(libzstd default level), parse validations in Go's order with equivalent
-error classification (`Corrupt` vs `Malformed`), 256 MiB `slen` cap on the
+the record with the CRC field zeroed, a codec id in the flags byte (0 raw,
+1 zstd, 2 lz4) chosen by the caller through `Compression` (Go:
+`Compression{Algorithm, Level}`; the default is none),
+compress-only-if-strictly-smaller, parse validations in Go's order with
+equivalent error classification (`Corrupt` vs `Malformed`), 256 MiB `slen` cap on the
 stream reader, magic `AMBERPK\x04`, `tagEnd = 0x00`, explicit rejection of
 versions 1 to 3, naming the version met. Writer streams records then the end marker; reader is an
 iterator that validates each record fully (including key canonicality) but
 not payload hashes, or (`records`) hands each validated record over
 undecoded with its parsed header — the read-side counterpart of
 `add_record`.
+
+`encode_record_with(k, data, c)` is Go's `EncodeRecordWith`; `Writer::new(w)
+.compression(c)` is Go's `NewWriter(w, WithCompression(c))`. In `packstore`,
+`Options::compression` and `Options::compression_for` are Go's
+`WithCompression` and `WithCompressionFor`; the callback takes `(&Key, &[u8],
+Compression)` and returns the `Compression` to use. `Options` holds the
+callback behind an `Arc`, so it is `Clone` and not `Copy`. Go's
+`ErrInvalidCompression` is `amberpack::Error::InvalidCompression`, tested
+with `is_invalid_compression()` on either error type.
 
 ### `packstore` (Go: `packstore/`, all files)
 

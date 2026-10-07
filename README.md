@@ -24,11 +24,11 @@ The port is **byte-compatible** at the content-addressing layer and
   and identical commit keys for identical commits — reference records,
   binary-fuse filter sections, segment footers, raw pack records, and PAX tar
   exports.
-- **Interoperable, not byte-identical**: zstd-compressed record payloads (Go
-  uses klauspost's Go-native encoder, this crate uses libzstd; each decodes
-  the other's frames, but pack/segment files containing compressed records
-  differ byte-wise — content addressing is unaffected because keys hash the
-  uncompressed bytes).
+- **Interoperable, not byte-identical**: compressed record payloads. Go uses
+  klauspost's zstd and pierrec's lz4, this crate libzstd and liblz4, and the
+  two map compression levels differently; each decodes what the other wrote,
+  but pack and segment files that contain compressed records differ byte-wise.
+  Content addressing is unaffected, because keys hash the uncompressed bytes.
 - **One shared file**: references live in `refs/refs.sqlite`, a SQLite
   database in WAL mode that both implementations open — at the same time, if
   need be. Its format and the rules for sharing it are specified in
@@ -76,6 +76,26 @@ let store = packstore::Store::open(dir.join("packstore"), packstore::Options::ne
 let (root, _stats) = ingest::dir(&store, "./some/dir", ingest::Opts::default())?;
 tarexport::write(&mut out, root, |k| store.get(k))?;
 ```
+
+Objects are stored uncompressed unless the store is opened with a compression
+option:
+
+```rust
+use amber_store_core::amberpack::Compression;
+
+let store = packstore::Store::open_with(
+    dir.join("packstore"),
+    packstore::Options::new().compression(Compression::Zstd { level: 0 }),
+)?;
+```
+
+`Options::compression` takes none, zstd (levels 1–22) or lz4 (0 for the fast
+compressor, 1–12 for high compression); level 0 is each algorithm's default.
+`Options::compression_for` adds a function that chooses per object, from its
+key and bytes. Every store reads records of every codec, whatever it was
+opened with. Releases before this one read raw and zstd records but not lz4
+ones; see [architecture/amberpack.md](architecture/amberpack.md). The example
+CLI takes the setting as `--compression none|zstd[:LEVEL]|lz4[:LEVEL]`.
 
 A dev CLI mirroring the Go `amber-store` commands
 (ingest/ls/export/restore/ref/commit/gc) ships as an example: `cargo run --example amber-store -- --store ./store ingest DIR`.

@@ -8,7 +8,12 @@ ported from `record_test.go` + `pack_test.go`.
 | Go | Rust |
 |----|------|
 | `RecHeaderSize` | `REC_HEADER_SIZE` |
-| `EncodeRecord(k, data)` | `encode_record(k, &data)` |
+| `EncodeRecord(k, data)` | `encode_record(k, &data)` (raw, as in Go) |
+| `EncodeRecordWith(k, data, c)` | `encode_record_with(k, &data, c)` |
+| `Compression{Algorithm, Level}`, `None` / `Zstd` / `LZ4` | `Compression::{None, Zstd { level }, Lz4 { level }}` (`#[non_exhaustive]`) |
+| `Compression.Validate()` / `.String()` / `ParseCompression(s)` | `Compression::validate()` / `Display` / `FromStr` |
+| `NewWriter(w, WithCompression(c))` | `Writer::new(w).compression(c)` |
+| `errors.Is(err, ErrInvalidCompression)` | `Error::is_invalid_compression()` |
 | `ParseRecord(b)` / `Record{Key,Flags,Ulen,Slen}` | `parse_record(&b)` / `Record{key,flags,ulen,slen}` |
 | `DecodePayload(flags, ulen, stored)` | `decode_payload(flags, ulen, &stored)` |
 | `Writer.Add(fstree.Object)` | `Writer::add(key, &bytes)` |
@@ -16,6 +21,12 @@ ported from `record_test.go` + `pack_test.go`.
 | `Writer.Close()` | `Writer::finish() -> Result<W, _>` (returns the inner writer; does not close the destination, same as Go) |
 | `Reader.All()` (`iter.Seq2`) | `Reader` implements `Iterator<Item = Result<(Key, Vec<u8>), Error>>` |
 | `errors.Is(err, ErrCorrupt/ErrMalformed)` | `Error::is_corrupt()` / `Error::is_malformed()` |
+
+Go's `Compression` can name an algorithm that does not exist
+(`Algorithm(9)`) and rejects it in `Validate`; the Rust enum cannot, so
+`validate` only checks levels. Go's `none` with a level is likewise a state
+the Rust type cannot hold; `FromStr` rejects the text `none:1` with the same
+message.
 
 `fstree` is still a placeholder in this crate, so the wire-pack API takes
 `(Key, &[u8])` / yields `(Key, Vec<u8>)` instead of a `fstree::Object` struct.
