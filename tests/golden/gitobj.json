@@ -1,0 +1,500 @@
+{
+  "cases": [
+    {
+      "name": "empty blob",
+      "data_hex": "626c6f62203000",
+      "key": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391000000000000000000000060",
+      "links": []
+    },
+    {
+      "name": "blob",
+      "data_hex": "626c6f6220360068656c6c6f0a",
+      "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+      "links": []
+    },
+    {
+      "name": "blob reading like a commit",
+      "data_hex": "626c6f62203935007472656520343964666633376364656263643732396263666133303163653762386235623865353764613832650a617574686f722061203c6140623e2031202b303030300a636f6d6d69747465722061203c6140623e2031202b303030300a",
+      "key": "bbdefa08ac03e57b2a1bbb8b270d84dd8874d514000000000000000000000060",
+      "links": []
+    },
+    {
+      "name": "empty tree",
+      "data_hex": "74726565203000",
+      "key": "4b825dc642cb6eb9a060e54bf8d69288fbee4904000000000000000000000060",
+      "links": []
+    },
+    {
+      "name": "tree",
+      "data_hex": "74726565203632003430303030206469720049dff37cdebcd729bcfa301ce7b8b5b8e57da82e3130303634342066696c6500ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "b714d8879146c9d37fbf41b1bcb98f0764faedff000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        },
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": true
+        }
+      ]
+    },
+    {
+      "name": "tree: padded mode",
+      "data_hex": "7472656520333100303430303030206469720049dff37cdebcd729bcfa301ce7b8b5b8e57da82e",
+      "key": "e2f83ce25034ef1c248ad3929436d455fa0289e2000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "tree: group-writable mode",
+      "data_hex": "7472656520323900313030363634206600ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "8b0ef6196172d7d4092ee8479ee7d36029c909aa000000000000000000000060",
+      "links": [
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": true
+        }
+      ]
+    },
+    {
+      "name": "tree: executable",
+      "data_hex": "7472656520323900313030373535206600ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "048669b8b376867c78d1bc4cec9f73aaeb18a031000000000000000000000060",
+      "links": [
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": true
+        }
+      ]
+    },
+    {
+      "name": "tree: symlink",
+      "data_hex": "7472656520323900313230303030206c00ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "7241279aae04b6dde06b1bbdc5e5c87360ff97b4000000000000000000000060",
+      "links": [
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": true
+        }
+      ]
+    },
+    {
+      "name": "tree: gitlink",
+      "data_hex": "7472656520323900313630303030206d00ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "3f3e10c20e9e86bd1f2eb914b55ea2d3e6368b0e000000000000000000000060",
+      "links": []
+    },
+    {
+      "name": "tree: zero mode",
+      "data_hex": "747265652032340030207800ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "6c2e970c16a788f600e9742ffa7511bb9d608c0b000000000000000000000060",
+      "links": []
+    },
+    {
+      "name": "tree: unknown file type",
+      "data_hex": "74726565203238003630303030207800ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "8a88c926384e1b70272be21d490f53720ab887a6000000000000000000000060",
+      "links": []
+    },
+    {
+      "name": "tree: mode shifts bits out",
+      "data_hex": "747265652034350037373737373737373737373737373737313030363434207800ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "dce98e4d9ab3bd8a732029b99d2ed5484dca1f29000000000000000000000060",
+      "links": [
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": true
+        }
+      ]
+    },
+    {
+      "name": "tree: name with spaces",
+      "data_hex": "7472656520333300313030363434206120620a6300ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "4cb34d654cede086da565f4c7490effd78f6a793000000000000000000000060",
+      "links": [
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": true
+        }
+      ]
+    },
+    {
+      "name": "tree: unsorted, duplicated",
+      "data_hex": "7472656520383700313030363434207a00ce013625030ba8dba906f756967f9e9ca394464a313030363434206100ce013625030ba8dba906f756967f9e9ca394464a313030363434206100ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "b124557fea1d710feec64d152e1e2fbbbf8e4c98000000000000000000000060",
+      "links": [
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": true
+        },
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": true
+        },
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": true
+        }
+      ]
+    },
+    {
+      "name": "tree: no space",
+      "data_hex": "74726565203600313030363434",
+      "key": "4c466507b474e4a2326297483f3f8543ce46d57d000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: tree entry without a mode"
+    },
+    {
+      "name": "tree: empty mode",
+      "data_hex": "7472656520323300207800ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "bf4a163f06910d7c5d8187dd6762505202d16d82000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: tree entry without a mode"
+    },
+    {
+      "name": "tree: mode not octal",
+      "data_hex": "7472656520323900313030363438207800ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "bf988d513f6533bddf1126e0d36f673f0ae8ef08000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: tree entry with a mode that is not octal"
+    },
+    {
+      "name": "tree: no NUL",
+      "data_hex": "747265652038003130303634342078",
+      "key": "95f5389214d321a923432b95b409558b3dce43c2000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: tree entry without an end to its name"
+    },
+    {
+      "name": "tree: empty name",
+      "data_hex": "74726565203238003130303634342000ce013625030ba8dba906f756967f9e9ca394464a",
+      "key": "6c7527bafbcb169526525ed09568d016f16b6957000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: tree entry with an empty name"
+    },
+    {
+      "name": "tree: short id",
+      "data_hex": "7472656520323800313030363434207800ce013625030ba8dba906f756967f9e9ca39446",
+      "key": "cd9615c30166b58e7617af2a0491d657dace98f4000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: tree entry with a short id"
+    },
+    {
+      "name": "tree: trailing bytes",
+      "data_hex": "7472656520333000313030363434207800ce013625030ba8dba906f756967f9e9ca394464a31",
+      "key": "32432285f9a58aecf8303480231846a2586f669e000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: tree entry without a mode"
+    },
+    {
+      "name": "commit",
+      "data_hex": "636f6d6d6974203938007472656520343964666633376364656263643732396263666133303163653762386235623865353764613832650a617574686f722061203c6140623e2031202b303030300a636f6d6d69747465722061203c6140623e2031202b303030300a0a6d0a",
+      "key": "173978ec6677b4e4968b923b21c954b720b0d466000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "commit: parents",
+      "data_hex": "636f6d6d697420313638007472656520343964666633376364656263643732396263666133303163653762386235623865353764613832650a706172656e7420313536383136393061646363306562646662663761366464633637613431303533363533386530380a706172656e7420636530313336323530333062613864626139303666373536393637663965396361333934343634610a617574686f722061203c6140623e2031202b303030300a0a6d0a",
+      "key": "25904e460580fa4a3a48105cb31a4943da4d65f4000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        },
+        {
+          "key": "15681690adcc0ebdfbf7a6ddc67a410536538e08000000000000000000000060",
+          "leaf": false
+        },
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "commit: tree line alone",
+      "data_hex": "636f6d6d6974203436007472656520343964666633376364656263643732396263666133303163653762386235623865353764613832650a",
+      "key": "aace4e69c137b09ccb9878f345ba33448ab0fa15000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "commit: uppercase hex",
+      "data_hex": "636f6d6d6974203436007472656520343944464633374344454243443732394243464133303143453742384235423845353744413832450a",
+      "key": "7dda676215e92086101e73a4f0d3a257ee3edd25000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "commit: later headers are no links",
+      "data_hex": "636f6d6d697420323134007472656520343964666633376364656263643732396263666133303163653762386235623865353764613832650a617574686f722061203c6140623e2031202b303030300a636f6d6d69747465722061203c6140623e2031202b303030300a6d65726765746167206f626a65637420636530313336323530333062613864626139303666373536393637663965396361333934343634610a207479706520636f6d6d69740a0a706172656e7420313536383136393061646363306562646662663761366464633637613431303533363533386530380a",
+      "key": "039837a1e5b1e1cbe5c33457ff915b9a88b31feb000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "commit: empty",
+      "data_hex": "636f6d6d6974203000",
+      "key": "dcf5b16e76cce7425d0beaef62d79a7d10fce1f5000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: no \"tree\" line"
+    },
+    {
+      "name": "commit: no tree",
+      "data_hex": "636f6d6d697420323300617574686f722061203c6140623e2031202b303030300a",
+      "key": "aefc134f386b0fce6d7eedc6a234be4b6d059b12000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: no \"tree\" line"
+    },
+    {
+      "name": "commit: short tree",
+      "data_hex": "636f6d6d69742034350074726565203439646666333763646562636437323962636661333031636537623862356238653537646138320a",
+      "key": "2139d7e81dbd29f5dc20eb1c02e1274a1d4fb71b000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad \"tree\" line"
+    },
+    {
+      "name": "commit: tree not hex",
+      "data_hex": "636f6d6d69742034360074726565207a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a0a",
+      "key": "adde93e0764352bcade9ad64d28ab9917e5bb7d6000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad \"tree\" line"
+    },
+    {
+      "name": "commit: tree no newline",
+      "data_hex": "636f6d6d697420343500747265652034396466663337636465626364373239626366613330316365376238623562386535376461383265",
+      "key": "9d7779e4b855231d5ee06c4aa833380bd8eb41e8000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad \"tree\" line"
+    },
+    {
+      "name": "commit: short final parent line",
+      "data_hex": "636f6d6d6974203537007472656520343964666633376364656263643732396263666133303163653762386235623865353764613832650a706172656e74206162630a",
+      "key": "fc4f159af23879c2975490f08566b53ca2723bd8000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "commit: final parent line without a newline",
+      "data_hex": "636f6d6d6974203933007472656520343964666633376364656263643732396263666133303163653762386235623865353764613832650a706172656e742031353638313639306164636330656264666266376136646463363761343130353336353338653038",
+      "key": "2ef70754b19963170d1436620b1b4c524e6ea8b4000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "commit: parent line, no id",
+      "data_hex": "636f6d6d6974203534007472656520343964666633376364656263643732396263666133303163653762386235623865353764613832650a706172656e74200a",
+      "key": "b510bb5bca946d4e933983cd62a31c191b0d771b000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "commit: parent line long enough, not one",
+      "data_hex": "636f6d6d697420313039007472656520343964666633376364656263643732396263666133303163653762386235623865353764613832650a706172656e74206162630a617574686f722061203c6140623e2031202b303030300a636f6d6d69747465722061203c6140623e2031202b303030300a0a6d0a",
+      "key": "3c77b7a50e1a3b7efe178464f865d28ed58fc0d2000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad \"parent\" line"
+    },
+    {
+      "name": "commit: parent line too long",
+      "data_hex": "636f6d6d6974203935007472656520343964666633376364656263643732396263666133303163653762386235623865353764613832650a706172656e742031353638313639306164636330656264666266376136646463363761343130353336353338653038300a",
+      "key": "9ea98f9a129fa7909206c9074069dcff55857893000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad \"parent\" line"
+    },
+    {
+      "name": "tag of a commit",
+      "data_hex": "746167203639006f626a65637420313536383136393061646363306562646662663761366464633637613431303533363533386530380a7479706520636f6d6d69740a74616720760a0a6d0a",
+      "key": "9c4ca5cf1d75a2815783cab2d022ed04a07972fa000000000000000000000060",
+      "links": [
+        {
+          "key": "15681690adcc0ebdfbf7a6ddc67a410536538e08000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "tag of a tree",
+      "data_hex": "746167203637006f626a65637420343964666633376364656263643732396263666133303163653762386235623865353764613832650a7479706520747265650a74616720760a0a6d0a",
+      "key": "7b244b3c01dd7f45758cb98e1158d7b5576ee80f000000000000000000000060",
+      "links": [
+        {
+          "key": "49dff37cdebcd729bcfa301ce7b8b5b8e57da82e000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "tag of a tag",
+      "data_hex": "746167203636006f626a65637420313536383136393061646363306562646662663761366464633637613431303533363533386530380a74797065207461670a74616720760a0a6d0a",
+      "key": "310caf7764af49b3ceab369c514f45e566cfe36f000000000000000000000060",
+      "links": [
+        {
+          "key": "15681690adcc0ebdfbf7a6ddc67a410536538e08000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "tag of a blob",
+      "data_hex": "746167203637006f626a65637420636530313336323530333062613864626139303666373536393637663965396361333934343634610a7479706520626c6f620a74616720760a0a6d0a",
+      "key": "a013f27991c3437dcecd85144923a141d3ce8e7b000000000000000000000060",
+      "links": [
+        {
+          "key": "ce013625030ba8dba906f756967f9e9ca394464a000000000000000000000060",
+          "leaf": true
+        }
+      ]
+    },
+    {
+      "name": "tag: no object",
+      "data_hex": "746167203132007479706520636f6d6d69740a",
+      "key": "aad77c8d83f8252011d216ed5efe320cbf070a1f000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: no \"object\" line"
+    },
+    {
+      "name": "tag: no type",
+      "data_hex": "746167203534006f626a65637420313536383136393061646363306562646662663761366464633637613431303533363533386530380a74616720760a",
+      "key": "17d43c29016b2e5840f7d419ab3d14011ae16daa000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: no \"type\" line"
+    },
+    {
+      "name": "tag: unknown type",
+      "data_hex": "746167203538006f626a65637420313536383136393061646363306562646662663761366464633637613431303533363533386530380a747970652066696c650a",
+      "key": "e451f9f3a5e3ad1a7f78ef0f2705331d49159751000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad \"type\" line"
+    },
+    {
+      "name": "tag: type no newline",
+      "data_hex": "746167203539006f626a65637420313536383136393061646363306562646662663761366464633637613431303533363533386530380a7479706520636f6d6d6974",
+      "key": "50a478d0bdd94d935fa026c0bfc4750b5f4cd219000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad \"type\" line"
+    },
+    {
+      "name": "tag: type ends at a NUL",
+      "data_hex": "746167203734006f626a65637420313536383136393061646363306562646662663761366464633637613431303533363533386530380a7479706520636f6d6d6974006a756e6b0a74616720760a0a6d0a",
+      "key": "02e1144ebbc3d3f066bf01a62d3be6bb4f03dabb000000000000000000000060",
+      "links": [
+        {
+          "key": "15681690adcc0ebdfbf7a6ddc67a410536538e08000000000000000000000060",
+          "leaf": false
+        }
+      ]
+    },
+    {
+      "name": "tag: type empty before the NUL",
+      "data_hex": "746167203631006f626a65637420313536383136393061646363306562646662663761366464633637613431303533363533386530380a747970652000636f6d6d69740a",
+      "key": "0c8fd0fee47c8deff776e80dc0a49a7ed955190d000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad \"type\" line"
+    },
+    {
+      "name": "frame: empty",
+      "data_hex": "",
+      "key": "da39a3ee5e6b4b0d3255bfef95601890afd80709000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: no space after the kind"
+    },
+    {
+      "name": "frame: no space",
+      "data_hex": "626c6f62",
+      "key": "0fd0bcfb44f83e7d5ac7a8922578276b9af48746000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: no space after the kind"
+    },
+    {
+      "name": "frame: no NUL",
+      "data_hex": "626c6f622033",
+      "key": "2211e6e30eeb18d9d38496b46ab54fa58ebe8acd000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: no NUL after the size"
+    },
+    {
+      "name": "frame: unknown kind",
+      "data_hex": "66696c65203000",
+      "key": "0b4247e466eada401083c73f74b969405440fd83000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: unknown kind"
+    },
+    {
+      "name": "frame: empty size",
+      "data_hex": "626c6f622000",
+      "key": "58b887337a64dacdee1067df261896ac9c19235c000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad size"
+    },
+    {
+      "name": "frame: leading zero",
+      "data_hex": "626c6f622030310078",
+      "key": "0a9614ac5d39c51d01464b9776fba0a05f75c892000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad size"
+    },
+    {
+      "name": "frame: size too large",
+      "data_hex": "626c6f6220320078",
+      "key": "e1b3e49575382549af886806bf302e654bca919c000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: size 2, content of 1 bytes"
+    },
+    {
+      "name": "frame: size too small",
+      "data_hex": "626c6f622031007879",
+      "key": "f496d48cd33b3b0864b0a1ce3d14c688dcb4b71b000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: size 1, content of 2 bytes"
+    },
+    {
+      "name": "frame: size overflows",
+      "data_hex": "626c6f6220313834343637343430373337303935353136313600",
+      "key": "23584f16eda60db2431512afd6d6fdf6cbf1e967000000000000000000000060",
+      "links": [],
+      "links_error": "gitobj: malformed object: bad size"
+    },
+    {
+      "name": "shattered prefix",
+      "data_hex": "255044462d312e330a25e2e3cfd30a0a0a312030206f626a0a3c3c2f57696474682032203020522f4865696768742033203020522f547970652034203020522f537562747970652035203020522f46696c7465722036203020522f436f6c6f7253706163652037203020522f4c656e6774682038203020522f42697473506572436f6d706f6e656e7420383e3e0a73747265616d0affd8fffe00245348412d3120697320646561642121212121852fec092339759c39b1a1c63c4c97e1fffe017346dc9166b67e118f029ab621b2560ff9ca67cca8c7f85ba84c79030c2b3de218f86db3a90901d5df45c14f26fedfb3dc38e96ac22fe7bd728f0e45bce046d23c570feb141398bb552ef5a0a82be331fea48037b8b5d71f0e332edf93ac3500eb4ddc0decc1a864790c782c76215660dd309791d06bd0af3f98cda4bc4629b1",
+      "key_error": "gitobj: SHA-1 collision attack detected",
+      "links": [],
+      "links_error": "gitobj: malformed object: unknown kind"
+    }
+  ]
+}

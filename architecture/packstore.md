@@ -32,39 +32,47 @@ active one is the same without the footer. The index holds the keys in
 bytewise order behind a fanout on their first byte, and the filter is built
 over their first 8 bytes: both rely on a key leading with its hash.
 
-The last byte of the header is the format version. There are two, `\x02` and
-`\x03`, with the same layout: they differ in the records they may hold. A
-version-2 segment holds only raw and zstd records; a version-3 segment may
-hold lz4 records as well ([amberpack.md](amberpack.md#the-record)). The
-reason is the releases up to 0.9.0. They read version 2 alone, and they would
+The last byte of the header is the format version. There are three, `\x02`,
+`\x03` and `\x04`, with the same layout: they differ in the records they may
+hold, each one everything the one before it may. A version-2 segment holds only
+raw and zstd records; a version-3 segment may hold lz4 records as well
+([amberpack.md](amberpack.md#the-record)); a version-4 segment may also hold
+[git objects](git-objects.md). The reason for version 3 is the releases up to
+0.9.0. They read version 2 alone, and they would
 misread an lz4 record in a segment they accept: their read path returns the
 lz4 block as the object's bytes, and their scan of an active segment
 truncates at the first one. A segment they refuse they leave alone. So an
-lz4 record is only ever written to a version-3 segment, and a store that
-holds such a segment is refused by those releases as a whole, at open. A
+lz4 record is only ever written to a segment at version 3 or above, and a store
+that holds such a segment is refused by those releases as a whole, at open. A
 later codec takes a later version in the same way: a release has to refuse
 the segments whose records it cannot read, and this one too would take a
 record of a codec it does not know for a torn tail.
 
+Version 4 is there for the same reason, one release on. Releases up to 0.10.0
+read versions 2 and 3, and their record parser does not know a git object's
+key: their scan of an active segment truncates at the first one, losing it and
+every record behind it. So a git record is only ever written to a version-4
+segment, and a store that holds one is refused by those releases as a whole.
+
 A writer creates version-2 segments, unless its compression setting is lz4,
-in which case it creates version-3 ones from the start. When an lz4 record
-is about to be appended to a version-2 segment — whether the writer
-encoded it, was handed it encoded, or is copying it in a compaction — the
-writer leaves that segment, sealing it or, if it is empty, letting go of it
-as it is, and continues in a version-3 one. From then on it creates version-3
-segments, so it pays for one early seal and not for one per segment. A header
-is never rewritten: a running older release may already have read it. The
-segment the writer continues in is checked for the record like any other: it
-may be one somebody left behind. An empty version-2 segment that was let go
-stays where it is until a version-2 writer takes it. A segment whose header
-never arrived, which its next writer starts over, gets that writer's version.
-A store whose writers are never set to lz4 and never take an lz4 record stays
-at version 2.
+in which case it creates version-3 ones from the start. When a record is about
+to be appended to a segment of a lower version than it needs — whether the
+writer encoded it, was handed it encoded, or is copying it in a compaction —
+the writer leaves that segment, sealing it or, if it is empty, letting go of
+it as it is, and continues in one of the version the record needs. From then
+on it creates segments at that version, so it pays for one early seal and not
+for one per segment. A header is never rewritten: a running older release may
+already have read it. The segment the writer continues in is checked for the
+record like any other: it may be one somebody left behind. An empty segment
+that was let go stays where it is until a writer at or below its version takes
+it. A segment whose header never arrived, which its next writer starts over, gets
+that writer's version. A store whose writers are never set to lz4 and never
+take an lz4 or git record stays at version 2.
 
 Version `\x01` held keys
 in their earlier byte order (header byte first), indexed and filtered on their
-last bytes. A segment that carries the magic with a version other than 2 and
-3 is refused
+last bytes. A segment that carries the magic with a version other than 2, 3
+and 4 is refused
 with an unsupported-version error and never modified — in particular it is not
 taken for a segment whose header was torn, which would be started over. Sealing appends the footer, fsyncs,
 renames `<id>.seg.active` to `<id>.seg`, fsyncs the directory and removes the
@@ -153,8 +161,8 @@ appends to it. Only when every active segment is held by a live writer does it
 create one. Serial writers therefore keep filling one segment to the segment
 size; the number of active segments is bounded by the peak number of
 simultaneous writers and drifts back to one as they fill. A writer that has
-moved to version-3 segments passes over a version-2 one, leaving it for a
-writer that can use it; a writer at version 2 adopts either.
+moved to a higher version passes over a segment below it, leaving it for a
+writer that can use it; a writer at version 2 adopts any.
 
 **Creating** a segment with an id above every id in the directory:
 
@@ -321,17 +329,20 @@ above:
   the segment it copied into, then removes the old ones, then syncs the
   directory.
 - **Rely only on durable copies** when skipping a write or a survivor's copy.
-- **Refuse a segment of a format version other than 2 and 3** and leave it as
+- **Refuse a segment of a format version other than 2, 3 and 4** and leave it as
   it is; only a header that is missing or not this format's magic at all may
   be reset.
-- **An lz4 record only in a version-3 segment.** Never append one to a
-  version-2 segment, and never rewrite a header: leave the segment and
-  continue in a version-3 one, checking it for the record first. A repair
+- **An lz4 record only in a segment at version 3 or above.** Never append one to
+  a version-2 segment, and never rewrite a header: leave the segment and
+  continue in one at version 3 or above, checking it for the record first. A repair
   that rewrites a sealed segment keeps its version, raised to 3 when the
   replacement record needs it. A scrub, which covers sealed segments, reports
   an lz4 record in a version-2 one as corruption. Sealing idle segments for a
   compaction takes them whatever their version. A later codec needs a later
   version.
+- **A git record only in a version-4 segment**, under the same rules: never
+  appended below it, a repair raises a segment to it, a scrub reports one below
+  it as corruption. A later key type needs a later version as well.
 
 The **sealed footer** (index section, filter, trailer) is older than this
 document and is not laid out here yet; `packstore/footer.go` is the reference.

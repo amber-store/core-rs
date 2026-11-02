@@ -62,10 +62,10 @@ it indexes an active segment by scanning it, it takes the first lz4 record for
 a torn tail and truncates the segment there at its next write, losing that
 record and every one after it. Such a release must therefore never read a
 segment that holds one, and the segment format sees to it: an lz4 record is
-only ever written to a segment at format version 3, which those releases
-refuse — the whole store, at open, without touching it
-([packstore.md](packstore.md)). A store that is never written to with lz4
-stays at version 2 and stays readable by them. A later algorithm takes the
+only ever written to a segment at format version 3 or above, which those
+releases refuse — the whole store, at open, without touching it
+([packstore.md](packstore.md)). A store that is never written to with lz4 or
+with a git object stays at version 2 and stays readable by them. A later algorithm takes the
 next codec id and, for the same reason, a segment version of its own.
 
 **The CRC covers the whole record with its own field zeroed.** It is computed
@@ -85,7 +85,8 @@ questions:
 1. **CRC-32C** — "did these bytes survive storage/transit intact?" Checked
    whenever a record is parsed.
 2. **Payload hash** — "is this really the object its key claims?" The key embeds
-   a BLAKE3 digest of the object's serialized bytes ([keys.md](keys.md)). The
+   a BLAKE3 digest of the object's serialized bytes ([keys.md](keys.md)), or for a
+   [git object](git-objects.md) its SHA-1. The
    record codec does **not** verify this; it is re-checked in the storage path
    (packstore's parallel write with verification) before anything is committed.
 
@@ -158,7 +159,7 @@ pack is just those records bracketed by a magic and an end marker. Sharing the
 codec means an object compressed once on disk can be copied byte-for-byte into a
 wire pack without re-encoding, and a received record can be appended to a segment
 without re-framing. The CRC and the raw/compressed invariants are checked
-identically in both settings, and the BLAKE3 payload hash remains the single
+identically in both settings, and the payload hash remains the single
 authoritative identity gate wherever an object is about to be stored.
 A copied record keeps the codec it was written with, whatever the
 compression setting of the store or writer that copies it.

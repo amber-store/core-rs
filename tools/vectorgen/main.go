@@ -36,7 +36,7 @@ func run(outDir string) error {
 	owned := []string{
 		"keys.json", "ultracdc.json", "item_chunker.json", "filters.json",
 		"reference.json", "commit.json", "amberignore.json", "tar_go.tar",
-		"fstree", "amberpack", "segments_go",
+		"gitobj.json", "fstree", "amberpack", "segments_go", "segments_go_lz4", "segments_go_git",
 	}
 	for _, name := range owned {
 		if err := os.RemoveAll(filepath.Join(outDir, name)); err != nil {
@@ -65,6 +65,12 @@ func run(outDir string) error {
 	}
 	if err := genSegments(outDir); err != nil {
 		return fmt.Errorf("segments: %w", err)
+	}
+	if err := genGitobj(outDir); err != nil {
+		return fmt.Errorf("gitobj.json: %w", err)
+	}
+	if err := genSegmentsGit(outDir); err != nil {
+		return fmt.Errorf("segments_go_git: %w", err)
 	}
 	if err := genTar(outDir, tree); err != nil {
 		return fmt.Errorf("tar_go.tar: %w", err)

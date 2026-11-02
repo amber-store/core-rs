@@ -60,7 +60,7 @@ impl Store {
     }
 
     fn put_verified_with(&self, key: Key, data: &[u8], sync_now: bool) -> Result<(), Error> {
-        verify_object(key, data).map_err(|msg| Error::Corrupt { msg, verify: true })?;
+        verify_object(key, data).map_err(Error::Verify)?;
         let _write_token = self.begin_write_token()?;
         self.observe(key);
         let mut ap = self.append_lock();
@@ -150,7 +150,7 @@ impl Store {
                     .open(&temporary)?;
                 // The rewritten segment keeps its version, raised when the
                 // replacement is a record that the old one may not hold.
-                let version = segment.version().max(version_for(replacement[33]));
+                let version = segment.version().max(version_for(key, replacement[33]));
                 file.write_all(&header_at(version))?;
                 let mut offset = MAGIC_HEADER.len() as u64;
                 let mut index = Vec::with_capacity(entries.len());

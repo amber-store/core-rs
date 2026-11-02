@@ -2,7 +2,7 @@
 
 A lookup key identifies a piece of content in the Amber-Store. It encodes the **type** of the payload and a **hash** of it.
 
-Every key is exactly **32 bytes** long, laid out as three contiguous fields:
+Every key is exactly **32 bytes** long, laid out as three contiguous fields (one type, [git objects](#git-keys), fills them differently):
 
 | Field | Size | Purpose |
 |-------|------|---------|
@@ -43,6 +43,25 @@ hash length = 32 - 1 - <length-field size>
 ```
 
 That is, 32 total bytes minus the 1 header byte minus however many bytes the payload-length field occupies. The truncated hash is stored reversed: the key's first byte is the last byte of the truncated hash, and the byte just before the payload length is the hash's first.
+
+## Git keys
+
+A key of type 6, `GitSHA1`, addresses a git object by the SHA-1 git gave it ([git-objects.md](git-objects.md)). It has the same 32 bytes and the same last two fields, filled as follows:
+
+| Field | Size | Purpose |
+|-------|------|---------|
+| Payload hash   | first 20 bytes  | The object's SHA-1, in digest order: **not** reversed |
+| Padding        | 10 bytes        | All zero |
+| Payload length | 1 byte          | Always `0` |
+| Header byte    | 1 byte, the last | `0x60`: type 6, 1 length byte |
+
+The SHA-1 needs no reversal to lead the key: it is uniform there as it is, and in digest order a key's hex starts with the id git prints. The length is zero because a git object's id does not tell its size, so a key made from a link in another git object could not hold one.
+
+A key of this type with anything but zeros after the SHA-1, the length-field size included, is not canonical and does not validate, so that one git object has one key.
+
+```
+ce013625030ba8dba906f756967f9e9ca394464a 00000000000000000000 00 60
+```
 
 ## Example
 

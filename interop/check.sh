@@ -25,6 +25,9 @@
 #      segment of a zstd store is at format version 2, which releases up to
 #      0.9.0 read, and every segment of an lz4 store at version 3, which they
 #      refuse.
+#   7. git objects: both give the same history the same keys, each walks what
+#      the OTHER wrote, a reference set on one side keeps it through a collection
+#      on the other, and every segment of such a store is at version 4.
 set -euo pipefail
 
 RS_REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -297,6 +300,56 @@ path.write_bytes(record)
 PYREPAIR
   "$REPAIR" repair "$STORE"
   "$CREATE" check "$STORE"
+done
+
+echo "== git objects (identical keys; each side walks, collects and reads what the OTHER wrote)"
+(cd "$RS_REPO" && cargo build -q --example git-interop)
+(cd "$GO_REPO" && go build -o "$WORK/git-go" "$RS_REPO/interop/git.go")
+RS_GIT="$RS_REPO/target/debug/examples/git-interop"
+[ "$("$WORK/git-go" keys)" = "$("$RS_GIT" keys)" ]
+read -r GIT_ROOT GIT_BLOB GIT_DANGLING < <("$RS_GIT" keys)
+for writer in rust go; do
+  # Objects written by one implementation, referenced and swept by the other.
+  if [ "$writer" = rust ]; then
+    CREATE="$RS_GIT" READ="$WORK/git-go" CLI="$GO" OTHER_CLI="$RS"
+  else
+    CREATE="$WORK/git-go" READ="$RS_GIT" CLI="$RS" OTHER_CLI="$GO"
+  fi
+  STORE="$WORK/store-git-$writer"
+  mkdir -p "$STORE"
+  "$CREATE" create "$STORE/packstore"
+  python3 - "$STORE/packstore" <<'PYGIT'
+import glob, sys
+paths = glob.glob(sys.argv[1] + "/*.seg") + glob.glob(sys.argv[1] + "/*.seg.active")
+assert paths, "no segments"
+for p in paths:
+    version = open(p, "rb").read(8)[7]
+    assert version == 4, f"{p} is at version {version}"
+PYGIT
+  "$READ" check "$STORE/packstore"
+  "$CLI" --store "$STORE" ref set refs/heads/main "$GIT_ROOT" >/dev/null
+  [[ "$("$OTHER_CLI" --store "$STORE" gc why "$GIT_BLOB")" == *refs/heads/main* ]]
+  # The first pass seals the segment the object nothing reaches sits in, the second
+  # is past its grace and has to copy what shares a pack with it.
+  "$CLI" --store "$STORE" gc run --grace 1h --garbage 0 >/dev/null
+  sleep 0.1
+  SWEEP="$("$CLI" --store "$STORE" gc run --grace 1ms --garbage 0)"
+  [[ "$SWEEP" == *" 1 reaped, 1 records"* ]] || {
+    echo "the sweep did not collect the dangling object: $SWEEP" >&2
+    exit 1
+  }
+  "$CREATE" check "$STORE/packstore"
+  "$READ" check "$STORE/packstore"
+  "$CREATE" gone "$STORE/packstore"
+  "$READ" gone "$STORE/packstore"
+  [[ "$("$OTHER_CLI" --store "$STORE" gc why "$GIT_DANGLING")" == *unreferenced* ]]
+  # A file operation refuses a git key, on both sides.
+  for cli in "$CLI" "$OTHER_CLI"; do
+    if "$cli" --store "$STORE" ls "$GIT_ROOT" 2>/dev/null; then
+      echo "ls took a git key" >&2
+      exit 1
+    fi
+  done
 done
 
 echo "OK: all interop checks passed"

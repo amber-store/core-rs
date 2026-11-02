@@ -371,9 +371,9 @@ fn open_refuses_a_version_beyond_the_ones_it_reads() {
     let sealed = sealed_files(dir.path());
     assert!(!sealed.is_empty());
     let mut b = fs::read(&sealed[0]).unwrap();
-    b[7] = 4;
+    b[7] = 5;
     fs::write(&sealed[0], b).unwrap();
-    let err = Store::open(dir.path()).expect_err("a version-4 segment must be refused");
+    let err = Store::open(dir.path()).expect_err("a version-5 segment must be refused");
     assert!(err.is_unsupported_version(), "{err}");
 }
 

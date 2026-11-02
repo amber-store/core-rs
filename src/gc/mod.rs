@@ -19,6 +19,8 @@ mod cycle;
 mod status;
 
 #[cfg(test)]
+mod git_tests;
+#[cfg(test)]
 mod multi_tests;
 #[cfg(test)]
 mod tests;

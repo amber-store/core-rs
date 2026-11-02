@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::SystemTime;
 
 use crate::amberpack::{self, Compression, REC_HEADER_SIZE, decode_payload, encode_record_with};
-use crate::key::Key;
+use crate::key::{Key, Type};
 
 use footer::SealedSegment;
 use gate::Gate;
@@ -84,20 +84,24 @@ pub(crate) fn check_version(b: &[u8]) -> Result<(), Error> {
     Err(Error::UnsupportedVersion { found: b[n] })
 }
 
-/// Segment format versions: the last byte of a segment's header. The two
-/// have the same layout; the version says which codecs the segment's records
-/// may use. A segment at `VERSION_BASE` holds only raw and zstd records,
-/// which is all that releases up to 0.9.0 read. Those releases refuse a
-/// segment at any other version, and would misread an lz4 record in one they
-/// accept, so an lz4 record is only ever written to a segment at
-/// `VERSION_LZ4`. A later codec takes a later version in the same way: a
-/// release must refuse the segments whose records it cannot read
-/// (architecture/packstore.md; Go: `versionBase`, `versionLZ4`).
+/// Segment format versions: the last byte of a segment's header. They have the
+/// same layout; the version says which records the segment may hold, each one
+/// everything the one before it may. A segment at `VERSION_BASE` holds only raw
+/// and zstd records of the store's own types, which is all that releases up to
+/// 0.9.0 read. Those releases refuse a segment at any other version, and would
+/// misread an lz4 record in one they accept, so an lz4 record is never written
+/// below `VERSION_LZ4`. Releases up to 0.10.0 refuse a segment above that, and
+/// their scan of an active segment would truncate at a key of a type they do not
+/// know, so a git record is never written below `VERSION_GIT`. A later codec or
+/// key type takes a later version in the same way: a release must refuse the
+/// segments whose records it cannot read (architecture/packstore.md; Go:
+/// `versionBase`, `versionLZ4`, `versionGit`).
 pub(crate) const VERSION_BASE: u8 = 2;
 pub(crate) const VERSION_LZ4: u8 = 3;
+pub(crate) const VERSION_GIT: u8 = 4;
 
 fn reads_version(v: u8) -> bool {
-    v == VERSION_BASE || v == VERSION_LZ4
+    (VERSION_BASE..=VERSION_GIT).contains(&v)
 }
 
 /// Reports whether `b` is a segment header of a version this release reads
@@ -114,9 +118,18 @@ pub(crate) fn header_at(version: u8) -> [u8; 8] {
     h
 }
 
-/// The lowest segment version that may hold a record with the given flags
-/// byte (Go: `versionFor`).
-pub(crate) fn version_for(flags: u8) -> u8 {
+/// The lowest segment version that may hold a record with the given key and
+/// flags byte (Go: `versionFor`).
+pub(crate) fn version_for(k: Key, flags: u8) -> u8 {
+    if k.as_bytes()[crate::key::SIZE - 1] >> 4 == Type::GitSha1 as u8 {
+        return VERSION_GIT;
+    }
+    version_for_codec(flags)
+}
+
+/// The lowest segment version that may hold a record with the given flags byte,
+/// whatever its key (Go: `versionForCodec`).
+pub(crate) fn version_for_codec(flags: u8) -> u8 {
     if flags > amberpack::CODEC_ZSTD {
         VERSION_LZ4
     } else {
@@ -181,7 +194,7 @@ pub enum Error {
     /// byte: data written by a release with a different layout. Such a file
     /// is neither read nor modified (Go: `ErrUnsupportedVersion`).
     #[error(
-        "packstore: unsupported segment format version: {found}, this release reads {VERSION_BASE} and {VERSION_LZ4}"
+        "packstore: unsupported segment format version: {found}, this release reads {VERSION_BASE} to {VERSION_GIT}"
     )]
     UnsupportedVersion {
         /// The version byte the segment carries.
@@ -641,7 +654,7 @@ impl Store {
             )));
         }
         let gate = Gate::open(&dir)?;
-        let seg_version = version_for(cfg.compression.codec());
+        let seg_version = version_for_codec(cfg.compression.codec());
         if let Ok(ls) = list_segments(&dir) {
             remove_orphan_sidecars(&dir, &ls);
         }
@@ -714,10 +727,10 @@ impl Store {
                 return Err(Error::Failed(msg.clone()));
             }
         }
-        // An lz4 record goes into a segment at VERSION_LZ4 only, and a store
-        // that has written one stays at that version: it leaves a segment
-        // early once, not once per segment.
-        let need = version_for(rec[33]);
+        // An lz4 record goes into a segment at VERSION_LZ4 or above and a git
+        // record into one at VERSION_GIT, and a store that has written one stays
+        // at that version: it leaves a segment early once, not once per segment.
+        let need = version_for(k, rec[33]);
         ap.seg_version = ap.seg_version.max(need);
         loop {
             self.ensure_active(ap)?;
@@ -1368,6 +1381,9 @@ mod gc_tests;
 
 #[cfg(test)]
 mod compression_tests;
+
+#[cfg(test)]
+mod git_tests;
 
 #[cfg(test)]
 mod segment_version_tests;

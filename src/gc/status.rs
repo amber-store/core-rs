@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::fstree::child_keys;
-use crate::key::{Key, Type};
+use crate::fstree;
+use crate::key::Key;
 
 use super::collector::{Cancel, Core};
 use super::{Collector, CycleStats, Error, lock};
@@ -163,24 +163,21 @@ impl Core {
     }
 
     /// Walks `root`'s tree until `k` is found, pruning revisited subtrees.
-    /// The `cur == k` test runs before the visited check, and Blob/XattrSet
-    /// leaves are not expanded (Go: `reaches`).
+    /// The `cur == k` test runs before the read check, and leaves are not
+    /// expanded (Go: `reaches`).
     fn reaches(&self, root: Key, k: Key) -> Result<bool, Error> {
-        let mut visited: HashSet<Key> = HashSet::new();
-        let mut stack = vec![root];
+        let mut read: HashSet<Key> = HashSet::new();
+        let mut stack = vec![fstree::link_to(root)];
         while let Some(cur) = stack.pop() {
-            if cur == k {
+            if cur.key == k {
                 return Ok(true);
             }
-            if !visited.insert(cur) {
+            if cur.leaf || !read.insert(cur.key) {
                 continue;
             }
-            if matches!(cur.type_(), Type::Blob | Type::XattrSet) {
-                continue;
-            }
-            let data = self.objects.get(cur).map_err(Error::Objects)?;
-            let children = child_keys(cur, &data).map_err(Error::Children)?;
-            stack.extend(children);
+            let data = self.objects.get(cur.key).map_err(Error::Objects)?;
+            let links = fstree::links(cur.key, &data).map_err(Error::Children)?;
+            stack.extend(links);
         }
         Ok(false)
     }

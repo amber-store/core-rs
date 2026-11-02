@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use crate::fstree::{self, child_keys};
+use crate::fstree;
 use crate::key::{Key, Type};
 use crate::packstore::{self, MarkSet};
 use crate::reference::Reference;
@@ -437,10 +437,16 @@ impl Core {
     }
 
     /// Prunes at already-marked keys, so shared subtrees are walked once.
-    /// Blob and xattr payloads are marked without being read (Go:
-    /// `markFrom`).
+    /// Blob and xattr payloads are marked without being read, and so are git
+    /// blobs a tree or tag says are blobs.
+    ///
+    /// A git key cannot prune on the mark alone. The mark may come from a link
+    /// that called it a blob, while this link calls it a directory: what lies
+    /// below has to stay. So a git key has a second bit, set when its links are
+    /// followed. Only git keys need one: for every other type, the key itself
+    /// says whether it is a leaf (Go: `markFrom`).
     fn mark_from(&self, cancel: Cancel<'_>, live: &mut MarkSet, root: Key) -> Result<(), Error> {
-        let mut stack = vec![root];
+        let mut stack = vec![fstree::link_to(root)];
         for n in 0usize.. {
             if stack.is_empty() {
                 break;
@@ -449,20 +455,24 @@ impl Core {
             if n % 1024 == 0 && cancel.is_canceled() {
                 return Err(Error::Canceled);
             }
-            let k = stack.pop().expect("stack is non-empty");
-            let (newly, present) = live.mark(k);
+            let l = stack.pop().expect("stack is non-empty");
+            let k = l.key;
+            let (mut newly, present) = live.mark(k);
             if !present {
                 return Err(Error::MissingFromStore { key: k });
+            }
+            if l.leaf {
+                continue;
+            }
+            if k.type_() == Type::GitSha1 {
+                newly = live.mark_walked(k);
             }
             if !newly {
                 continue;
             }
-            if matches!(k.type_(), Type::Blob | Type::XattrSet) {
-                continue;
-            }
             let data = self.objects.get(k).map_err(Error::Objects)?;
-            let children = child_keys(k, &data).map_err(Error::Children)?;
-            stack.extend(children);
+            let links = fstree::links(k, &data).map_err(Error::Children)?;
+            stack.extend(links);
         }
         Ok(())
     }

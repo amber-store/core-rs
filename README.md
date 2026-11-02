@@ -19,7 +19,7 @@ The port is **byte-compatible** at the content-addressing layer and
 **interoperable** at the storage layer:
 
 - **Byte-identical** (same input ⇒ same bytes): 32-byte keys, every serialized
-  object (`Blob`/`FileNode`/`DirLeaf`/`DirNode`/`XattrSet`/`Commit`), UltraCDC
+  object (`Blob`/`FileNode`/`DirLeaf`/`DirNode`/`XattrSet`/`Commit`/`GitSHA1`), UltraCDC
   and item-chunker cut points — hence identical root keys for identical trees
   and identical commit keys for identical commits — reference records,
   binary-fuse filter sections, segment footers, raw pack records, and PAX tar
@@ -52,7 +52,7 @@ The modules mirror the Go packages; see the crate docs (`cargo doc --open`).
 
 | Module | Role |
 |--------|------|
-| `key` | The 32-byte content key: type, length, truncated BLAKE3 hash. |
+| `key` | The 32-byte content key: type, length, truncated BLAKE3 hash (for a git object, its SHA-1). |
 | `fstree` | Tree objects (encode/decode), bottom-up builders, read paths. A commit key reads as its tree, as a root and as the content key of a directory entry. |
 | `chunkers` | UltraCDC byte chunking and BLAKE3 item chunking. |
 | `ingest` | Build a tree from a local directory; honors `.amberignore`; `Opts::exclude` skips names at the root (a working copy's metadata directory). |
@@ -60,6 +60,7 @@ The modules mirror the Go packages; see the crate docs (`cargo doc --open`).
 | `packstore` | Append-only pack segments with parallel, deduplicating, verifying writers. Any number of processes may read and write one store at once; see [`architecture/packstore.md`](architecture/packstore.md). |
 | `refstore` | SQLite-backed (WAL, multi-process) name → record map for references, with optimistic updates; the file is shared with the Go implementation. |
 | `reference` | The reference record: canonical CBOR encoding and validation. |
+| `gitobj` | Git objects (object type 6): the frame, the collision-detecting SHA-1 and the links a walk follows, so that a repository can be pushed to a store and keep its ids. See [`architecture/git-objects.md`](architecture/git-objects.md). |
 | `commit` | The commit record (object type 5): canonical CBOR encoding and validation; a change id and conflicted trees for jj; a key whose length field is the footprint of the snapshot (own bytes plus its trees); signature fields carried opaquely. See [`architecture/commits.md`](architecture/commits.md). |
 | `amberpack` | The flat pack stream format for transfer and storage. |
 | `inbox` | Durable pack receiving. |
