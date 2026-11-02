@@ -41,11 +41,9 @@ verbatim from the Go repository like the rest of `architecture/`.
 - **`put_verified` reports a forged object as `Error::Verify`,** not as corruption,
   for every type. It used `Error::Corrupt { verify: true }`, whose `is_corrupt()` was
   true where Go's `errors.Is(err, ErrCorrupt)` is false. The text was and is the same.
-- **`parallel_map` spawns scoped threads per BFS level,** which a long history makes
-  visible: about five times Go's cost on a chain of 100,000 commits with an in-memory
-  getter (2.0 s against 0.32 s, measured during other load). Correct, and left alone:
-  a real store's reads weigh more. A threshold below which it runs sequentially is the
-  obvious lever when this matters.
+- **`parallel_map` starts workers only when a level has shown they are worth it,**
+  where Go starts a goroutine per object per level. Go's are cheap enough, and threads
+  are not: see `fstree/read.rs`. Results are the same and in the same order.
 
 ## How it was checked
 
