@@ -2,11 +2,9 @@
 
 This crate is a port of `github.com/amber-store/core` (Go; formerly
 `jobs-build/amber-store-core`), pinned at commit
-`927d50215c6fea5dbead9d99768f0859e0c1ae45` (tag `v0.10.0`, the merge of PR
-#26, compression options). Since v0.9.0 the two are released under the same
-version number. In flight on top of that: the git object type, Go PR #28, for which
-vectorgen and the CI interop job pin the head of the Go branch until it is released.
-Not yet ported from that range:
+`42c254791127b9ad7e9b0156f559ca446c74463c` (tag `v0.11.0`, the merge of PR
+#28, git objects). Since v0.9.0 the two are released under the same
+version number. Not yet ported from that range:
 Go PR #8's `inbox.WithGate`. The Go sources are the normative reference
 wherever this document or `architecture/` is silent; clone the parent fresh
 when porting (the checkout at `/Users/dragan/jobs-build/amber-store-core`

@@ -1,6 +1,6 @@
 # gitobj — port notes
 
-Backport of Go PR #28 (`amber-store/core`, branch `git-sha1-objects`): CAS type 6,
+Backport of Go PR #28 (`amber-store/core`, merge commit `42c2547`, tag `v0.11.0`): CAS type 6,
 `GitSHA1`, a git object under its SHA-1. The format is specified in `architecture/git-objects.md`, copied
 verbatim from the Go repository like the rest of `architecture/`.
 
