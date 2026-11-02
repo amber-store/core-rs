@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: amber-store/core
-          ref: d5c184d19e00193c9e88ca6f35eae5ff5e1bbff3 # core git-sha1-objects (amber-store/core#28)
+          ref: 42c254791127b9ad7e9b0156f559ca446c74463c # core v0.11.0
           path: amber-go
       - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6 # v1.0.0
         with:

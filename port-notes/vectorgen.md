@@ -192,3 +192,10 @@ The git object type's `gitobj.json` and `segments_go_git/` are generated at the
 head of Go's `git-sha1-objects` (amber-store/core#28); a full regeneration there
 reproduced every other file. The generator now also owns `segments_go_lz4/`, which
 it used to resume when regenerating in place, emptying the manifest.
+
+## Go v0.11.0 (2026-11-02)
+
+The pin moved from the branch's pseudo-version to the release, `v0.11.0`
+(`42c2547`, the merge of Go PR #28). A full regeneration into a scratch directory
+at that pin reproduced every file of `tests/golden` byte for byte. `vectorgen` itself
+did not change with the pin.
