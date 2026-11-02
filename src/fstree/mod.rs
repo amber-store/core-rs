@@ -21,6 +21,9 @@ mod decode;
 mod encode;
 mod fx;
 mod read;
+
+#[cfg(test)]
+mod git_tests;
 mod scan;
 
 use std::fmt;
@@ -35,9 +38,9 @@ pub use encode::{
 pub(crate) use fx::unmarshal_commit;
 pub use fx::{CborError, CborType};
 pub use read::{
-    ChildKeysError, DirectoryReader, MissingObjectError, WalkError, check_complete, child_keys,
-    collect_entries, dir_of, list_entries, lookup_entry, reachable_keys, resolve_entry,
-    resolve_path, write_content,
+    ChildKeysError, DirectoryReader, Link, MissingObjectError, WalkError, check_complete,
+    child_keys, collect_entries, dir_of, link_to, links, list_entries, lookup_entry,
+    reachable_keys, resolve_entry, resolve_path, write_content,
 };
 
 /// A built CAS object: its key and its serialized bytes.

@@ -4,7 +4,9 @@ This crate is a port of `github.com/amber-store/core` (Go; formerly
 `jobs-build/amber-store-core`), pinned at commit
 `927d50215c6fea5dbead9d99768f0859e0c1ae45` (tag `v0.10.0`, the merge of PR
 #26, compression options). Since v0.9.0 the two are released under the same
-version number. Not yet ported from that range:
+version number. In flight on top of that: the git object type, Go PR #28, for which
+vectorgen and the CI interop job pin the head of the Go branch until it is released.
+Not yet ported from that range:
 Go PR #8's `inbox.WithGate`. The Go sources are the normative reference
 wherever this document or `architecture/` is silent; clone the parent fresh
 when porting (the checkout at `/Users/dragan/jobs-build/amber-store-core`
@@ -19,6 +21,8 @@ lags GitHub). The CI interop job pins the same Go commit in
   (`Blob`/`FileNode`/`DirLeaf`/`DirNode`/`XattrSet`/`Commit`) — hence
   identical root keys for identical logical trees, and identical commit keys
   for identical commits.
+- Git keys (`GitSHA1`) and what `gitobj` reads from a payload: its SHA-1, its
+  frame and its links.
 - UltraCDC and item-chunker cut points.
 - Reference records and commit records (canonical CBOR).
 - Binary fuse filter sections (the Go construction is deterministic:
@@ -65,6 +69,7 @@ time if need be):
 | Go | Rust |
 |----|------|
 | `zeebo/blake3` | `blake3` |
+| `pjbgf/sha1cd` (collision-detecting SHA-1) | `sha1-checked` |
 | `hash/crc32` Castagnoli | `crc32c` |
 | `klauspost/compress/zstd` | `zstd` (libzstd) |
 | `pierrec/lz4/v4` | `lz4` (liblz4) |
@@ -220,11 +225,11 @@ Full port: store open/scan (segment file naming from `packstore.go`), active
 segment append + recovery tail-scan (`recover.go`), sealing with footer
 (`footer.go` — already-specified layouts; fanout on the **first** key byte,
 filter over the first 8, both relying on a key leading with its hash; segment
-format versions 2 and 3, `VERSION_BASE` and `VERSION_LZ4` (Go:
-`versionBase`, `versionLZ4`), where only a version-3 segment may hold an
-lz4 record and a store moves to version 3 at its first such record,
-so that releases up to 0.9.0 refuse the store instead of misreading it; a
-segment of any other format version is refused with
+format versions 2, 3 and 4, `VERSION_BASE`, `VERSION_LZ4` and `VERSION_GIT` (Go:
+`versionBase`, `versionLZ4`, `versionGit`), where an lz4 record takes version 3 or
+above and a git record version 4, and a store moves there at its first such record,
+so that releases up to 0.9.0 and up to 0.10.0 refuse the store instead of misreading
+it; a segment of any other format version is refused with
 `Error::UnsupportedVersion`, Go `ErrUnsupportedVersion`, and left as it is),
 sealed-segment mmap reads (`memmap2`, bounds-checked, no CRC on hot path),
 `has`/`get`/`getRecord`/`storedSize`/`locate`, options (`WithSegmentSize`,

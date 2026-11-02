@@ -1220,3 +1220,101 @@ fn gc_over_mixed_codecs() {
         second
     );
 }
+
+/// Writes a small history straight into the store, as whatever pushes a repository
+/// would, and returns the head and the blob it holds (Go: `storeGitBranch`).
+fn store_git_branch(store: &Path) -> (Key, Key) {
+    use amber_store_core::gitobj::{self, Kind};
+    let objects = open_objects(store);
+    let put = |kind: Kind, body: &[u8]| -> Key {
+        let data = gitobj::encode(kind, body);
+        let k = gitobj::key_of(&data).unwrap();
+        objects.put_verified(k, &data).unwrap();
+        k
+    };
+    let blob = put(Kind::Blob, b"hello\n");
+    let mut entry = b"100644 f\0".to_vec();
+    entry.extend_from_slice(&blob.git_sha1_sum().unwrap());
+    let tree = put(Kind::Tree, &entry);
+    let id = &tree.to_string()[..40];
+    let head = put(
+        Kind::Commit,
+        format!("tree {id}\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n\nm\n").as_bytes(),
+    );
+    objects.close().unwrap();
+    (head, blob)
+}
+
+/// Go: `TestE2E_GitBranch`.
+#[test]
+fn git_branch_end_to_end() {
+    let store = TempDir::new().unwrap();
+    let (head, blob) = store_git_branch(store.path());
+    let (head_s, blob_s) = (head.to_string(), blob.to_string());
+    let run = |rest: &[&str]| run_seg(store.path(), rest);
+
+    // A key reads as the git id, and a reference takes it like any other.
+    run(&["ref", "set", "refs/heads/main", &head_s]).expect("ref set");
+    let out = run(&["gc", "why", &blob_s]).expect("gc why");
+    assert!(out.contains("refs/heads/main"), "gc why = {out:?}");
+    let out = run(&["gc", "status"]).expect("gc status");
+    assert!(out.contains("live"), "gc status = {out:?}");
+
+    // The store's own trees live in the same store and are not disturbed.
+    let src = TempDir::new().unwrap();
+    write_fixture(src.path());
+    let src_s = src.path().display().to_string();
+    run(&["ingest", "--no-progress", "--ref", "files", &src_s]).expect("ingest next to git");
+    thread::sleep(Duration::from_millis(50));
+    run(&["gc", "run", "--grace", "1ms", "--garbage", "0"]).expect("gc run");
+    let dest = TempDir::new().unwrap();
+    let dest_s = dest.path().display().to_string();
+    run(&["restore", "ref:files", &dest_s]).expect("restore after a cycle");
+    let out = run(&["gc", "why", &blob_s]).expect("gc why after a cycle");
+    assert!(out.contains("refs/heads/main"), "gc why = {out:?}");
+
+    // File operations read the store's directories, which a git key is not. They
+    // say so.
+    let tar = dest.path().join("out.tar").display().to_string();
+    let empty = TempDir::new().unwrap();
+    let empty_s = empty.path().display().to_string();
+    let cases: [&[&str]; 4] = [
+        &["ls", &head_s],
+        &["restore", &head_s, &empty_s],
+        &["export", "-o", &tar, &head_s],
+        &["commit", "show", &head_s],
+    ];
+    for args in cases {
+        let err = run(args).expect_err("a file operation took a git commit");
+        assert!(err.contains("GitSHA1"), "{args:?}: {err}");
+    }
+
+    // Without the branch it is garbage.
+    run(&["ref", "rm", "refs/heads/main"]).expect("ref rm");
+    let out = run(&["gc", "why", &blob_s]).expect("gc why");
+    assert!(out.contains("unreferenced"), "gc why = {out:?}");
+}
+
+/// Go: `TestE2E_RefSetChecksGitCompleteness`.
+#[test]
+fn ref_set_checks_git_completeness() {
+    use amber_store_core::gitobj::{self, Kind};
+    let store = TempDir::new().unwrap();
+    let (head, _) = store_git_branch(store.path());
+    let objects = open_objects(store.path());
+    // A commit whose parent was never pushed, as from a shallow clone.
+    let body = format!(
+        "tree {}\nparent {}\n",
+        "0".repeat(40),
+        &head.to_string()[..40]
+    );
+    let data = gitobj::encode(Kind::Commit, body.as_bytes());
+    let shallow = gitobj::key_of(&data).unwrap();
+    objects.put_verified(shallow, &data).unwrap();
+    objects.close().unwrap();
+    run_store(
+        store.path(),
+        &["ref", "set", "partial", &shallow.to_string()],
+    )
+    .expect_err("ref set accepted a commit whose tree is not in the store");
+}

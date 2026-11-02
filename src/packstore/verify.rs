@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::amberpack::{REC_HEADER_SIZE, decode_payload, parse_record};
 use crate::commit::{self, Commit};
+use crate::gitobj;
 use crate::key::{self, Key, Type};
 
 use super::footer::{IndexEntry, SealedSegment, build_index_section, filter_key};
@@ -53,9 +54,10 @@ impl SealedSegment {
                 msg: format!("{path}: record at offset {off}: {e}"),
                 verify: false,
             })?;
-            if version_for(rec.flags) > self.version() {
+            if version_for(rec.key, rec.flags) > self.version() {
                 return Err(super::corrupt(format!(
-                    "{path}: record at offset {off}: codec {} in a version-{} segment",
+                    "{path}: record at offset {off}: {} key, codec {} in a version-{} segment",
+                    rec.key.type_(),
                     rec.flags,
                     self.version()
                 )));
@@ -138,10 +140,9 @@ impl SealedSegment {
 /// bytes plus the trees it records — which the commit's own bytes suffice to
 /// recompute. A commit that does not decode fails verification. The other
 /// aggregate types (FileNode/DirLeaf/DirNode) carry a logical length the
-/// store does not recompute, so only their hash is checked (Go:
-/// `verifyObject`).
+/// store does not recompute, so only their hash is checked. A git object is held
+/// to its SHA-1 instead, and to its frame ([`gitobj::verify`]) (Go: `verifyObject`).
 pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
-    let sum = *blake3::hash(data).as_bytes();
     let raw_type = k.as_bytes()[key::SIZE - 1] >> 4;
     let Some(t) = Type::from_u8(raw_type) else {
         // Go: key.NewFromHash rejects the reserved type nibble.
@@ -149,6 +150,11 @@ pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
             "packstore: object verification failed: {k}: key: reserved object type: {raw_type}"
         ));
     };
+    if t == Type::GitSha1 {
+        return gitobj::verify(k, data)
+            .map_err(|e| format!("packstore: object verification failed: {k}: {e}"));
+    }
+    let sum = *blake3::hash(data).as_bytes();
     let want = Key::new_from_hash(t, k.length(), sum);
     if want != k {
         return Err(format!(
@@ -178,7 +184,7 @@ pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
                 ));
             }
         }
-        Type::FileNode | Type::DirLeaf | Type::DirNode => {}
+        Type::FileNode | Type::DirLeaf | Type::DirNode | Type::GitSha1 => {}
     }
     Ok(())
 }

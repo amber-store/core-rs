@@ -7,12 +7,15 @@ use std::fmt;
 /// Size is the fixed byte length of every key.
 pub const SIZE: usize = 32;
 
+/// The byte length of the SHA-1 a [`Type::GitSha1`] key holds.
+pub const GIT_SHA1_SIZE: usize = 20;
+
 /// The 4-bit CAS object type carried in the high nibble of a key's header byte
 /// (`architecture/types.md`).
 ///
 /// Unlike the Go implementation (where `Type` is a plain `uint8` that may hold
-/// reserved values), this enum can only represent the six defined types.
-/// Reserved raw values (6..=15, and anything above the 4-bit field) are handled
+/// reserved values), this enum can only represent the seven defined types.
+/// Reserved raw values (7..=15, and anything above the 4-bit field) are handled
 /// as `u8` via [`Type::from_u8`] / [`Type::is_valid`] and surface as
 /// [`Error::ReservedType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -31,18 +34,21 @@ pub enum Type {
     /// Snapshot record: tree, parent commits, author, committer, message
     /// (`crate::commit`).
     Commit = 5,
+    /// A git object, addressed by its SHA-1 (`crate::gitobj`,
+    /// `architecture/git-objects.md`).
+    GitSha1 = 6,
 }
 
 impl Type {
-    /// Reports whether `v` is a defined CAS object type (0..5). Values 6..15
+    /// Reports whether `v` is a defined CAS object type (0..6). Values 7..15
     /// are reserved and must not be emitted; values above 15 do not fit the
     /// 4-bit field.
     pub const fn is_valid(v: u8) -> bool {
-        v <= Type::Commit as u8
+        v <= Type::GitSha1 as u8
     }
 
     /// Converts a raw type value to a [`Type`], or `None` if `v` is reserved
-    /// (6..15) or out of range.
+    /// (7..15) or out of range.
     pub const fn from_u8(v: u8) -> Option<Type> {
         match v {
             0 => Some(Type::Blob),
@@ -51,6 +57,7 @@ impl Type {
             3 => Some(Type::DirNode),
             4 => Some(Type::XattrSet),
             5 => Some(Type::Commit),
+            6 => Some(Type::GitSha1),
             _ => None,
         }
     }
@@ -69,6 +76,7 @@ impl fmt::Display for Type {
             Type::DirNode => "DirNode",
             Type::XattrSet => "XattrSet",
             Type::Commit => "Commit",
+            Type::GitSha1 => "GitSHA1",
         })
     }
 }
@@ -85,13 +93,16 @@ pub enum Error {
     /// The header's reserved bit (bit 3) is set.
     #[error("key: reserved header bit is set")]
     ReservedBitSet,
-    /// The object type is reserved (6..15) or out of range; carries the raw
+    /// The object type is reserved (7..15) or out of range; carries the raw
     /// type value.
     #[error("key: reserved object type: {0}")]
     ReservedType(u8),
     /// The length field has leading-zero padding.
     #[error("key: non-canonical length encoding")]
     NonCanonicalLength,
+    /// A [`Type::GitSha1`] key has something other than zeros after its SHA-1.
+    #[error("key: non-canonical git key")]
+    NonCanonicalGitKey,
 }
 
 /// A 32-byte lookup key. It is a small `Copy` value type, directly comparable
@@ -102,7 +113,8 @@ pub enum Error {
 /// The bytes are the (header, length, hash) encoding of
 /// `architecture/keys.md` reversed: the truncated hash comes first and the
 /// header byte last, so keys sort and bucket uniformly on their leading
-/// bytes.
+/// bytes. A [`Type::GitSha1`] key has a layout of its own, see
+/// [`Key::new_git_sha1`].
 ///
 /// The inner byte array is public, mirroring Go's transparent `[32]byte`;
 /// bytes obtained from untrusted input must go through [`Key::parse`] (or
@@ -126,7 +138,12 @@ impl Key {
     /// Computes the BLAKE3-256 digest of `serialized`, then assembles a
     /// canonical key via [`Key::new_from_hash`]. `length` is the logical
     /// payload length and is taken as given (it need not equal
-    /// `serialized.len()` — see [`Key::new_from_hash`]).
+    /// `serialized.len()` — see [`Key::new_from_hash`]). A [`Type::GitSha1`]
+    /// key is not made here: see [`Key::new_git_sha1`].
+    ///
+    /// # Panics
+    ///
+    /// Panics on [`Type::GitSha1`], as [`Key::new_from_hash`] does.
     pub fn new(t: Type, length: u64, serialized: &[u8]) -> Key {
         Key::new_from_hash(t, length, *blake3::hash(serialized).as_bytes())
     }
@@ -138,10 +155,19 @@ impl Key {
     /// `FileNode`/`DirLeaf`/`DirNode` and `Commit` it is a logical size (see
     /// `architecture/types.md`).
     ///
-    /// Infallible, unlike Go's `NewFromHash`: its only error
-    /// (`ErrReservedType`) is unrepresentable because [`Type`] admits only
-    /// defined types.
+    /// Infallible, unlike Go's `NewFromHash`: `ErrReservedType` is
+    /// unrepresentable because [`Type`] admits only defined types.
+    ///
+    /// # Panics
+    ///
+    /// Panics on [`Type::GitSha1`], where Go returns `ErrNotBlake3`: such a key
+    /// would look canonical and name no git object at all. Asking for one is a
+    /// caller bug, and [`Key::new_git_sha1`] makes the real thing.
     pub fn new_from_hash(t: Type, length: u64, full_hash: [u8; SIZE]) -> Key {
+        assert!(
+            t != Type::GitSha1,
+            "key: this type is not addressed by BLAKE3: {t}"
+        );
         let ls = length_size_for(length);
         let mut k = [0u8; SIZE];
         k[HEADER_AT] = (t as u8) << 4 | (ls as u8 - 1);
@@ -150,6 +176,35 @@ impl Key {
         hash.copy_from_slice(&full_hash[..HEADER_AT - ls]);
         hash.reverse();
         Key(k)
+    }
+
+    /// Assembles the key of a git object from its SHA-1. The layout is not the
+    /// reversed one: the SHA-1 comes first, in digest order, so a key's hex
+    /// starts with the object's git id and keys sort as git ids do. Then come
+    /// ten zero bytes, the length (a git object's id does not tell its size, so
+    /// a key made from a link in another object could not hold one: it is
+    /// always zero) and the header. See `architecture/keys.md`.
+    pub fn new_git_sha1(sum: [u8; GIT_SHA1_SIZE]) -> Key {
+        let mut k = [0u8; SIZE];
+        k[..GIT_SHA1_SIZE].copy_from_slice(&sum);
+        k[HEADER_AT] = (Type::GitSha1 as u8) << 4;
+        Key(k)
+    }
+
+    /// The SHA-1 a [`Type::GitSha1`] key holds, or `None` for a key of any other
+    /// type (Go: `GitSHA1Sum`).
+    pub fn git_sha1_sum(&self) -> Option<[u8; GIT_SHA1_SIZE]> {
+        if !self.is_git() {
+            return None;
+        }
+        let mut sum = [0u8; GIT_SHA1_SIZE];
+        sum.copy_from_slice(&self.0[..GIT_SHA1_SIZE]);
+        Some(sum)
+    }
+
+    /// Whether the type nibble says [`Type::GitSha1`], on any bytes.
+    fn is_git(&self) -> bool {
+        self.0[HEADER_AT] >> 4 == Type::GitSha1 as u8
     }
 
     /// Copies `b` into a `Key` and validates its canonical form. `b` must be
@@ -166,9 +221,11 @@ impl Key {
     }
 
     /// Reports whether the key is canonical: the reserved bit is clear, the
-    /// type is defined (0..5), and the length field is minimally encoded (its
-    /// most significant byte, the one next to the header, is non-zero, except
-    /// for the single `0x00` byte that encodes a zero length).
+    /// type is defined (0..6), the length field is minimally encoded (its most
+    /// significant byte, the one next to the header, is non-zero, except for
+    /// the single `0x00` byte that encodes a zero length), and a
+    /// [`Type::GitSha1`] key has nothing but zeros after its SHA-1, so that one
+    /// git object has one key.
     pub fn validate(&self) -> Result<(), Error> {
         if self.0[HEADER_AT] & 0x08 != 0 {
             return Err(Error::ReservedBitSet);
@@ -180,7 +237,16 @@ impl Key {
         if self.0[HEADER_AT - 1] == 0 && !(self.length_size() == 1 && self.length() == 0) {
             return Err(Error::NonCanonicalLength);
         }
+        if self.is_git() && !self.has_git_tail() {
+            return Err(Error::NonCanonicalGitKey);
+        }
         Ok(())
+    }
+
+    /// Whether everything between a git key's SHA-1 and its type is zero: the
+    /// padding, the length and the length size.
+    fn has_git_tail(&self) -> bool {
+        self.0[HEADER_AT] & 0x07 == 0 && self.0[GIT_SHA1_SIZE..HEADER_AT].iter().all(|&b| b == 0)
     }
 
     /// Returns the CAS object type from the header's high nibble.
@@ -213,10 +279,14 @@ impl Key {
         u64::from_le_bytes(buf)
     }
 
-    /// Returns the truncated payload hash (`len == SIZE - 1 - length_size()`)
-    /// in digest order, a copy: the key stores it reversed (Go: `Hash`,
-    /// likewise a copy).
+    /// Returns the payload hash in digest order, a copy (Go: `Hash`, likewise a
+    /// copy). For a BLAKE3 key that is the truncated digest
+    /// (`len == SIZE - 1 - length_size()`), which the key stores reversed; for a
+    /// [`Type::GitSha1`] key it is the SHA-1, [`GIT_SHA1_SIZE`] bytes.
     pub fn hash(&self) -> Vec<u8> {
+        if self.is_git() {
+            return self.0[..GIT_SHA1_SIZE].to_vec();
+        }
         let mut h = self.0[..HEADER_AT - self.length_size()].to_vec();
         h.reverse();
         h
@@ -464,9 +534,9 @@ mod tests {
     #[test]
     fn validate_reserved_type() {
         let mut k = Key([0u8; SIZE]);
-        k.0[31] = 6 << 4; // type 6, length_size 1
+        k.0[31] = 7 << 4; // type 7, length_size 1
         k.0[30] = 0x01;
-        assert_eq!(k.validate(), Err(Error::ReservedType(6)));
+        assert_eq!(k.validate(), Err(Error::ReservedType(7)));
     }
 
     #[test]
@@ -517,12 +587,138 @@ mod tests {
         assert_eq!(k.validate(), Ok(()));
     }
 
+    // The object id git gives an empty blob, and the key that stands for it
+    // (Go: `key/git_test.go`).
+    const EMPTY_BLOB_OID: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
+    fn empty_blob_sum() -> [u8; GIT_SHA1_SIZE] {
+        let mut sum = [0u8; GIT_SHA1_SIZE];
+        for (i, b) in sum.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&EMPTY_BLOB_OID[2 * i..2 * i + 2], 16).unwrap();
+        }
+        sum
+    }
+
+    #[test]
+    fn git_key_layout() {
+        let k = Key::new_git_sha1(empty_blob_sum());
+        let want = format!("{EMPTY_BLOB_OID}{}0060", "00".repeat(10));
+        assert_eq!(k.to_string(), want);
+        assert_eq!(k.validate(), Ok(()));
+    }
+
+    #[test]
+    fn git_key_accessors() {
+        let sum = empty_blob_sum();
+        let k = Key::new_git_sha1(sum);
+        assert_eq!(k.type_(), Type::GitSha1);
+        assert_eq!((k.length(), k.length_size()), (0, 1));
+        // A git key's hash is the SHA-1 alone, in digest order: not the 30
+        // bytes a BLAKE3 key's hash takes, and not reversed.
+        assert_eq!(k.hash(), sum.to_vec());
+        assert_eq!(k.git_sha1_sum(), Some(sum));
+        assert_eq!(Key::new(Type::Blob, 0, &[]).git_sha1_sum(), None);
+    }
+
+    #[test]
+    fn git_key_parse_round_trip() {
+        let k = Key::new_git_sha1(empty_blob_sum());
+        assert_eq!(Key::parse(&k.0), Ok(k));
+    }
+
+    /// Only one key may stand for one SHA-1: anything but the zero padding and
+    /// the zero length would let the same git object sit under many keys.
+    #[test]
+    fn git_key_validate_refuses_everything_but_the_layout() {
+        let good = Key::new_git_sha1(empty_blob_sum());
+        type Edit = fn(&mut Key);
+        let cases: &[(&str, Edit, Error)] = &[
+            (
+                "padding, first byte",
+                |k| k.0[GIT_SHA1_SIZE] = 1,
+                Error::NonCanonicalGitKey,
+            ),
+            (
+                "padding, last byte",
+                |k| k.0[HEADER_AT - 2] = 1,
+                Error::NonCanonicalGitKey,
+            ),
+            (
+                "a length",
+                |k| k.0[HEADER_AT - 1] = 5,
+                Error::NonCanonicalGitKey,
+            ),
+            (
+                "two length bytes, a value",
+                |k| {
+                    k.0[HEADER_AT] |= 1;
+                    k.0[HEADER_AT - 1] = 5;
+                },
+                Error::NonCanonicalGitKey,
+            ),
+            (
+                "two length bytes, zero",
+                |k| k.0[HEADER_AT] |= 1,
+                Error::NonCanonicalLength,
+            ),
+            (
+                "reserved bit",
+                |k| k.0[HEADER_AT] |= 0x08,
+                Error::ReservedBitSet,
+            ),
+        ];
+        for (name, edit, want) in cases {
+            let mut k = good;
+            edit(&mut k);
+            assert_eq!(k.validate(), Err(*want), "{name}");
+            assert_eq!(Key::parse(&k.0), Err(*want), "{name}");
+        }
+    }
+
+    /// The padding rule is the git type's alone: a BLAKE3 key has hash bytes
+    /// there.
+    #[test]
+    fn git_key_rule_leaves_other_types_alone() {
+        for t in [
+            Type::Blob,
+            Type::FileNode,
+            Type::DirLeaf,
+            Type::DirNode,
+            Type::XattrSet,
+            Type::Commit,
+        ] {
+            assert_eq!(Key::new_from_hash(t, 0, [0xab; SIZE]).validate(), Ok(()));
+        }
+    }
+
+    /// Go: `TestGitKey_NotFromTheBlake3Constructors`, whose `ErrNotBlake3` is a
+    /// panic here, these constructors being infallible.
+    #[test]
+    #[should_panic(expected = "this type is not addressed by BLAKE3: GitSHA1")]
+    fn git_key_not_from_new_from_hash() {
+        let _ = Key::new_from_hash(Type::GitSha1, 0, [0; SIZE]);
+    }
+
+    #[test]
+    #[should_panic(expected = "this type is not addressed by BLAKE3: GitSHA1")]
+    fn git_key_not_from_new() {
+        let _ = Key::new(Type::GitSha1, 0, b"blob 0\0");
+    }
+
+    #[test]
+    fn git_key_error_text_matches_go() {
+        assert_eq!(
+            Error::NonCanonicalGitKey.to_string(),
+            "key: non-canonical git key"
+        );
+    }
+
     #[test]
     fn type_is_valid() {
-        for v in 0u8..=5 {
+        for v in 0u8..=6 {
             assert!(Type::is_valid(v), "Type({v}) should be valid");
         }
-        for v in [6u8, 7, 15, 16, 255] {
+        for v in [7u8, 8, 15, 16, 255] {
             assert!(!Type::is_valid(v), "Type({v}) should be invalid");
         }
     }
@@ -535,7 +731,8 @@ mod tests {
         assert_eq!(Type::from_u8(3), Some(Type::DirNode));
         assert_eq!(Type::from_u8(4), Some(Type::XattrSet));
         assert_eq!(Type::from_u8(5), Some(Type::Commit));
-        for v in [6u8, 15, 16, 255] {
+        assert_eq!(Type::from_u8(6), Some(Type::GitSha1));
+        for v in [7u8, 15, 16, 255] {
             assert_eq!(Type::from_u8(v), None, "Type({v})");
         }
     }
@@ -549,6 +746,7 @@ mod tests {
             (Type::DirNode, "DirNode"),
             (Type::XattrSet, "XattrSet"),
             (Type::Commit, "Commit"),
+            (Type::GitSha1, "GitSHA1"),
         ];
         for (t, want) in cases {
             assert_eq!(t.to_string(), want);

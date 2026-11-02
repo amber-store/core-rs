@@ -27,7 +27,7 @@ device, fifo, or socket entry holds its small data **inline** and references no 
 
 ## CAS object types
 
-The 4-bit type field has 16 slots; 6 are defined.
+The 4-bit type field has 16 slots; 7 are defined.
 
 | Type | Name       | Role                                                              | Key length field encodes        | Child object types   |
 |------|------------|------------------------------------------------------------------|---------------------------------|----------------------|
@@ -37,12 +37,15 @@ The 4-bit type field has 16 slots; 6 are defined.
 | 3    | `DirNode`  | Directory index node, keyed by entry name (directory tree).      | **own bytes + subtree footprint** | `DirNode` / `DirLeaf`|
 | 4    | `XattrSet` | Spilled extended attributes, when too large to store inline.     | own serialized byte length      | —                    |
 | 5    | `Commit`   | Snapshot record: a directory root (or the sides of a conflict), parent commits, author, committer, message, change id ([commits.md](commits.md)). | **own bytes + the footprints of its trees**; parents are not counted | `DirLeaf` / `DirNode` (tree and conflict terms), `Commit` (parents) |
-| 6–15 | reserved   | Must not be emitted.                                             | —                               | —                    |
+| 6    | `GitSHA1`  | A git object of any kind, addressed by its SHA-1 ([git-objects.md](git-objects.md)). | **always 0**: a git id does not tell a size | `GitSHA1` (what git follows from it) |
+| 7–15 | reserved   | Must not be emitted.                                             | —                               | —                    |
 
 **Leaf and internal nodes are distinct types** (`Blob`/`FileNode`,
 `DirLeaf`/`DirNode`) so the key alone tells a reader whether following it yields
-data or more index — no fetch-then-discriminate. With 11 free slots this costs
-nothing.
+data or more index — no fetch-then-discriminate. With 9 free slots this costs
+nothing. `GitSHA1` is the exception: a git id does not say what kind of object it
+names, so one type stands for them all, and a reader goes by the object's own
+frame.
 
 ## Length field: logical size, not serialized size
 
@@ -66,6 +69,7 @@ extends the rule [keys.md](keys.md) already states for directories:
   overflows, and a directory that holds a commit would report the size of a whole
   history ([commits.md](commits.md#the-key)). The commit's own bytes name its
   trees, so the store recomputes and verifies this length.
+- `GitSHA1`: length = 0, always. It says nothing about the object.
 
 For directories the cumulative therefore counts, across the whole subtree: every
 regular file's content bytes, every directory object's (`DirLeaf`/`DirNode`) own
@@ -136,6 +140,15 @@ The top of a store is simply a directory key (`DirLeaf` or `DirNode`). Because
 entry metadata lives in the *parent* entry, the **root directory carries no
 metadata of its own** for now — whatever external reference names the root key can
 hold root ownership/mode/mtime later if needed.
+
+## Git objects
+
+A [`GitSHA1`](git-objects.md) key holds a git object as git hashed it, so a
+repository can be pushed and keep its ids. It is a world apart from the types
+above: a git tree holds no directory entries of this store's, a store's `Commit`
+cannot name a git key, and the file operations refuse one. What it shares with them
+is the store: the packs, references, and a collector that follows what git follows
+from it.
 
 ## Commits
 

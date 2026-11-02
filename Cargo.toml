@@ -19,6 +19,7 @@ thiserror = "2"
 memmap2 = "0.9"
 libc = "0.2"
 xattr = "1"
+sha1-checked = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

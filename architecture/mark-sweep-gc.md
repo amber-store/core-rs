@@ -39,9 +39,13 @@ refLock.Lock    barrier on; snapshot the reference roots   (writers stall: µs)
 refLock.Lock    sweep: packstore.Compact                   (writers stall)
 ```
 
-- **Mark.** For each root in the snapshot, a DFS over `fstree.ChildKeys`.
+- **Mark.** For each root in the snapshot, a DFS over `fstree.Links`.
   Already-marked keys prune the walk, so shared subtrees cost once. A
-  missing object aborts the cycle loudly.
+  missing object aborts the cycle loudly. A [git object](git-objects.md) has
+  links too, and a blob among them is marked unread as well, on the word of the
+  tree entry or tag that names it. Since that word can be contradicted by another
+  link, a git key prunes on a second bit, set when its links are followed
+  (`MarkSet.MarkWalked`), and not on the mark.
 - **Sweep** (`packstore.Compact`): seal the active segment; select as
   victims the sealed packs whose dead bytes reach the garbage line
   (`--garbage`, policy 0.5, or 0.1 under min-free pressure) *and* whose

@@ -148,6 +148,9 @@ fn golden_fstree_objects() {
             Type::Commit => {
                 panic!("object {i}: the golden tree holds no commits (see commit.json)")
             }
+            Type::GitSha1 => {
+                panic!("object {i}: the golden tree holds no git objects (see gitobj.json)")
+            }
         }
     }
 

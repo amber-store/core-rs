@@ -8,7 +8,7 @@
 //! [`check_complete`], whose Go counterparts require a getter that is safe
 //! for concurrent use.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::sync::Mutex;
@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{Entry, Error, decode_dir_leaf, decode_dir_node, decode_file_node, scan};
 use crate::commit::{self, Commit};
+use crate::gitobj;
+pub use crate::gitobj::Link;
 use crate::key::{self, Key, Type};
 
 /// POSIX file-type mask/dir bits (Go uses `unix.S_IFMT` / `unix.S_IFDIR`;
@@ -27,7 +29,7 @@ const S_IFDIR: u64 = 0o040000;
 /// diagnostic text.
 ///
 /// Go's trailing `fstree: unknown object type %s` branch is unrepresentable:
-/// [`Type`] admits only the six defined types, all of which are handled, and
+/// [`Type`] admits only the seven defined types, all of which are handled, and
 /// a non-canonical key panics in [`Key::type_`] per that method's contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildKeysError {
@@ -58,6 +60,13 @@ pub enum ChildKeysError {
         key: Key,
         /// The decode failure.
         source: Error,
+    },
+    /// `fstree: decoding git object <key>: <err>`
+    DecodeGit {
+        /// The git object's key.
+        key: Key,
+        /// The decode failure.
+        source: crate::gitobj::Error,
     },
     /// `fstree: decoding Commit <key>: <err>`
     DecodeCommit {
@@ -118,6 +127,9 @@ impl fmt::Display for ChildKeysError {
             ChildKeysError::DecodeDirLeaf { key, source } => {
                 write!(f, "fstree: decoding DirLeaf {key}: {source}")
             }
+            ChildKeysError::DecodeGit { key, source } => {
+                write!(f, "fstree: decoding git object {key}: {source}")
+            }
             ChildKeysError::DecodeCommit { key, source } => {
                 write!(f, "fstree: decoding Commit {key}: {source}")
             }
@@ -155,6 +167,7 @@ impl std::error::Error for ChildKeysError {
             ChildKeysError::DecodeFileNode { source, .. }
             | ChildKeysError::DecodeDirNode { source, .. }
             | ChildKeysError::DecodeDirLeaf { source, .. } => Some(source),
+            ChildKeysError::DecodeGit { source, .. } => Some(source),
             ChildKeysError::DecodeCommit { source, .. }
             | ChildKeysError::CommitFootprint { source, .. } => Some(source),
             ChildKeysError::CommitLength { .. } => None,
@@ -415,7 +428,8 @@ impl<E: std::error::Error + 'static> std::error::Error for WalkError<E> {
 /// terms of a conflicted tree, then its parents, all in recorded order — so
 /// every walk built on `child_keys` follows history and keeps every side of a
 /// conflict. A DirLeaf's children are its entries' content keys whatever
-/// their type, so a directory entry that holds a Commit is followed too.
+/// their type, so a directory entry that holds a Commit is followed too. A git
+/// object's children are what git follows from it ([`gitobj::links`]).
 pub fn child_keys(k: Key, data: &[u8]) -> Result<Vec<Key>, ChildKeysError> {
     match k.type_() {
         Type::Blob | Type::XattrSet => Ok(Vec::new()),
@@ -464,6 +478,59 @@ pub fn child_keys(k: Key, data: &[u8]) -> Result<Vec<Key>, ChildKeysError> {
             out.extend(c.parents);
             Ok(out)
         }
+        Type::GitSha1 => Ok(git_links(k, data)?.iter().map(|l| l.key).collect()),
+    }
+}
+
+/// The link to a root, which no object refers to: all that is known of it is what
+/// its key says. A Blob or XattrSet key says it is a leaf. A git key says nothing
+/// of the kind: it holds a SHA-1 alone, and a blob and a commit look the same (Go:
+/// `LinkTo`).
+pub fn link_to(k: Key) -> Link {
+    Link {
+        key: k,
+        leaf: matches!(k.type_(), Type::Blob | Type::XattrSet),
+    }
+}
+
+/// Returns what [`child_keys`] returns, with each child's `leaf` set. A child's
+/// own key tells for the store's own types. For a git object the referring object
+/// tells: a tree entry's mode or a tag's type line says which targets are blobs.
+///
+/// That is a claim, and two links can disagree: one tree entry may call an object
+/// a file and another call it a directory. A walk must therefore not prune on a
+/// key it has seen only through a `leaf` link, or it passes over what the other
+/// link reaches (Go: `Links`).
+pub fn links(k: Key, data: &[u8]) -> Result<Vec<Link>, ChildKeysError> {
+    if k.type_() == Type::GitSha1 {
+        return git_links(k, data);
+    }
+    Ok(child_keys(k, data)?.into_iter().map(link_to).collect())
+}
+
+fn git_links(k: Key, data: &[u8]) -> Result<Vec<Link>, ChildKeysError> {
+    gitobj::links(data).map_err(|source| ChildKeysError::DecodeGit { key: k, source })
+}
+
+/// What a walk has seen: every key it has met, and for each whether it has been
+/// sent to be read. A key met through a `leaf` link alone is present and `false`,
+/// so that a later link that does not say `leaf` still gets it read (Go: `visits`).
+#[derive(Default)]
+struct Visits(HashMap<Key, bool>);
+
+impl Visits {
+    /// Records a link. Returns `(is_new, act)`: `is_new` says the key had not been
+    /// met before; `act` says there is something to do for this link: a test for
+    /// presence if it is a leaf, a read if not.
+    fn visit(&mut self, l: Link) -> (bool, bool) {
+        let seen = self.0.get(&l.key).copied();
+        if let Some(read) = seen
+            && (l.leaf || read)
+        {
+            return (false, false);
+        }
+        self.0.insert(l.key, !l.leaf);
+        (seen.is_none(), true)
     }
 }
 
@@ -607,8 +674,8 @@ pub struct DirectoryReader<G> {
     get: G,
     capacity: usize,
     clock: u64,
-    directories: std::collections::HashMap<Key, (DecodedDirectory, u64)>,
-    commits: std::collections::HashMap<Key, Key>,
+    directories: HashMap<Key, (DecodedDirectory, u64)>,
+    commits: HashMap<Key, Key>,
 }
 
 enum DecodedDirectory {
@@ -632,8 +699,8 @@ where
             get,
             capacity: capacity.max(1),
             clock: 0,
-            directories: std::collections::HashMap::new(),
-            commits: std::collections::HashMap::new(),
+            directories: HashMap::new(),
+            commits: HashMap::new(),
         }
     }
 
@@ -979,7 +1046,8 @@ where
 /// remaining keys in unspecified order (callers must not rely on any ordering
 /// beyond root-first), each key listed once even when referenced repeatedly.
 /// `root` may be any object type. `get` fetches the bytes stored under a key;
-/// Blob and XattrSet objects are leaves and are not fetched.
+/// objects known to be leaves are not fetched: Blob and XattrSet objects, and git
+/// blobs a tree or tag says are blobs ([`links`]).
 ///
 /// The walk is a breadth-first sweep that fetches each round's frontier
 /// concurrently (bounded by the available parallelism), so a wide tree of
@@ -994,28 +1062,30 @@ where
     E: Send,
 {
     let jobs = default_jobs();
-    let mut seen: HashSet<Key> = HashSet::from([root]);
+    let mut seen = Visits::default();
+    let first = link_to(root);
+    seen.visit(first);
     let mut out = vec![root];
-    let mut frontier = vec![root];
+    let mut frontier = if first.leaf { Vec::new() } else { vec![root] };
 
     while !frontier.is_empty() {
         // Fetch each frontier node's children concurrently; indexing by
         // position keeps the result deterministic regardless of completion
         // order.
-        let child_lists = parallel_map(&frontier, jobs, |k| {
-            if matches!(k.type_(), Type::Blob | Type::XattrSet) {
-                return Ok(Vec::new()); // leaf: no children, nothing to fetch
-            }
+        let child_lists = parallel_map(&frontier, jobs, |k: Key| {
             let data = get(k).map_err(|source| WalkError::Read { key: k, source })?;
-            child_keys(k, &data).map_err(WalkError::Children)
+            links(k, &data).map_err(WalkError::Children)
         });
 
         let mut next = Vec::new();
         for children in child_lists {
-            for ck in children? {
-                if seen.insert(ck) {
-                    out.push(ck);
-                    next.push(ck);
+            for l in children? {
+                let (is_new, act) = seen.visit(l);
+                if is_new {
+                    out.push(l.key);
+                }
+                if act && !l.leaf {
+                    next.push(l.key);
                 }
             }
         }
@@ -1031,9 +1101,9 @@ where
 /// checking each level's objects with up to `jobs` concurrent lookups
 /// (`jobs == 0` means the available parallelism, like Go's `jobs <= 0` ⇒
 /// GOMAXPROCS): interior nodes are read with `get` — a failed read surfaces
-/// as [`WalkError::Read`] wrapping the get error — and Blob and XattrSet
-/// leaves are tested with `has` — an absent leaf surfaces as
-/// [`WalkError::Missing`]. On error there is no partial list — `Err` is
+/// as [`WalkError::Read`] wrapping the get error — and leaves (Blob and XattrSet
+/// objects, and git blobs a tree or tag says are blobs: see [`links`]) are tested
+/// with `has` — an absent leaf surfaces as [`WalkError::Missing`]. On error there is no partial list — `Err` is
 /// returned (Go returns a nil visited list). `get` and `has` must be safe
 /// for concurrent use.
 pub fn check_complete<G, H, E>(
@@ -1048,13 +1118,16 @@ where
     E: Send,
 {
     let jobs = if jobs == 0 { default_jobs() } else { jobs };
+    let mut seen = Visits::default();
+    let first = link_to(root);
+    seen.visit(first);
     let mut visited = vec![root];
-    let mut seen: HashSet<Key> = HashSet::from([root]);
-    let mut frontier = vec![root];
+    let mut frontier = vec![first];
 
     while !frontier.is_empty() {
-        let results = parallel_map(&frontier, jobs, |k| {
-            if matches!(k.type_(), Type::Blob | Type::XattrSet) {
+        let results = parallel_map(&frontier, jobs, |l: Link| {
+            let k = l.key;
+            if l.leaf {
                 return match has(k) {
                     Ok(true) => Ok(Vec::new()),
                     Ok(false) => Err(WalkError::Missing(MissingObjectError { key: k })),
@@ -1062,15 +1135,18 @@ where
                 };
             }
             let data = get(k).map_err(|source| WalkError::Read { key: k, source })?;
-            child_keys(k, &data).map_err(WalkError::Children)
+            links(k, &data).map_err(WalkError::Children)
         });
 
         let mut next = Vec::new();
         for children in results {
-            for ck in children? {
-                if seen.insert(ck) {
-                    visited.push(ck);
-                    next.push(ck);
+            for l in children? {
+                let (is_new, act) = seen.visit(l);
+                if is_new {
+                    visited.push(l.key);
+                }
+                if act {
+                    next.push(l);
                 }
             }
         }
@@ -1090,9 +1166,10 @@ fn default_jobs() -> usize {
 /// returns the per-index results — deterministic regardless of scheduling.
 /// All items are processed even if some fail (as Go's errgroup runs every
 /// submitted task); the caller picks the first error in index order.
-fn parallel_map<T, E, F>(items: &[Key], jobs: usize, f: F) -> Vec<Result<T, E>>
+fn parallel_map<I, T, E, F>(items: &[I], jobs: usize, f: F) -> Vec<Result<T, E>>
 where
-    F: Fn(Key) -> Result<T, E> + Sync,
+    I: Copy + Sync,
+    F: Fn(I) -> Result<T, E> + Sync,
     T: Send,
     E: Send,
 {
@@ -1128,7 +1205,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::convert::Infallible;
 
     use super::super::{

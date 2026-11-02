@@ -333,3 +333,84 @@ fn golden_segments_rewrite_rotate_reopen() {
     }
     s2.verify(|| false).expect("verify after reopen");
 }
+
+#[derive(serde::Deserialize)]
+struct GitManifest {
+    segment_size: u64,
+    root: String,
+    objects: Vec<GitObject>,
+    unreached: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GitObject {
+    key: String,
+    data_hex: String,
+}
+
+/// A store holding a small git history, written by Go (`segments_go_git`). Its
+/// segments are at format version 4, and Rust must open it, serve every object,
+/// walk what a reference to its root would keep, pass a full verify, and resume the
+/// version-4 active segment.
+#[test]
+fn golden_segments_go_git() {
+    let Some(bytes) = common::load("segments_go_git/manifest.json") else {
+        return;
+    };
+    let m: GitManifest = serde_json::from_slice(&bytes).expect("manifest parses");
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    copy_fixture_of("segments_go_git", dir.path());
+    let mut versions = 0;
+    for entry in fs::read_dir(dir.path()).expect("read_dir") {
+        let path = entry.expect("entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.ends_with(".seg") || name.ends_with(".seg.active") {
+            assert_eq!(fs::read(&path).expect("read")[7], 4, "{name}");
+            versions += 1;
+        }
+    }
+    assert!(versions >= 2, "the fixture has {versions} segments");
+
+    let root = parse_key(&m.root, "root");
+    let check = |s: &Store| {
+        let mut want = Vec::new();
+        for o in &m.objects {
+            let k = parse_key(&o.key, "object");
+            let data = hex::decode(&o.data_hex).expect("data_hex");
+            assert_eq!(s.get(k).expect("get"), data, "object {}", o.key);
+            amber_store_core::gitobj::verify(k, &data).expect("verify");
+            want.push(k);
+        }
+        want.sort();
+        let mut got = amber_store_core::fstree::check_complete(root, |k| s.get(k), |k| s.has(k), 4)
+            .expect("check_complete");
+        got.sort();
+        assert_eq!(got, want, "check_complete from the root");
+        let mut got =
+            amber_store_core::fstree::reachable_keys(root, |k| s.get(k)).expect("reachable_keys");
+        got.sort();
+        assert_eq!(got, want, "reachable_keys from the root");
+        for u in &m.unreached {
+            assert!(s.has(parse_key(u, "unreached")).expect("has"), "{u}");
+        }
+    };
+
+    let s = Store::open_with(dir.path(), Options::new().segment_size(m.segment_size))
+        .expect("open Go-written store");
+    check(&s);
+    s.verify(|| false).expect("verify on the Go-written store");
+
+    // Resume the Go-written version-4 active segment with a new git object.
+    let extra =
+        amber_store_core::gitobj::encode(amber_store_core::gitobj::Kind::Blob, b"resumed\n");
+    let extra_key = amber_store_core::gitobj::key_of(&extra).expect("key_of");
+    s.put(extra_key, &extra)
+        .expect("put on the resumed Go tail");
+    s.close().expect("close");
+    let s2 =
+        Store::open_with(dir.path(), Options::new().segment_size(m.segment_size)).expect("reopen");
+    check(&s2);
+    assert_eq!(s2.get(extra_key).expect("get(extra)"), extra);
+    s2.verify(|| false)
+        .expect("verify after the resumed append");
+}

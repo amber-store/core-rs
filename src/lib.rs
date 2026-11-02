@@ -10,7 +10,7 @@
 //!
 //! | Module | Role |
 //! |--------|------|
-//! | [`key`] | The 32-byte content key: type, length, truncated BLAKE3 hash. |
+//! | [`key`] | The 32-byte content key: type, length, truncated BLAKE3 hash (for a git object, its SHA-1). |
 //! | [`cbor`] | Shared deterministic-CBOR helpers (RFC 8949 §4.2). |
 //! | [`chunkers`] | Content-defined chunking: UltraCDC bytes + BLAKE3 item runs. |
 //! | [`binaryfuse`] | Binary fuse filter (16-bit), bit-compatible with FastFilter/xorfilter. |
@@ -22,6 +22,7 @@
 //! | [`refstore`] | Name → reference-record map in SQLite (WAL, multi-process, optimistic updates); the file is shared with Go. |
 //! | [`reference`] | The reference record: canonical CBOR encoding and validation. |
 //! | [`commit`] | The commit record (object type 5): canonical CBOR encoding and validation. |
+//! | [`gitobj`] | Git objects (object type 6): the frame, the collision-detecting SHA-1 and the links a walk follows. |
 //! | [`inbox`] | Durable pack receiving. |
 //! | [`ingest`] | Build a tree from a local directory. |
 //! | [`tarexport`] | Stream a stored tree as a PAX tar. |
@@ -35,6 +36,7 @@ pub mod chunkers;
 pub mod commit;
 pub mod fstree;
 pub mod gc;
+pub mod gitobj;
 pub mod inbox;
 pub mod ingest;
 pub mod key;

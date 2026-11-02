@@ -1,5 +1,7 @@
 # Port notes: `key` (Go `key/` → `src/key.rs`)
 
+The git type's key, `Type::GitSha1`, is in [gitobj.md](gitobj.md).
+
 ## API mapping
 
 | Go | Rust |

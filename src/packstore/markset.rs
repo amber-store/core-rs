@@ -2,7 +2,7 @@
 //! by footer index position, plus a map for the active segment (Go:
 //! `packstore/markset.go`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::key::Key;
@@ -24,6 +24,11 @@ pub struct MarkSet {
     active: HashMap<Key, bool>,
     /// Keys marked so far.
     marked: usize,
+    /// What [`MarkSet::mark_walked`] records, apart from the mark. A bitmap is
+    /// allocated when first used: a store without git objects pays nothing for
+    /// it.
+    walked: Vec<Vec<u64>>,
+    active_walked: HashSet<Key>,
 }
 
 /// Where [`MarkSet::locate`] found a key.
@@ -43,6 +48,8 @@ impl Store {
             bits: Vec::with_capacity(sh.sealed.len()),
             active: HashMap::new(),
             marked: 0,
+            walked: vec![Vec::new(); sh.sealed.len()],
+            active_walked: HashSet::new(),
         };
         for g in &sh.sealed {
             m.segs.push(g.clone());
@@ -106,6 +113,30 @@ impl MarkSet {
                     self.marked += 1;
                 }
                 (newly, true)
+            }
+        }
+    }
+
+    /// Records that a walk follows `k`'s links, reporting whether it is the first
+    /// to. It is apart from [`MarkSet::mark`] because an object can be marked
+    /// without being read: a git key is marked through a link that calls it a
+    /// blob, and may still be named as a directory by another. It reports `false`
+    /// for a key that is not in the snapshot (Go: `MarkWalked`).
+    pub fn mark_walked(&mut self, k: Key) -> bool {
+        match self.locate(k) {
+            None => false,
+            Some(Loc::Active) => self.active_walked.insert(k),
+            Some(Loc::Sealed { seg, pos }) => {
+                let words = self.bits[seg].len();
+                let walked = &mut self.walked[seg];
+                if walked.is_empty() {
+                    walked.resize(words, 0);
+                }
+                let w = &mut walked[pos / 64];
+                let b = 1u64 << (pos % 64);
+                let first = *w & b == 0;
+                *w |= b;
+                first
             }
         }
     }

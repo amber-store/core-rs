@@ -1478,6 +1478,60 @@ mod tests {
 
     /// Go: TestCorruptPackQuarantined (with a log callback bolted on to
     /// exercise the slog port).
+    // Go: TestGitObjectsArriveInAPack.
+    #[test]
+    fn git_objects_arrive_in_a_pack() {
+        use crate::gitobj::{self, Kind};
+        let td = tempfile::tempdir().unwrap();
+        let store = new_test_store(td.path());
+        let ib = Inbox::open(td.path().join("inbox"), Arc::clone(&store), 2, None).unwrap();
+        let obj = |kind, body: &[u8]| {
+            let data = gitobj::encode(kind, body);
+            (gitobj::key_of(&data).unwrap(), data)
+        };
+        let blob = obj(Kind::Blob, b"hello\n");
+        let mut entry = b"100644 f\0".to_vec();
+        entry.extend_from_slice(&blob.0.git_sha1_sum().unwrap());
+        let tree = obj(Kind::Tree, &entry);
+        let body = pack_body(&[blob.clone(), tree.clone()]);
+        let (tmp, h, _) = ib.stage(&meta_for(tree.0), &body[..]).unwrap();
+        assert!(ib.commit(&tmp, &h, tree.0).unwrap());
+        ib.wait_for(tree.0);
+        for (k, d) in [blob, tree] {
+            assert_eq!(store.get(k).unwrap(), d);
+        }
+    }
+
+    // A pack is trusted for its framing and nothing else: a payload that does not
+    // hash to its SHA-1, or has no frame, does not get in, and the entry is
+    // quarantined. Go: TestForgedGitObjectIsQuarantined.
+    #[test]
+    fn forged_git_object_is_quarantined() {
+        use crate::gitobj::{self, Kind};
+        let real = gitobj::key_of(&gitobj::encode(Kind::Blob, b"hello\n")).unwrap();
+        let unframed: &[u8] = b"not a git object";
+        let cases: [(Key, Vec<u8>); 2] = [
+            (real, gitobj::encode(Kind::Blob, b"hullo\n")),
+            (gitobj::key_of(unframed).unwrap(), unframed.to_vec()),
+        ];
+        for (k, data) in cases {
+            let td = tempfile::tempdir().unwrap();
+            let store = new_test_store(td.path());
+            let dir = td.path().join("inbox");
+            let ib = Inbox::open(&dir, Arc::clone(&store), 1, None).unwrap();
+            let body = pack_body(&[(k, data)]);
+            let (tmp, h, _) = ib.stage(&meta_for(k), &body[..]).unwrap();
+            assert!(ib.commit(&tmp, &h, k).unwrap());
+            ib.wait_for(k);
+            assert!(!store.has(k).unwrap(), "a forged object got in");
+            let name = format!(
+                "{}.pack",
+                h.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
+            assert!(dir.join("failed").join(name).exists(), "not quarantined");
+        }
+    }
+
     #[test]
     fn corrupt_pack_quarantined() {
         let td = tempfile::tempdir().unwrap();
