@@ -2,8 +2,8 @@
 
 This crate is a port of `github.com/amber-store/core` (Go; formerly
 `jobs-build/amber-store-core`), pinned at commit
-`42c254791127b9ad7e9b0156f559ca446c74463c` (tag `v0.11.0`, the merge of PR
-#28, git objects). Since v0.9.0 the two are released under the same
+`86bc326fd9f818005d9ef522c52e0cd69d5f9020` (tag `v0.12.0`, the merge of PR
+#31, a sweep past a bad record). Since v0.9.0 the two are released under the same
 version number. Not yet ported from that range:
 Go PR #8's `inbox.WithGate`. The Go sources are the normative reference
 wherever this document or `architecture/` is silent; clone the parent fresh

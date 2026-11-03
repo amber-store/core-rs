@@ -199,3 +199,9 @@ The pin moved from the branch's pseudo-version to the release, `v0.11.0`
 (`42c2547`, the merge of Go PR #28). A full regeneration into a scratch directory
 at that pin reproduced every file of `tests/golden` byte for byte. `vectorgen` itself
 did not change with the pin.
+
+## Go v0.12.0 (2026-11-03)
+
+The pin moved to `v0.12.0` (`86bc326`, the merge of Go PR #31). The release changes no
+format, and a full regeneration into a scratch directory at that pin reproduced every
+file of `tests/golden` byte for byte. `vectorgen` itself did not change with the pin.
