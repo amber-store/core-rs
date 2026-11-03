@@ -133,16 +133,10 @@ impl SealedSegment {
     }
 }
 
-/// Recomputes `k` from `data` and reports a verification-failure message on
-/// mismatch (the complete `ErrVerify`-prefixed text Go produces). For Blob
-/// and XattrSet, whose key length is the serialized byte length, it also
-/// checks the length field; and for Commit, whose length is a footprint — own
-/// bytes plus the trees it records — which the commit's own bytes suffice to
-/// recompute. A commit that does not decode fails verification. The other
-/// aggregate types (FileNode/DirLeaf/DirNode) carry a logical length the
-/// store does not recompute, so only their hash is checked. A git object is held
-/// to its SHA-1 instead, and to its frame ([`gitobj::verify`]) (Go: `verifyObject`).
-pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
+/// Reports a verification-failure message (the complete `ErrVerify`-prefixed text Go
+/// produces) unless `data` hashes to `k`: that the bytes are what the key says. A git
+/// object is held to its SHA-1, and to its frame ([`gitobj::verify`]) (Go: `verifyHash`).
+pub(crate) fn verify_hash(k: Key, data: &[u8]) -> Result<Type, String> {
     let raw_type = k.as_bytes()[key::SIZE - 1] >> 4;
     let Some(t) = Type::from_u8(raw_type) else {
         // Go: key.NewFromHash rejects the reserved type nibble.
@@ -151,8 +145,9 @@ pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
         ));
     };
     if t == Type::GitSha1 {
-        return gitobj::verify(k, data)
-            .map_err(|e| format!("packstore: object verification failed: {k}: {e}"));
+        gitobj::verify(k, data)
+            .map_err(|e| format!("packstore: object verification failed: {k}: {e}"))?;
+        return Ok(t);
     }
     let sum = *blake3::hash(data).as_bytes();
     let want = Key::new_from_hash(t, k.length(), sum);
@@ -161,6 +156,20 @@ pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
             "packstore: object verification failed: payload hashes to {want}, not {k}"
         ));
     }
+    Ok(t)
+}
+
+/// Recomputes `k` from `data` and reports a verification-failure message on
+/// mismatch ([`verify_hash`]). For Blob
+/// and XattrSet, whose key length is the serialized byte length, it also
+/// checks the length field; and for Commit, whose length is a footprint — own
+/// bytes plus the trees it records — which the commit's own bytes suffice to
+/// recompute. A commit that does not decode fails verification. The other
+/// aggregate types (FileNode/DirLeaf/DirNode) carry a logical length the
+/// store does not recompute, so only their hash is checked (Go:
+/// `verifyObject`).
+pub(crate) fn verify_object(k: Key, data: &[u8]) -> Result<(), String> {
+    let t = verify_hash(k, data)?;
     match t {
         Type::Blob | Type::XattrSet => {
             if k.length() != data.len() as u64 {

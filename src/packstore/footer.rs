@@ -331,6 +331,26 @@ impl std::fmt::Debug for SealedSegment {
 }
 
 impl SealedSegment {
+    /// Reports whether this is a seal whose writer died before the rename, mapped as
+    /// the sealed segment it is about to be. Its body may never have been fsynced:
+    /// only the fsync that comes with finishing the seal says it has, so a store that
+    /// syncs must not acknowledge a write against it (Go: `crashedSeal`).
+    pub(crate) fn crashed_seal(&self) -> bool {
+        self.path.extension().is_some_and(|e| e == "active")
+    }
+
+    /// Looks at the segment's file. A crashed seal that is gone from its active name has
+    /// been finished by whoever held it, which the view hears of at its next refresh (Go:
+    /// `sealedSegment.stat`).
+    pub(crate) fn stat(&self) -> std::io::Result<std::fs::Metadata> {
+        match std::fs::metadata(&self.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.crashed_seal() => {
+                std::fs::metadata(super::view::sealed_path_of(&self.path))
+            }
+            res => res,
+        }
+    }
+
     /// The segment's format version (Go: `sealedSegment.version`).
     pub(crate) fn version(&self) -> u8 {
         self.mm[MAGIC_HEADER.len() - 1]

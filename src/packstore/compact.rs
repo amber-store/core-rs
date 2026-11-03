@@ -4,7 +4,7 @@
 //! `packstore/compact.go`, ported from Mic92's bitmap GC; see
 //! `architecture/mark-sweep-gc.md` and `specs/gc.qnt` in the Go repo).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -15,8 +15,10 @@ use crate::amberpack::{REC_HEADER_SIZE, decode_payload, parse_record};
 use crate::key::{self, Key};
 
 use super::footer::{INDEX_ENTRY_SIZE, IndexEntry, SealedSegment};
+use super::repair::{indexed_record_valid, valid_record};
 use super::verify::verify_object;
-use super::{AppendState, Error, MAGIC_HEADER, Store, be_u32, corrupt, unpoison};
+use super::view::{ForeignActive, Lookup};
+use super::{AppendState, Error, MAGIC_HEADER, Shared, Store, be_u32, corrupt, unpoison};
 
 /// One segment's liveness breakdown. Byte counts cover record bytes only,
 /// not footer overhead (Go: `SegmentLiveness`).
@@ -64,6 +66,17 @@ pub struct CompactOpts {
     /// copy. The default, `u64::MAX`, is unbounded (Go: `MaxCopyBytes`, a
     /// pointer that is nil for no cap).
     pub max_copy_bytes: u64,
+    /// Says that `live` comes from a walk that verified every object it read
+    /// ([`Store::get_verified`]), so that a bad record found here cannot have hidden
+    /// anything from it. The pass then leaves that record's segment in place and goes on
+    /// with the others. Without it, any bad record stops the pass with nothing removed:
+    /// a walk may have read a bad directory as something smaller, and the pass may meet
+    /// that directory or another bad record first, which says nothing about it.
+    ///
+    /// A pass reads only its victims, so even a stop promises nothing about a bad record
+    /// in a segment that is not one. A caller that needs that promise has to verify what
+    /// it marks (Go: `MarkVerified`).
+    pub mark_verified: bool,
 }
 
 impl Default for CompactOpts {
@@ -73,6 +86,7 @@ impl Default for CompactOpts {
             horizon: None,
             pace: None,
             max_copy_bytes: u64::MAX,
+            mark_verified: false,
         }
     }
 }
@@ -83,8 +97,27 @@ impl std::fmt::Debug for CompactOpts {
             .field("min_dead_ratio", &self.min_dead_ratio)
             .field("horizon", &self.horizon)
             .field("pace", &self.pace.is_some())
+            .field("max_copy_bytes", &self.max_copy_bytes)
+            .field("mark_verified", &self.mark_verified)
             .finish()
     }
+}
+
+/// A victim that a pass left in place, because a live record in it failed
+/// verification. The first such record found is the one named; there may be more
+/// (Go: `SkippedSegment`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedSegment {
+    pub id: u64,
+    pub path: std::path::PathBuf,
+    /// The record's key.
+    pub key: Key,
+    /// The record's offset in the segment.
+    pub offset: u64,
+    /// Why, as Go's `Err` reads.
+    pub err: String,
+    /// The payload is not what the key says (Go: `errors.Is(Err, ErrVerify)`).
+    pub verify: bool,
 }
 
 /// Summarizes one [`Store::compact`] pass (Go: `CompactStats`).
@@ -93,11 +126,13 @@ pub struct CompactStats {
     /// Sealed segments considered.
     pub segments_scanned: usize,
     pub segments_compacted: usize,
-    /// Compacted segment ids, ascending.
+    /// Ids of the segments removed, ascending.
     pub victims: Vec<u64>,
+    /// Victims left in place, ascending by id.
+    pub skipped: Vec<SkippedSegment>,
     pub records_copied: usize,
     pub bytes_copied: u64,
-    /// Victim file sizes, footers included.
+    /// Removed file sizes, footers included.
     pub bytes_freed: u64,
 }
 
@@ -132,6 +167,45 @@ fn segment_liveness(g: &SealedSegment, live: &dyn Fn(Key) -> bool) -> SegmentLiv
     info
 }
 
+/// A copy of a record in another store's active segment (Go: `foreignCopy`).
+pub(super) struct ForeignCopy {
+    pub(super) fa: Arc<ForeignActive>,
+    /// `None` when the segment does not hold what the view says it does.
+    pub(super) raw: Option<Vec<u8>>,
+    /// Its owner has synced it.
+    durable: bool,
+}
+
+/// Reads `k`'s copies in other stores' active segments, to be verified outside the shared
+/// lock, which readers and the view's changes share (Go: `foreignCopiesLocked`).
+pub(super) fn foreign_copies(sh: &Shared, k: Key) -> Vec<ForeignCopy> {
+    let mut out = Vec::new();
+    for fa in &sh.foreign {
+        let found = {
+            let st = unpoison(fa.state.read());
+            st.scan.index.get(&k).copied().map(|loc| {
+                let end = (loc.off as i64)
+                    .wrapping_add(REC_HEADER_SIZE as i64)
+                    .wrapping_add(i64::from(loc.slen));
+                (loc, end <= st.scan.at.durable)
+            })
+        };
+        let Some((loc, durable)) = found else {
+            continue;
+        };
+        let raw = match fa.read_record(k, loc) {
+            Ok(Lookup::Hit(raw)) => Some(raw),
+            _ => None,
+        };
+        out.push(ForeignCopy {
+            fa: fa.clone(),
+            raw,
+            durable,
+        });
+    }
+    out
+}
+
 /// One record travelling the verify pipeline. The record bytes are a
 /// zero-copy view into the victim's mmap, kept alive by the `Arc` (Go:
 /// `copyRec`, whose `rec` slice borrows the mmap).
@@ -151,17 +225,42 @@ impl CopyRec {
 /// `context.WithCancel`; the same shape as parallel.rs's `Run`).
 struct Pipe {
     cancel: AtomicBool,
-    first_err: Mutex<Option<Error>>,
+    /// What stops the pass.
+    stopped: Mutex<Option<Error>>,
+    /// Victims found bad; read-only keys, so that the walk asks without a lock.
+    bad: HashMap<u64, AtomicBool>,
+    skipped: Mutex<Vec<SkippedSegment>>,
+    mark_verified: bool,
 }
 
 impl Pipe {
-    fn fail(&self, e: Error) {
-        let mut slot = unpoison(self.first_err.lock());
-        if slot.is_none() {
-            *slot = Some(e);
+    /// A record of `g` failed verification. It keeps its segment if the mark verified
+    /// what it read, and stops the pass if not.
+    fn bad_record(&self, g: &SealedSegment, e: IndexEntry, err: Error) {
+        if !self.mark_verified {
+            let mut slot = unpoison(self.stopped.lock());
+            if slot.is_none() {
+                *slot = Some(err);
+            }
+            drop(slot);
+            self.cancel.store(true, Ordering::Relaxed);
+            return;
         }
-        drop(slot);
-        self.cancel.store(true, Ordering::Relaxed);
+        if self.bad[&g.id].swap(true, Ordering::SeqCst) {
+            return; // the first one found is reported
+        }
+        unpoison(self.skipped.lock()).push(SkippedSegment {
+            id: g.id,
+            path: g.path.clone(),
+            key: e.k,
+            offset: e.off,
+            verify: err.is_verify(),
+            err: err.to_string(),
+        });
+    }
+
+    fn is_bad(&self, g: &SealedSegment) -> bool {
+        self.bad[&g.id].load(Ordering::SeqCst)
     }
 
     fn canceled(&self) -> bool {
@@ -212,7 +311,14 @@ impl Store {
     /// caller must guarantee no ingest or reference publication overlaps
     /// (`specs/gc.qnt`). A grey set captured since [`Store::begin_barrier`]
     /// is consumed — unconditionally, even if the pass then errors or selects
-    /// no victims — and kept alongside `live` (Go: `Compact`).
+    /// no victims — and kept alongside `live`.
+    ///
+    /// A live record that fails verification stops the pass with nothing removed, unless
+    /// the caller's mark verified what it read ([`CompactOpts::mark_verified`]). Then its
+    /// segment stays where it is, the pass goes on with the others, and it returns
+    /// [`Error::Skipped`], which carries stats that say what it did. Any other error means
+    /// nothing was removed, unless it came from removing the victims themselves (Go:
+    /// `Compact`).
     pub fn compact<L>(&self, live: L, opts: CompactOpts) -> Result<CompactStats, Error>
     where
         L: Fn(Key) -> bool + Sync,
@@ -222,6 +328,7 @@ impl Store {
             horizon,
             mut pace,
             max_copy_bytes,
+            mark_verified,
         } = opts;
         // Other stores' writers wait for the whole pass and look at the
         // directory again afterwards (gate.rs); inside a collector's
@@ -260,28 +367,53 @@ impl Store {
             self.seal_idle(&mut ap)?;
         }
 
-        let victims =
-            self.select_victims(&live, horizon, min_dead_ratio, max_copy_bytes, &mut stats)?;
+        let victims = self.select_victims(
+            &live,
+            horizon,
+            min_dead_ratio,
+            max_copy_bytes,
+            &ap.kept,
+            &mut stats,
+        )?;
         if victims.is_empty() {
             return Ok(stats);
         }
         // On error the victims stay untouched on disk: a failed compaction
         // must leave the victim files in place.
-        self.copy_live(&mut ap, &victims, &live, &mut pace, &mut stats)?;
+        ap.copying = true;
+        let skipped = self.copy_live(
+            &mut ap,
+            &victims,
+            &live,
+            &mut pace,
+            mark_verified,
+            &mut stats,
+        );
+        ap.copying = false;
+        let skipped = skipped?;
         // One fsync makes the whole copy batch durable before any unlink. If
         // copies rotated the active segment away, the seal already fsynced;
         // a `None` active skips.
         if self.cfg.sync
             && let Some(aw) = ap.active.as_mut()
         {
-            if let Err(e) = aw.seg.f.sync_all() {
+            if let Err(e) = self.fsync(&aw.seg.f, &aw.seg.path) {
                 let e: Error = e.into();
                 self.set_failed(&e);
                 return Err(e);
             }
             aw.sidecar_synced();
         }
+        ap.kept = skipped.iter().map(|sk| sk.id).collect();
+        stats.skipped = skipped;
+        let victims: Vec<_> = victims
+            .into_iter()
+            .filter(|g| !ap.kept.contains(&g.id))
+            .collect();
         self.remove_victims(&mut ap, &victims, &mut stats)?;
+        if !stats.skipped.is_empty() {
+            return Err(Error::Skipped(Box::new(stats)));
+        }
         Ok(stats)
     }
 
@@ -296,15 +428,19 @@ impl Store {
         horizon: Option<SystemTime>,
         min_dead_ratio: f64,
         mut copy_left: u64,
+        kept: &HashSet<u64>,
         stats: &mut CompactStats,
     ) -> Result<Vec<Arc<SealedSegment>>, Error> {
         let segs: Vec<Arc<SealedSegment>> = unpoison(self.shared.read()).sealed.clone();
         stats.segments_scanned = segs.len();
 
         let mut victims = Vec::new();
-        for g in segs {
+        // What the last pass left in place goes last: it is charged its whole live
+        // size though it will copy next to nothing, and would starve the rest for good.
+        let (last, first): (Vec<_>, Vec<_>) = segs.into_iter().partition(|g| kept.contains(&g.id));
+        for g in first.into_iter().chain(last) {
             if let Some(h) = horizon {
-                let mtime = fs::metadata(&g.path)?.modified()?;
+                let mtime = g.stat()?.modified()?;
                 if mtime >= h {
                     continue; // eligible only when sealed strictly before the horizon
                 }
@@ -316,44 +452,82 @@ impl Store {
                     continue;
                 }
                 copy_left -= info.live_bytes;
-                stats.victims.push(g.id);
                 victims.push(g);
             }
         }
+        victims.sort_by_key(|g| g.id);
         Ok(victims)
     }
 
-    /// Appends every live victim record that has no copy in a surviving
+    /// Whether `k` has a copy outside the victims that a sweep may rely on instead of
+    /// the victim's, which means one that verifies: otherwise the victim's may be the
+    /// only good one left. This store's own active segment is taken on trust, since it
+    /// holds only what this pass copied and so verified: the pass sealed whatever was
+    /// there before, and takes no segment from anybody while it copies (`ensure_active`).
+    ///
+    /// The verifying is left for outside the lock, and the callers are the pass's
+    /// verifiers: duplicates are not always rare, what with concurrent ingests and packs
+    /// left in place (Go: `goodSurvivor`).
+    fn good_survivor(&self, k: Key, victim_ids: &HashSet<u64>) -> bool {
+        let sh = unpoison(self.shared.read());
+        if let Some(a) = &sh.active
+            && unpoison(a.index.read()).contains_key(&k)
+        {
+            return true;
+        }
+        let foreign = foreign_copies(&sh, k);
+        let holders: Vec<Arc<SealedSegment>> = sh
+            .sealed
+            .iter()
+            .filter(|g| {
+                !victim_ids.contains(&g.id) && g.has(k) && (!self.cfg.sync || !g.crashed_seal())
+            })
+            .cloned()
+            .collect();
+        drop(sh);
+        foreign.iter().any(|c| {
+            (!self.cfg.sync || c.durable) && c.raw.as_ref().is_some_and(|raw| valid_record(k, raw))
+        }) || holders.iter().any(|g| {
+            g.fv.lookup(&g.mm, k)
+                .is_some_and(|(off, slen)| indexed_record_valid(g, k, off, slen))
+        })
+    }
+
+    /// Appends every live victim record that has no good copy in a surviving
     /// segment. Verification (decompress + re-hash) dominates, so workers
-    /// verify in parallel while the calling thread — which holds the append
-    /// lock — appends whatever is ready (Go: `copyLive`).
+    /// verify in parallel, the copies a record could rely on and the record itself, while
+    /// the calling thread — which holds the append lock — appends whatever is ready.
+    ///
+    /// A record that fails verification is not copied, and stops the pass with nothing to
+    /// remove, unless the caller's mark verified what it read
+    /// ([`CompactOpts::mark_verified`]). Then its segment is reported and goes no further:
+    /// it stays where it is, so what it holds needs no copy. The pass goes on with the
+    /// others, whose removal is safe by the same rule as ever: a live key has a copy that
+    /// verified. A segment left in place is no survivor here, so a key with a bad copy in
+    /// one victim and a good copy in another gets the good one copied. An append that
+    /// fails stops the pass as well: the copies are not all there (Go: `copyLive`).
     fn copy_live(
         &self,
         ap: &mut AppendState,
         victims: &[Arc<SealedSegment>],
         live: &(impl Fn(Key) -> bool + Sync),
         pace: &mut Option<Box<dyn FnMut(usize) + Send>>,
+        mark_verified: bool,
         stats: &mut CompactStats,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<SkippedSegment>, Error> {
         let victim_ids: HashSet<u64> = victims.iter().map(|g| g.id).collect();
-        // Victims are still in `shared.sealed` during the copy — reads keep
-        // working — so survivor probes must skip them by id.
-        let survivor_has = |k: Key| -> bool {
-            let sh = unpoison(self.shared.read());
-            // Not a copy a live writer has yet to sync: the victim's may be
-            // the durable one.
-            if Store::reliable_active(&sh, self.cfg.sync, k) {
-                return true;
-            }
-            sh.sealed
-                .iter()
-                .any(|g| !victim_ids.contains(&g.id) && g.has(k))
-        };
 
-        let workers = thread::available_parallelism().map_or(1, |n| n.get());
+        let workers = unpoison(self.hooks.copy_workers.lock())
+            .unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get()));
         let pipe = Pipe {
             cancel: AtomicBool::new(false),
-            first_err: Mutex::new(None),
+            stopped: Mutex::new(None),
+            bad: victims
+                .iter()
+                .map(|g| (g.id, AtomicBool::new(false)))
+                .collect(),
+            skipped: Mutex::new(Vec::new()),
+            mark_verified,
         };
         let (cands_tx, cands_rx) = mpsc::sync_channel::<CopyRec>(4 * workers);
         let cands_rx = Mutex::new(cands_rx);
@@ -363,31 +537,21 @@ impl Store {
         thread::scope(|s| {
             let pipe = &pipe;
             let cands_rx = &cands_rx;
-            let survivor_has = &survivor_has;
-            // Producer: walk the victims' indexes in order, bounds-check each
-            // entry, and feed zero-copy record views to the verifiers.
+            let victim_ids = &victim_ids;
+            // Producer: walk the victims' indexes in order, and feed the live entries
+            // to the verifiers.
             s.spawn(move || {
                 let tx = cands_tx; // moved in; dropping it closes the channel
                 for g in victims {
-                    let body_len = g.fv.body_len;
                     for e in all_entries(g) {
                         if pipe.canceled() {
                             return;
                         }
-                        if !live(e.k) || survivor_has(e.k) {
-                            continue;
+                        if pipe.is_bad(g) {
+                            break; // it stays where it is, with all it holds
                         }
-                        // Overflow-safe, subtraction form: e.off came from
-                        // the on-disk index and may be crafted.
-                        if e.off < MAGIC_HEADER.len() as u64
-                            || e.off > body_len
-                            || REC_HEADER_SIZE as u64 + u64::from(e.slen) > body_len - e.off
-                        {
-                            pipe.fail(corrupt(format!(
-                                "{}: index entry out of bounds",
-                                g.path.display()
-                            )));
-                            return;
+                        if !live(e.k) {
+                            continue;
                         }
                         if tx.send(CopyRec { g: g.clone(), e }).is_err() {
                             return;
@@ -395,20 +559,41 @@ impl Store {
                     }
                 }
             });
-            // Verifiers: full record scrub (framing CRC, key match, payload
-            // rehash) in parallel. On failure they record the error and keep
-            // draining so the producer can never block on a full channel.
+            // Verifiers: the copies a record could rely on, then the full record scrub
+            // (framing CRC, key match, payload rehash), in parallel. They keep draining
+            // after a failure, so the producer can never block on a full channel.
             for _ in 0..workers {
                 let verified_tx = verified_tx.clone();
                 s.spawn(move || {
                     loop {
                         let recv = unpoison(cands_rx.lock()).recv();
                         let Ok(c) = recv else { return };
-                        if pipe.canceled() {
+                        if pipe.canceled() || pipe.is_bad(&c.g) {
                             continue; // drain
                         }
+                        if self.good_survivor(c.e.k, victim_ids) {
+                            continue;
+                        }
+                        // Overflow-safe, subtraction form: e.off came from the on-disk
+                        // index and may be crafted.
+                        let body_len = c.g.fv.body_len;
+                        if c.e.off < MAGIC_HEADER.len() as u64
+                            || c.e.off > body_len
+                            || REC_HEADER_SIZE as u64 + u64::from(c.e.slen) > body_len - c.e.off
+                        {
+                            pipe.bad_record(
+                                &c.g,
+                                c.e,
+                                corrupt(format!(
+                                    "{}: index entry out of bounds, key {}",
+                                    c.g.path.display(),
+                                    c.e.k
+                                )),
+                            );
+                            continue;
+                        }
                         if let Err(e) = verify_record(&c.g, c.e, c.rec()) {
-                            pipe.fail(e);
+                            pipe.bad_record(&c.g, c.e, e);
                             continue;
                         }
                         if verified_tx.send(c).is_err() {
@@ -430,6 +615,11 @@ impl Store {
                 if append_err.is_some() {
                     continue; // drain
                 }
+                if let Some(aw) = ap.active.as_ref()
+                    && unpoison(aw.seg.index.read()).contains_key(&c.e.k)
+                {
+                    continue; // the same key from another victim, already copied
+                }
                 if let Err(e) = self.append_locked(ap, c.e.k, c.rec(), false) {
                     pipe.cancel.store(true, Ordering::Relaxed);
                     append_err = Some(e);
@@ -443,15 +633,17 @@ impl Store {
             }
         });
 
-        // Append errors first, then the pipeline's first error (Go:
-        // `cmp.Or(appendErr, pipe.Wait())`).
+        // An append error first, then what stopped the pipeline (Go:
+        // `copyLive`'s two returns).
         if let Some(e) = append_err {
             return Err(e);
         }
-        match unpoison(pipe.first_err.into_inner()) {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if let Some(e) = unpoison(pipe.stopped.into_inner()) {
+            return Err(e);
         }
+        let mut skipped = unpoison(pipe.skipped.into_inner());
+        skipped.sort_by_key(|sk| sk.id);
+        Ok(skipped)
     }
 
     /// Detaches the victims from the probe list, then unlinks their files
@@ -466,6 +658,9 @@ impl Store {
         victims: &[Arc<SealedSegment>],
         stats: &mut CompactStats,
     ) -> Result<(), Error> {
+        if victims.is_empty() {
+            return Ok(()); // every victim was left in place: nothing to detach or sync
+        }
         let victim_ids: HashSet<u64> = victims.iter().map(|g| g.id).collect();
         // A lookup that finds nothing lists the directory (view.rs). Between
         // the victims leaving the view and leaving the directory, such a
@@ -485,15 +680,17 @@ impl Store {
         }
         let mut first_err: Option<Error> = None;
         for g in victims {
-            stats.bytes_freed += g.mm.len() as u64; // whole file, footer included
             if let Err(e) = fs::remove_file(&g.path) {
                 first_err.get_or_insert(e.into());
+                continue;
             }
+            stats.victims.push(g.id);
+            stats.bytes_freed += g.mm.len() as u64; // whole file, footer included
         }
-        stats.segments_compacted = victims.len();
+        stats.segments_compacted = stats.victims.len();
         if self.cfg.sync
             && let Some(dir_f) = ap.dir_f.as_ref()
-            && let Err(e) = dir_f.sync_all()
+            && let Err(e) = self.fsync(dir_f, &self.dir)
         {
             first_err.get_or_insert(e.into());
         }
@@ -507,9 +704,10 @@ impl Store {
 fn verify_record(g: &SealedSegment, e: IndexEntry, rec: &[u8]) -> Result<(), Error> {
     check_record(e.k, rec).map_err(|(msg, verify)| Error::Corrupt {
         msg: format!(
-            "amberpack: corrupt pack data: {}: record at offset {}: {msg}",
+            "amberpack: corrupt pack data: {}: record at offset {}, key {}: {msg}",
             g.path.display(),
-            e.off
+            e.off,
+            e.k
         ),
         verify,
     })

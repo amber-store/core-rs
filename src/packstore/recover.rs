@@ -49,7 +49,7 @@ pub(crate) fn scan_active(path: &Path) -> Result<ScanResult, Error> {
     }
     // A synced footer can precede a crashed seal rename. Its index
     // preserves later records even when an earlier payload has bit rot.
-    if parse_footer(&b).is_ok() {
+    if parse_footer(&b).is_ok_and(|fv| !inside_record(&b, fv.body_len)) {
         res.size = b.len() as u64;
         res.sealed = true;
         return Ok(res);
@@ -57,11 +57,6 @@ pub(crate) fn scan_active(path: &Path) -> Result<ScanResult, Error> {
     let mut off = MAGIC_HEADER.len();
     while off < b.len() {
         if b[off] == TAG_SEAL {
-            if parse_footer(&b).is_ok() {
-                res.size = b.len() as u64;
-                res.sealed = true;
-                return Ok(res);
-            }
             // Partial footer: truncate at the seal marker. A valid footer
             // followed by trailing bytes also lands here (parse_footer
             // anchors the trailer at EOF); that state cannot arise from our
@@ -85,4 +80,20 @@ pub(crate) fn scan_active(path: &Path) -> Result<ScanResult, Error> {
     }
     res.size = off as u64;
     Ok(res)
+}
+
+/// Reports whether a footer that starts at `body_len` lies inside a record, which makes
+/// it that record's payload: an object is whatever bytes somebody stored, and those may
+/// read as a footer that fits where they lie. A seal's footer starts where its last
+/// record ends. Damage on the way ends the walk with no answer: the footer stands, since
+/// it is what indexes the records behind the damage (Go: `insideRecord`).
+fn inside_record(b: &[u8], body_len: u64) -> bool {
+    let mut off = MAGIC_HEADER.len() as u64;
+    while off < body_len {
+        let Ok(rec) = parse_record(&b[off as usize..]) else {
+            return false;
+        };
+        off += REC_HEADER_SIZE as u64 + u64::from(rec.slen);
+    }
+    off > body_len
 }

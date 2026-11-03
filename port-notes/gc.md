@@ -112,7 +112,9 @@ path.
    `CompactStats` even when `Compact` errors; the Rust
    `packstore::Store::compact` returns `Result<CompactStats, _>` (wave-1
    orchestrator API), so a failed cycle's sweep counters stay zero in
-   `last`. Flagged in `port-notes/packstore-gc.md` too.
+   `last`. Flagged in `port-notes/packstore-gc.md` too. The exception, since
+   v0.12.0, is `Error::Skipped`, which carries them: a pass that left a bad
+   pack in place did the rest of its work, and the cycle reports it.
 3. **`free_below` uses `libc::statfs`** (identical field mapping to Go's
    `unix.Statfs`: `f_bavail`/`f_bsize`/`f_blocks`) on both apple and linux
    targets. POSIX `statvfs` was rejected: Darwin's `statvfs` `fsblkcnt_t`

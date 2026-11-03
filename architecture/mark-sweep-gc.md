@@ -41,7 +41,11 @@ refLock.Lock    sweep: packstore.Compact                   (writers stall)
 
 - **Mark.** For each root in the snapshot, a DFS over `fstree.Links`.
   Already-marked keys prune the walk, so shared subtrees cost once. A
-  missing object aborts the cycle loudly. A [git object](git-objects.md) has
+  missing object aborts the cycle loudly, and so does an object that fails
+  verification: what the mark reads it verifies (`Store.GetVerified`), since a bad
+  directory can still decode, and walks as a smaller one, and whatever it no longer
+  names would be swept. So a bad object the mark has to read stops the cycle with
+  nothing freed: what it reaches cannot be known. A [git object](git-objects.md) has
   links too, and a blob among them is marked unread as well, on the word of the
   tree entry or tag that names it. Since that word can be contradicted by another
   link, a git key prunes on a second bit, set when its links are followed
@@ -55,6 +59,36 @@ refLock.Lock    sweep: packstore.Compact                   (writers stall)
   payload rehash) in parallel while a single loop appends; fsync; only
   then unlink the victims and fsync the directory. A crash mid-sweep
   loses no live record: victims outlive the durable copies.
+- **A bad live record.** What the mark does not read is checked when it is copied. A
+  record that fails is not copied, and its pack stays where it is, what it holds
+  along with it. The rest of the sweep goes on: every other victim is copied and
+  removed as usual, so a damaged leaf costs its own pack's garbage, not the store's. A
+  key with a bad copy in one victim and a good copy in another keeps the good one,
+  since a pack left in place is not counted as a survivor, and a copy in a pack that
+  is not a victim counts only if it verifies. So that the copies a pass has made can
+  be relied on, a pass copies into a new segment and takes over none while it copies:
+  one somebody left in the meantime holds what nobody verified, and an empty one from
+  before has an id below a pack that may survive with a bad copy of the same key, which
+  lookups would then read first. The cycle still fails loudly: `Compact` and
+  `Collector.Run` return a `packstore.SkippedError` beside stats that say what was
+  done, and `Status.LastError` names the pack, the offset and the key. The pack reports
+  again whenever it is a victim again, which depends on the line and the budget, and
+  without copying what it already gave up, until the record is repaired or no reference
+  reaches it. `PutVerified` repairs it wherever it is, unless another store holds the
+  segment with the bad copy, active or a crashed seal, which it reports: it goes through
+  when that store has let go. Another store sees the repair at its next look at the
+  directory, and a verified read that fails looks first. A failed append stops the pass
+  with nothing removed.
+
+  Going on past a bad record is only safe because the mark verified what it read, so
+  `Compact` does it for a caller that says so (`CompactOpts.MarkVerified`), which
+  `gc.Collector` does. For any other, every bad record stops the pass with nothing
+  removed, whatever its type: a bad directory that still decodes may have hidden its
+  children from that caller's walk, and the record the pass meets first may be another
+  one beside it. A stop promises no more than that. A pass reads only its victims, so
+  such a caller can still lose what a bad directory in another pack no longer names, or
+  what a bad copy hid behind a good one that survives. Marking with `GetVerified` is
+  what closes that.
 - **Copy budget.** A sweep can be capped in the live record bytes it
   copies (`CompactOpts.MaxCopyBytes`, or `Collector.RunWithCopyBudget` for
   a cycle), for a collector that must not start a sweep that needs more

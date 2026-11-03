@@ -33,7 +33,7 @@ mod sidecar;
 mod verify;
 mod view;
 
-pub use compact::{CompactOpts, CompactStats, SegmentLiveness};
+pub use compact::{CompactOpts, CompactStats, SegmentLiveness, SkippedSegment};
 pub use gate::{Sweep, WriteSpan};
 pub use gc::SegmentInfo;
 pub use markset::MarkSet;
@@ -174,6 +174,17 @@ impl From<crate::fstree::Object> for Object {
     }
 }
 
+/// The text of [`Error::Skipped`]: Go's `SkippedError.Error`.
+fn skipped_text(stats: &CompactStats) -> String {
+    let n = stats.skipped.len();
+    let causes: Vec<&str> = stats.skipped.iter().map(|sk| sk.err.as_str()).collect();
+    format!(
+        "packstore: compaction left {n} {} in place (repair the record with PutVerified, or drop the references that reach it): {}",
+        if n == 1 { "segment" } else { "segments" },
+        causes.join("; ")
+    )
+}
+
 /// Errors from the packstore, mirroring the Go package's `errors.Is`
 /// sentinels (`ErrNotFound`, `ErrClosed`, `ErrCorrupt`, `ErrVerify`). Match
 /// classes with the `is_*` helpers where Go code would use `errors.Is`; they
@@ -212,6 +223,12 @@ pub enum Error {
         /// Whether this corruption is also an object-verification failure.
         verify: bool,
     },
+    /// A [`Store::compact`] pass left victims in place, for a live record in each
+    /// that failed verification, which it does only for a caller with a verified mark
+    /// ([`CompactOpts::mark_verified`]). The rest of the pass was carried out, and the
+    /// stats say what was removed (Go: `SkippedError`, returned beside the stats).
+    #[error("{}", skipped_text(.0))]
+    Skipped(Box<CompactStats>),
     /// An object's key does not match its payload (Go: `ErrVerify`, from
     /// `WriteParallel` with `verify` enabled). `msg` is the complete
     /// diagnostic text.
@@ -293,10 +310,19 @@ impl Error {
         }
     }
 
+    /// What a pass did, when it returned [`Error::Skipped`] (Go: the stats returned
+    /// beside the error).
+    pub fn compact_stats(&self) -> Option<&CompactStats> {
+        match self {
+            Error::Skipped(stats) => Some(stats),
+            _ => None,
+        }
+    }
+
     /// Go's `errors.Is(err, ErrCorrupt)`.
     pub fn is_corrupt(&self) -> bool {
         match self {
-            Error::Corrupt { .. } => true,
+            Error::Corrupt { .. } | Error::Skipped(_) => true,
             Error::Pack(e) => e.is_corrupt(),
             Error::Context { source, .. } => source.is_corrupt(),
             _ => false,
@@ -317,6 +343,7 @@ impl Error {
         match self {
             Error::Verify(_) => true,
             Error::Corrupt { verify, .. } => *verify,
+            Error::Skipped(stats) => stats.skipped.iter().any(|sk| sk.verify),
             Error::Context { source, .. } => source.is_verify(),
             _ => false,
         }
@@ -498,6 +525,11 @@ struct AppendState {
     /// and is raised for good by the first record that needs more (Go:
     /// `segVersion`).
     seg_version: u8,
+    /// Segments the last `compact` left in place (Go: `kept`).
+    kept: HashSet<u64>,
+    /// A `compact` is copying survivors, and takes no segment from anybody
+    /// (`ensure_active`; Go: `copying`).
+    copying: bool,
 }
 
 /// Reader-visible state (Go: fields guarded by `mu`).
@@ -523,6 +555,7 @@ type Hook = Box<dyn Fn() + Send + Sync>;
 
 /// A test hook that can fail.
 type FallibleHook = Box<dyn Fn() -> io::Result<()> + Send + Sync>;
+type FsyncHook = Box<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 
 /// Test hooks; never set outside tests.
 #[derive(Default)]
@@ -533,6 +566,12 @@ struct Hooks {
     /// Runs when `compact` or `remove` took its victims out of the view,
     /// before it unlinks them (Go: `afterDetach`).
     after_detach: Mutex<Option<Hook>>,
+    /// Runs before every fsync ([`Store::fsync`]) with the file's path; an error it
+    /// returns stands in for the fsync's (Go: `beforeFsync`).
+    before_fsync: Mutex<Option<FsyncHook>>,
+    /// How many verifiers a `compact` runs, for a test that needs their order (Go: the
+    /// test sets `GOMAXPROCS`).
+    copy_workers: Mutex<Option<usize>>,
     /// Runs when a seal wrote the footer, before it syncs; an error it
     /// returns stands in for the write's (Go: `afterFooter`).
     after_footer: Mutex<Option<FallibleHook>>,
@@ -666,6 +705,8 @@ impl Store {
                 active: None,
                 next_id: 1,
                 seg_version,
+                kept: HashSet::new(),
+                copying: false,
             }),
             shared: RwLock::new(Shared {
                 sealed: Vec::new(),
@@ -742,7 +783,7 @@ impl Store {
                 // holds it: the record is already appended. Whoever appended
                 // it may have been a deferred put, which has not synced it.
                 if sync_now && self.cfg.sync && self.deferred.load(Ordering::SeqCst) {
-                    if let Err(e) = aw.seg.f.sync_all() {
+                    if let Err(e) = self.fsync(&aw.seg.f, &aw.seg.path) {
                         self.set_failed(&e);
                         return Err(e.into());
                     }
@@ -777,7 +818,7 @@ impl Store {
         aw.sidecar_entry(k, loc); // only now: an entry never precedes its record
 
         if sync_now && self.cfg.sync {
-            let res = aw.seg.f.sync_all();
+            let res = self.fsync(&aw.seg.f, &aw.seg.path);
             if let Err(e) = res {
                 self.set_failed(&e);
                 return Err(e.into());
@@ -816,7 +857,7 @@ impl Store {
             self.deferred.store(false, Ordering::SeqCst);
             return Ok(());
         };
-        if let Err(e) = aw.seg.f.sync_all() {
+        if let Err(e) = self.fsync(&aw.seg.f, &aw.seg.path) {
             self.set_failed(&e);
             return Err(e.into());
         }
@@ -825,6 +866,16 @@ impl Store {
         self.fsyncs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Every fsync the store's durability rests on, so that a test can see each one and
+    /// fail it. Whoever acknowledges on its strength calls `set_failed` when it fails
+    /// (Go: `fsync`).
+    fn fsync(&self, f: &File, path: &Path) -> io::Result<()> {
+        if let Some(hook) = unpoison(self.hooks.before_fsync.lock()).as_ref() {
+            hook(path)?;
+        }
+        f.sync_all()
     }
 
     /// Poisons the write path after an fsync failure: a failed fsync may have
@@ -885,9 +936,9 @@ impl Store {
         }
         let sealed_path = view::sealed_path_of(&aw.seg.path);
         let seg = (|| -> Result<SealedSegment, Error> {
-            aw.seg.f.sync_all()?;
+            self.fsync(&aw.seg.f, &aw.seg.path)?;
             fs::rename(&aw.seg.path, &sealed_path)?;
-            ap.dir_f.as_ref().ok_or(Error::Closed)?.sync_all()?;
+            self.fsync(ap.dir_f.as_ref().ok_or(Error::Closed)?, &self.dir)?;
             // The footer indexes the segment from here on. A crash before the
             // removal leaves an orphan that the next open deletes.
             let _ = fs::remove_file(with_suffix(&aw.seg.path, SIDECAR_SUFFIX));
@@ -1001,6 +1052,39 @@ impl Store {
     /// absent. The returned buffer is caller-owned (Go: `Get`).
     pub fn get(&self, k: Key) -> Result<Vec<u8>, Error> {
         self.lookup(k, || self.get_once(k))
+    }
+
+    /// [`Store::get`], and checks that the bytes it read hash to the key. `get` trusts
+    /// them, which is what a read of file content can afford. A walk that decides what
+    /// is alive cannot: a bad directory can still decode, and walks as a smaller one (a
+    /// collector's mark, and a reference's completeness check). A payload that decodes
+    /// and hashes to something else is an [`Error::Corrupt`] that
+    /// [`is_verify`](Error::is_verify); one that does not even decode fails as it does
+    /// for `get`. What a key's length says is for whoever reads the object: a commit
+    /// keyed by an older rule is told apart by the walk, which says what to do about it.
+    ///
+    /// A failure gets one more try on a fresh view: a repair replaces a segment under
+    /// its name and moves no generation, so another store's may be what this one has yet
+    /// to see (Go: `GetVerified`).
+    pub fn get_verified(&self, k: Key) -> Result<Vec<u8>, Error> {
+        match self.get_verified_once(k) {
+            Err(e) if !e.is_not_found() && !matches!(e, Error::Closed) => {
+                if self.refresh().is_err() {
+                    return Err(e); // what the read found says more than why it could not look again
+                }
+                self.get_verified_once(k)
+            }
+            read => read,
+        }
+    }
+
+    fn get_verified_once(&self, k: Key) -> Result<Vec<u8>, Error> {
+        let data = self.get(k)?;
+        verify::verify_hash(k, &data).map_err(|e| Error::Corrupt {
+            msg: format!("amberpack: corrupt pack data: {e}"),
+            verify: true,
+        })?;
+        Ok(data)
     }
 
     /// Finds `k` in the active segment this store owns or in one it only
@@ -1220,7 +1304,14 @@ impl Store {
             return Err(Error::Closed);
         }
         Ok(Store::reliable_active(&sh, self.cfg.sync, k)
-            || sh.sealed.iter().rev().any(|seg| seg.has(k)))
+            || sh.sealed.iter().rev().any(|g| self.reliable_sealed(g, k)))
+    }
+
+    /// Reports whether `g` holds a copy of `k` that a write, or a compaction, may rely on
+    /// instead of making its own: not one in a crashed seal, when this store syncs, since
+    /// nobody has fsynced that yet (Go: `reliableSealed`).
+    pub(super) fn reliable_sealed(&self, g: &SealedSegment, k: Key) -> bool {
+        g.has(k) && (!self.cfg.sync || !g.crashed_seal())
     }
 
     /// Reports whether an active segment holds a copy of `k` that a write, or
@@ -1235,7 +1326,7 @@ impl Store {
         if let Some(a) = &sh.active
             && unpoison(a.index.read()).contains_key(&k)
         {
-            return true; // this store's own fsync covers it
+            return true; // this store's own fsync covers it, or did at adoption (adopt)
         }
         sh.foreign.iter().any(|fa| {
             let st = unpoison(fa.state.read());
@@ -1315,7 +1406,7 @@ impl Store {
         if self.cfg.sync
             && let Some(dir_f) = ap.dir_f.as_ref()
         {
-            note(dir_f.sync_all());
+            note(self.fsync(dir_f, &self.dir));
         }
         first_err.map_or(Ok(()), Err)
     }
@@ -1337,7 +1428,9 @@ impl Store {
         if let Some(mut aw) = ap.active.take() {
             // Synced whatever the sync option says, so that a store closed
             // cleanly always reopens from its sidecar alone.
-            match aw.seg.f.sync_all() {
+            match self.fsync(&aw.seg.f, &aw.seg.path) {
+                // After a failed fsync this one proves nothing.
+                Ok(()) if sh.failed.is_some() => {}
                 Ok(()) => aw.sidecar_synced(),
                 Err(e) => first_err = Some(e.into()),
             }
@@ -1381,6 +1474,12 @@ mod gc_tests;
 
 #[cfg(test)]
 mod compression_tests;
+
+#[cfg(test)]
+mod compact_skip_tests;
+
+#[cfg(test)]
+mod durability_tests;
 
 #[cfg(test)]
 mod git_tests;

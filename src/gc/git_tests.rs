@@ -13,11 +13,11 @@ use crate::gitobj::{self, Kind};
 use crate::key::{GIT_SHA1_SIZE, Key};
 use crate::packstore;
 
-use super::Options;
 use super::collector::Cancel;
 use super::tests::{
     HOUR, backdate_packs, count_gone, new_test_store, open_collector, put_test_ref, rm_test_ref,
 };
+use super::{Error, Options};
 
 fn store_git(st: &packstore::Store, kind: Kind, body: &[u8]) -> Key {
     let data = gitobj::encode(kind, body);
@@ -537,4 +537,55 @@ fn prepare_ref_does_not_require_a_submodule() {
         format!("tree {}\n", oid_of(tree)).as_bytes(),
     );
     c.prepare_ref(tip).expect("prepare_ref").commit();
+}
+
+/// A git key does not say it is a blob, so only a verified mark lets the cycle go on
+/// past a bad one. A git store gets the same as any other: one bad file costs one pack
+/// (Go: `TestABadGitBlobDoesNotStopCollection`).
+#[test]
+fn a_bad_git_blob_does_not_stop_collection() {
+    let ts = new_test_store(2 << 10);
+    let c = open_collector(
+        &ts,
+        Options {
+            grace: HOUR,
+            ..Options::default()
+        },
+    );
+    let data = gitobj::encode(Kind::Blob, b"hello\n");
+    let blob = gitobj::key_of(&data).unwrap();
+    ts.objects.put_verified(blob, &data).unwrap();
+    let tree = store_git(&ts.objects, Kind::Tree, &git_entry("100644", "f", blob));
+    let tip = store_git(
+        &ts.objects,
+        Kind::Commit,
+        format!("tree {}\n", oid_of(tree)).as_bytes(),
+    );
+    let dead: Vec<Key> = (0..40)
+        .map(|i| store_git(&ts.objects, Kind::Blob, format!("{i:0400}").as_bytes()))
+        .collect();
+    put_test_ref(&c, &ts.refs, "main", tip);
+    // The blob is the first record of the first pack.
+    let p = ts.dir.join("packstore/0000000000000001.seg");
+    let mut b = fs::read(&p).unwrap();
+    b[8 + crate::amberpack::REC_HEADER_SIZE] ^= 0x40;
+    fs::write(&p, b).unwrap();
+    backdate_packs(&ts);
+    let err = c.run(0.0).expect_err("a bad record passed");
+    let Error::Skipped { stats, .. } = &err else {
+        panic!("not a skip: {err}");
+    };
+    assert_eq!(stats.skipped.len(), 1);
+    assert_eq!(stats.skipped[0].key, blob);
+    assert!(count_gone(&ts.objects, &dead) > 0, "collection stopped");
+    ts.objects.put_verified(blob, &data).unwrap();
+    backdate_packs(&ts);
+    c.run(0.0).expect("after the repair");
+    fstree::check_complete(
+        tip,
+        |k| ts.objects.get_verified(k),
+        |k| ts.objects.has(k),
+        1,
+    )
+    .expect("after a cycle");
 }

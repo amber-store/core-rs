@@ -165,3 +165,23 @@ impl Error { pub fn is_unknown_segment(&self) -> bool }
   refLock) around the sweep.
 - `store_tests::sealed_store` was promoted to `pub(crate)` so gc_tests can
   reuse it (Go shares it via package scope).
+
+## Go v0.12.0: what may be acknowledged, and a sweep past a bad record
+
+Ports Go `amber-store/core` #27 and #29 (`packstore/{active,repair,compact,recover,footer,verify}.go`,
+`gc/{collector,cycle}.go`, `cmd/amber-store/gc.go`) with their tests, in
+`durability_tests.rs` and `compact_skip_tests.rs`. `architecture/` says what the
+rules are. Where the port differs from Go:
+
+- `Error::Skipped(Box<CompactStats>)` is Go's `(stats, *SkippedError)`: a `Result`
+  carries one or the other, so the stats travel in the error, and
+  `Error::compact_stats` reads them. Any other failure still loses them, as noted in
+  `gc.md`.
+- A crashed seal's name: Go keeps an immutable `path` and an atomic `renamed`, which
+  a refresh sets. Here a refresh publishes the segment under its new name, and
+  `SealedSegment::stat` falls back on it in between, so there is no flag to race on.
+- `Store::fsync(&File, &Path)` takes the path because a Rust `File` has no name, and
+  the test hook `before_fsync` is keyed on it. `copy_workers` pins the pass to one
+  worker for the tests that need an order; Go's tests set `GOMAXPROCS`.
+- `get_verified`'s failure is `Error::Corrupt { verify: true }`, Go's error wrapping
+  both `ErrCorrupt` and `ErrVerify`.
