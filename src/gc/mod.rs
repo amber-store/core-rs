@@ -150,6 +150,16 @@ pub enum Error {
     /// `BeginSpan`).
     #[error("gc: {0}")]
     Span(packstore::Error),
+    /// The cycle left packs in place, for a bad live record in each, and freed what
+    /// else it could. `stats` say what it did (Go: `packstore.SkippedError`, returned
+    /// beside the stats).
+    #[error("{source}")]
+    Skipped {
+        /// What the cycle did.
+        stats: Box<CycleStats>,
+        /// The packstore's report.
+        source: packstore::Error,
+    },
     /// A packstore error surfaced unchanged, as in Go: the mark's `get`,
     /// `liveness`, `segments`, or the sweep's `compact`.
     #[error(transparent)]

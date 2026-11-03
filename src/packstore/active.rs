@@ -85,6 +85,14 @@ impl Store {
         }
         let ls = list_segments(&self.dir)?;
         self.remove_stale_temporaries(&ls.tmp);
+        // What a compact's own segment holds stands in for a victim's copy, because the
+        // pass verified it. One that somebody left while it ran holds what nobody
+        // verified, and may be a victim the pass is reading: a crashed seal. And lookups
+        // read the newest id first, so a copy must not go under an id below a pack that
+        // survives with a bad copy of the same key: it takes a new one.
+        if ap.copying {
+            return self.create_active(ap, ls.max_id);
+        }
         let mut cands: Vec<_> = ls.active.iter().collect();
         // The fullest first, so that one fills and seals before the next.
         cands.sort_by(|a, b| {
@@ -136,18 +144,7 @@ impl Store {
         // The segment is this store's now: only from here on may it be modified.
         let mut res = recover_segment(path)?;
         if res.sealed {
-            // A crash between the footer's write and the rename: finish it.
-            // The crash may also have come before the seal.s fsync, and a
-            // sealed segment is trusted as durable from here on.
-            f.sync_all()?;
-            let sealed_path = sealed_path_of(path);
-            fs::rename(path, &sealed_path)?;
-            ap.dir_f.as_ref().ok_or(Error::Closed)?.sync_all()?;
-            let _ = fs::remove_file(with_suffix(path, SIDECAR_SUFFIX)); // a sealed segment indexes itself
-            let seg = SealedSegment::open(&sealed_path, id)?;
-            drop(f);
-            let mut sh = unpoison(self.shared.write());
-            publish_sealed(&mut sh, Arc::new(seg));
+            self.finish_seal(ap, id, path, f)?;
             return Ok(false);
         }
         let header_len = MAGIC_HEADER.len() as u64;
@@ -174,6 +171,20 @@ impl Store {
             f.set_len(res.data_end as u64)?;
             res.data_end as u64
         };
+        // From here on this store acknowledges what its own index holds, on the
+        // grounds that its own fsync covers it (`reliable_active`, `append_locked`).
+        // A tail its last writer never synced is not covered by anything yet, and
+        // this one fsync makes the grounds true. A writer that synced or closed
+        // cleanly leaves nothing to do, so a process per command pays nothing.
+        let tail = self.cfg.sync && size as i64 > res.durable.max(header_len as i64);
+        if tail {
+            self.fsyncs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Err(e) = self.fsync(&f, path) {
+                self.set_failed(&e);
+                return Err(e.into()); // dropping f lets go of its lock
+            }
+        }
         let sc = open_owned_sidecar(path, &res);
         let seg = Arc::new(ActiveSegment {
             id,
@@ -187,13 +198,61 @@ impl Store {
             drop_foreign(&mut sh, id);
             sh.active = Some(seg.clone());
         }
-        ap.active = Some(ActiveWriter {
+        let mut writer = ActiveWriter {
             seg,
             version,
             size,
             sc,
-        });
+        };
+        if tail {
+            writer.sidecar_synced();
+        }
+        ap.active = Some(writer);
         Ok(true)
+    }
+
+    /// Finishes a seal whose writer crashed between the footer's write and the
+    /// rename. The crash may also have come before the seal's fsync, and a sealed
+    /// segment is trusted as durable from here on. The caller holds `f`'s lock,
+    /// and this lets go of it (Go: `finishSeal`).
+    fn finish_seal(&self, ap: &AppendState, id: u64, path: &Path, f: File) -> Result<(), Error> {
+        if let Err(e) = self.fsync(&f, path) {
+            self.set_failed(&e);
+            return Err(e.into());
+        }
+        let sealed_path = sealed_path_of(path);
+        fs::rename(path, &sealed_path)?;
+        if let Err(e) = self.fsync(ap.dir_f.as_ref().ok_or(Error::Closed)?, &self.dir) {
+            self.set_failed(&e);
+            return Err(e.into());
+        }
+        let _ = fs::remove_file(with_suffix(path, SIDECAR_SUFFIX)); // a sealed segment indexes itself
+        let seg = SealedSegment::open(&sealed_path, id)?;
+        drop(f);
+        let mut sh = unpoison(self.shared.write());
+        publish_sealed(&mut sh, Arc::new(seg));
+        Ok(())
+    }
+
+    /// Finishes the seal a view holds under its active name, unless somebody else
+    /// holds it. The caller holds the append lock (Go: `finishCrashedSeal`).
+    pub(super) fn finish_crashed_seal(
+        &self,
+        ap: &AppendState,
+        g: &SealedSegment,
+    ) -> Result<(), Error> {
+        let f = match OpenOptions::new().read(true).write(true).open(&g.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if !try_lock(&f)? || !is_file_at(&f, &g.path) {
+            return Ok(());
+        }
+        if !recover_segment(&g.path)?.sealed {
+            return Ok(());
+        }
+        self.finish_seal(ap, g.id, &g.path, f)
     }
 
     /// Makes a new active segment with an id above every one in the
@@ -249,9 +308,9 @@ impl Store {
             }
             let init = (|| -> Result<(), Error> {
                 f.write_all_at(&header_at(ap.seg_version), 0)?;
-                f.sync_all()?;
+                self.fsync(&f, &tmp)?;
                 fs::rename(&tmp, &final_path)?;
-                ap.dir_f.as_ref().ok_or(Error::Closed)?.sync_all()?;
+                self.fsync(ap.dir_f.as_ref().ok_or(Error::Closed)?, &self.dir)?;
                 Ok(())
             })();
             if let Err(e) = init {
@@ -348,33 +407,21 @@ impl Store {
         Ok(())
     }
 
-    /// Seals every active segment that no writer holds. A small store's
-    /// segments never fill, and the process that wrote them may be long gone:
-    /// without this nothing in them could ever be collected. A segment a live
-    /// writer holds is left alone; an active segment is never a victim.
-    /// Called by `compact` under the append lock, after it sealed the store's
-    /// own segment (Go: `sealIdleLocked`).
+    /// Seals every active segment that no writer holds, and lets go of those with
+    /// nothing in them. A small store's segments never fill, and the process that wrote
+    /// them may be long gone: without this nothing in them could ever be collected. A
+    /// segment a live writer holds is left alone, and is no victim. Called by `compact`
+    /// under the append lock, after it sealed the store's own segment (Go:
+    /// `sealIdleLocked`).
     pub(super) fn seal_idle(&self, ap: &mut AppendState) -> Result<(), Error> {
         // Still owned, so empty: sealing left it alone. Let go of it for the
         // pass; it is on disk for whoever writes next.
         self.release_active(ap);
         let ls = list_segments(&self.dir)?;
-        let mut ids: Vec<u64> = ls.active.keys().copied().collect();
-        // The fullest first: the empty ones cannot be sealed.
-        ids.sort_by(|a, b| {
-            ls.active[b]
-                .size
-                .cmp(&ls.active[a].size)
-                .then_with(|| a.cmp(b))
-        });
-        for id in ids {
+        for (id, sf) in &ls.active {
             // Whatever its version: it is to be sealed.
-            if !self.adopt(ap, id, &ls.active[&id].path, VERSION_BASE)? {
-                continue;
-            }
-            self.seal_active(ap)?;
-            if ap.active.is_some() {
-                return Ok(()); // an empty one: the pass appends its survivors to it
+            if self.adopt(ap, *id, &sf.path, VERSION_BASE)? {
+                self.leave_active(ap)?;
             }
         }
         Ok(())

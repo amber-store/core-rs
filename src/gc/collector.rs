@@ -395,12 +395,16 @@ impl Core {
     /// `prepare`).
     pub(super) fn prepare(&self, root: Key) -> Result<(), Error> {
         let objects = &self.objects;
-        let keys =
-            fstree::check_complete(root, |k| objects.get(k), |k| objects.has(k), self.opts.jobs)
-                .map_err(|source| Error::Walk {
-                    root,
-                    source: Box::new(source),
-                })?;
+        let keys = fstree::check_complete(
+            root,
+            |k| objects.get_verified(k),
+            |k| objects.has(k),
+            self.opts.jobs,
+        )
+        .map_err(|source| Error::Walk {
+            root,
+            source: Box::new(source),
+        })?;
         self.objects.observe_keys(&keys);
         Ok(())
     }
@@ -436,9 +440,9 @@ impl Core {
         Ok(live)
     }
 
-    /// Prunes at already-marked keys, so shared subtrees are walked once.
-    /// Blob and xattr payloads are marked without being read, and so are git
-    /// blobs a tree or tag says are blobs.
+    /// Prunes at already-marked keys, so shared subtrees are walked once. What it
+    /// reads it verifies. Blob and xattr payloads are marked without being read, and
+    /// so are git blobs a tree or tag says are blobs.
     ///
     /// A git key cannot prune on the mark alone. The mark may come from a link
     /// that called it a blob, while this link calls it a directory: what lies
@@ -470,7 +474,10 @@ impl Core {
             if !newly {
                 continue;
             }
-            let data = self.objects.get(k).map_err(Error::Objects)?;
+            // Verified, because the mark decides what is deleted: a bad directory can
+            // still decode, and walks as a smaller one, and whatever it no longer names
+            // would be swept.
+            let data = self.objects.get_verified(k).map_err(Error::Objects)?;
             let links = fstree::links(k, &data).map_err(Error::Children)?;
             stack.extend(links);
         }

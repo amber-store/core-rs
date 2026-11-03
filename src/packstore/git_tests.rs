@@ -17,7 +17,7 @@ use crate::amberpack::{REC_HEADER_SIZE, encode_record, encode_record_with, parse
 use crate::gitobj::{self, Kind};
 use crate::key::{GIT_SHA1_SIZE, Key, Type};
 
-fn git_blob_obj(content: &[u8]) -> Object {
+pub(super) fn git_blob_obj(content: &[u8]) -> Object {
     let data = gitobj::encode(Kind::Blob, content);
     Object {
         key: gitobj::key_of(&data).unwrap(),

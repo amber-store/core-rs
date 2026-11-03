@@ -1318,3 +1318,59 @@ fn ref_set_checks_git_completeness() {
     )
     .expect_err("ref set accepted a commit whose tree is not in the store");
 }
+
+/// A cycle that left a pack behind says what it did do, and fails (Go:
+/// `TestE2E_GCRunReportsWhatABadRecordKept`).
+#[test]
+fn gc_run_reports_what_a_bad_record_kept() {
+    use amber_store_core::gitobj::{self, Kind};
+    let store = TempDir::new().unwrap();
+    let objects = packstore::Store::open_with(
+        store.path().join("packstore"),
+        packstore::Options::new().segment_size(2048),
+    )
+    .unwrap();
+    let put = |kind: Kind, body: &[u8]| -> Key {
+        let data = gitobj::encode(kind, body);
+        let k = gitobj::key_of(&data).unwrap();
+        objects.put_verified(k, &data).unwrap();
+        k
+    };
+    let blob = put(Kind::Blob, b"hello\n");
+    let mut entry = b"100644 f\0".to_vec();
+    entry.extend_from_slice(&blob.git_sha1_sum().unwrap());
+    let top = put(Kind::Tree, &entry);
+    for i in 0..40 {
+        put(Kind::Blob, format!("{i:0400}").as_bytes());
+    }
+    objects.close().unwrap();
+    run_store(store.path(), &["ref", "set", "main", &top.to_string()]).unwrap();
+    // The blob is the first record of the first pack.
+    let p = store.path().join("packstore/0000000000000001.seg");
+    let mut b = fs::read(&p).unwrap();
+    b[8 + 46] ^= 0x40;
+    fs::write(&p, b).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    let bin = cli_bin();
+    let out = Command::new(bin)
+        .args(["--store"])
+        .arg(store.path())
+        .args(["gc", "run", "--grace", "1ms", "--garbage", "0"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !out.status.success(),
+        "gc run passed a bad record: {stdout}"
+    );
+    assert!(stderr.contains(&blob.to_string()), "{stderr}");
+    assert!(stderr.contains("PutVerified"), "{stderr}");
+    assert!(
+        stdout.contains(" reaped,") && stdout.contains("1 left in place"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(" 0 reaped,"), "freed nothing: {stdout}");
+}

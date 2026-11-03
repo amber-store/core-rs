@@ -31,8 +31,10 @@ pub struct CycleStats {
     pub marked: usize,
     /// Sealed packs considered (Go: `Scored`).
     pub scored: usize,
-    /// Victim ids, ascending (Go: `Reaped`).
+    /// Ids of the packs removed, ascending (Go: `Reaped`).
     pub reaped: Vec<u64>,
+    /// Packs left in place for a bad live record (Go: `Skipped`).
+    pub skipped: Vec<crate::packstore::SkippedSegment>,
     /// Records rewritten out of the victims (Go: `CopiedRecords`).
     pub copied_records: usize,
     /// Bytes rewritten out of the victims (Go: `CopiedBytes`, an `int64`;
@@ -92,7 +94,16 @@ impl Core {
         st.last_err = res.as_ref().err().map(|e| e.to_string());
         st.cancel_cycle = None;
         drop(st);
-        res.map(|()| stats)
+        match res {
+            Ok(()) => Ok(stats),
+            Err(Error::Objects(source)) if source.compact_stats().is_some() => {
+                Err(Error::Skipped {
+                    stats: Box::new(stats),
+                    source,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// One cycle body with the total-duration accounting (Go: `cycle` and
@@ -113,6 +124,7 @@ impl Core {
             marked: 0,
             scored: 0,
             reaped: Vec::new(),
+            skipped: Vec::new(),
             copied_records: 0,
             copied_bytes: 0,
             freed_bytes: 0,
@@ -214,6 +226,7 @@ impl Core {
             ),
             pace: None,
             max_copy_bytes,
+            mark_verified: true,
         };
         if self.opts.rate > 0 {
             let mut throttle = Throttle::new(self.opts.rate); // clock starts here
@@ -222,19 +235,29 @@ impl Core {
         let sweep_start = Instant::now();
         let res = self.objects.compact(|k| live.contains(k), opts);
         stats.sweep_duration = sweep_start.elapsed();
+        let mut take = |cs: &crate::packstore::CompactStats| {
+            stats.scored = cs.segments_scanned;
+            stats.reaped.clone_from(&cs.victims);
+            stats.skipped.clone_from(&cs.skipped);
+            stats.copied_records = cs.records_copied;
+            stats.copied_bytes = cs.bytes_copied;
+            stats.freed_bytes = cs.bytes_freed;
+        };
         match res {
             Ok(cs) => {
-                stats.scored = cs.segments_scanned;
-                stats.reaped = cs.victims;
-                stats.copied_records = cs.records_copied;
-                stats.copied_bytes = cs.bytes_copied;
-                stats.freed_bytes = cs.bytes_freed;
+                take(&cs);
                 Ok(())
             }
-            // Go maps the partial CompactStats even on error; the Rust
-            // compact returns no stats with its error (see
-            // port-notes/packstore-gc.md), so the sweep counters stay zero.
-            Err(e) => Err(Error::Objects(e)),
+            // Go maps the partial CompactStats on every error. Here the only error
+            // that carries stats is a pack left in place, the only one after which
+            // anything was removed unless removing it failed (see
+            // port-notes/packstore-gc.md).
+            Err(e) => {
+                if let Some(cs) = e.compact_stats() {
+                    take(cs);
+                }
+                Err(Error::Objects(e))
+            }
         }
     }
 }

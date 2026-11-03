@@ -1050,8 +1050,9 @@ where
 /// blobs a tree or tag says are blobs ([`links`]).
 ///
 /// The walk is a breadth-first sweep that fetches each round's frontier
-/// concurrently (bounded by the available parallelism), so a wide tree of
-/// small objects is read in parallel. The current implementation happens to
+/// concurrently (bounded by the available parallelism) once the round has shown
+/// that is worth it, so a slow getter is called in parallel and a fast one is not
+/// held up starting threads. The current implementation happens to
 /// be deterministic — results are indexed by frontier position, matching the
 /// Go implementation's order — but that is not part of the contract. `get`
 /// must be safe for concurrent use (`Fn + Sync`, the Rust spelling of the Go
@@ -1162,10 +1163,22 @@ fn default_jobs() -> usize {
         .unwrap_or(1)
 }
 
-/// Applies `f` to every item with up to `jobs` scoped worker threads and
-/// returns the per-index results — deterministic regardless of scheduling.
-/// All items are processed even if some fail (as Go's errgroup runs every
-/// submitted task); the caller picks the first error in index order.
+/// How long a level may take on the calling thread before workers are worth
+/// starting. A scoped thread costs about 8 µs to start and join, so about 100 µs for
+/// a pool of a dozen.
+const WORKERS_WORTH_IT: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// Applies `f` to every item, with up to `jobs` at once, and returns the per-index
+/// results — deterministic regardless of scheduling. All items are processed even if
+/// some fail (as Go's errgroup runs every submitted task); the caller picks the first
+/// error in index order.
+///
+/// It starts on the calling thread and starts workers only once a level has shown
+/// they are worth it. Goroutines are cheap enough that Go starts them per level, and
+/// threads are not: a linear history is 100,000 levels of a few small objects, where
+/// starting them cost 2.5 s to do 0.2 s of work (core-rs#33). No fixed width would do,
+/// because the same width is worth threads when the getter is slow: a cold disk, or a
+/// network. One slow item is enough to tell.
 fn parallel_map<I, T, E, F>(items: &[I], jobs: usize, f: F) -> Vec<Result<T, E>>
 where
     I: Copy + Sync,
@@ -1173,14 +1186,32 @@ where
     T: Send,
     E: Send,
 {
-    let workers = jobs.min(items.len());
-    if workers <= 1 {
-        return items.iter().map(|&k| f(k)).collect();
+    let start = std::time::Instant::now();
+    let mut out = Vec::with_capacity(items.len());
+    for (i, &item) in items.iter().enumerate() {
+        out.push(f(item));
+        let rest = &items[i + 1..];
+        // A single item left has nothing to share with.
+        if jobs > 1 && rest.len() > 1 && start.elapsed() >= WORKERS_WORTH_IT {
+            out.extend(on_workers(rest, jobs, &f));
+            break;
+        }
     }
+    out
+}
+
+/// [`parallel_map`] with workers from the start: up to `jobs` scoped threads.
+fn on_workers<I, T, E, F>(items: &[I], jobs: usize, f: &F) -> Vec<Result<T, E>>
+where
+    I: Copy + Sync,
+    F: Fn(I) -> Result<T, E> + Sync,
+    T: Send,
+    E: Send,
+{
     let next = AtomicUsize::new(0);
     let slots: Vec<Mutex<Option<Result<T, E>>>> = items.iter().map(|_| Mutex::new(None)).collect();
     std::thread::scope(|s| {
-        for _ in 0..workers {
+        for _ in 0..jobs.min(items.len()) {
             s.spawn(|| {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
@@ -2611,6 +2642,84 @@ mod tests {
                 missing.key, missing.key
             )
         );
+    }
+
+    // parallel_map: threads only when a level has shown they are worth starting.
+
+    /// A linear history is levels of a few objects. With one left to do once the
+    /// first is done, there is nothing to share out, however slow that first was.
+    #[test]
+    fn parallel_map_stays_on_the_calling_thread_for_a_narrow_level() {
+        let me = std::thread::current().id();
+        let got = parallel_map(&[1, 2], 8, |i: i32| -> Result<i32, Infallible> {
+            assert_eq!(std::thread::current().id(), me, "a thread for item {i}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            Ok(i * 10)
+        });
+        let got: Vec<i32> = got.into_iter().map(Result::unwrap).collect();
+        assert_eq!(got, [10, 20]);
+    }
+
+    #[test]
+    fn parallel_map_stays_on_the_calling_thread_with_one_job() {
+        let me = std::thread::current().id();
+        let items: Vec<i32> = (0..8).collect();
+        let got = parallel_map(&items, 1, |i: i32| -> Result<i32, Infallible> {
+            assert_eq!(std::thread::current().id(), me, "a thread for item {i}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            Ok(i)
+        });
+        assert_eq!(got.len(), 8);
+    }
+
+    /// Slow reads are what the parallelism is for: a cold disk, or a getter that goes
+    /// over a network. One slow item is enough to start the workers, and no more than
+    /// `jobs` run at once.
+    #[test]
+    fn parallel_map_shares_out_slow_items() {
+        let (now, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let items: Vec<i32> = (0..32).collect();
+        let got = parallel_map(&items, 4, |i: i32| -> Result<i32, Infallible> {
+            let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(n, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            now.fetch_sub(1, Ordering::SeqCst);
+            Ok(i)
+        });
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak > 1, "slow items ran one at a time");
+        assert!(peak <= 4, "{peak} at once with 4 jobs");
+        let got: Vec<i32> = got.into_iter().map(Result::unwrap).collect();
+        assert_eq!(
+            got, items,
+            "results out of order across the switch to workers"
+        );
+    }
+
+    /// Every item is processed even if some fail, as Go's errgroup runs every
+    /// submitted task, on either side of the switch to workers.
+    #[test]
+    fn parallel_map_processes_every_item_past_a_failure() {
+        let done = AtomicUsize::new(0);
+        let items: Vec<i32> = (0..16).collect();
+        let got = parallel_map(&items, 4, |i: i32| -> Result<i32, i32> {
+            done.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            if i % 5 == 0 { Err(i) } else { Ok(i) }
+        });
+        assert_eq!(done.load(Ordering::SeqCst), 16);
+        for (i, r) in got.into_iter().enumerate() {
+            let i = i as i32;
+            assert_eq!(r, if i % 5 == 0 { Err(i) } else { Ok(i) });
+        }
+    }
+
+    #[test]
+    fn parallel_map_of_nothing() {
+        let got = parallel_map(&[] as &[i32], 4, |i: i32| -> Result<i32, Infallible> {
+            Ok(i)
+        });
+        assert!(got.is_empty());
     }
 
     #[test]

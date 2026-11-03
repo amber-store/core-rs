@@ -1621,7 +1621,7 @@ fn run_gc_run(cli: &Cli, a: &GcRunArgs) -> Result<(), CliError> {
             return Err(e);
         }
     };
-    let res = coll.run(a.garbage).map_err(CliError::from).map(|stats| {
+    let summary = |stats: &gc::CycleStats| {
         println!(
             "{} packs scored, {} reaped, {} records ({}) copied, {} freed in {} (mark {}, sweep {}; {} objects marked)",
             stats.scored,
@@ -1634,7 +1634,23 @@ fn run_gc_run(cli: &Cli, a: &GcRunArgs) -> Result<(), CliError> {
             format_go_duration(round_ms(go_ns(stats.sweep_duration))),
             stats.marked
         );
-    });
+        if !stats.skipped.is_empty() {
+            println!("{} left in place", stats.skipped.len());
+        }
+    };
+    let res = match coll.run(a.garbage) {
+        Ok(stats) => {
+            summary(&stats);
+            Ok(())
+        }
+        // A pack left in place is still a failed run.
+        Err(e) => {
+            if let gc::Error::Skipped { stats, .. } = &e {
+                summary(stats);
+            }
+            Err(CliError::from(e))
+        }
+    };
     let _ = coll.close();
     drop(coll);
     let _ = close_store(st);

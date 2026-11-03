@@ -164,6 +164,13 @@ simultaneous writers and drifts back to one as they fill. A writer that has
 moved to a higher version passes over a segment below it, leaving it for a
 writer that can use it; a writer at version 2 adopts any.
 
+A store that syncs fsyncs a segment it adopts, once, when recovery finds records
+past what the sidecar knows durable: a writer that died may have left an unsynced
+tail, and from here on this store acknowledges what its own index holds. One that
+adopts what a writer synced or closed cleanly pays nothing. A seal whose writer died
+before the rename may be just as unsynced, so a store that syncs writes its own copy
+rather than acknowledge against one, until somebody has finished the seal.
+
 **Creating** a segment with an id above every id in the directory:
 
 1. Create `<id>.seg.active.tmp` with `O_EXCL`. If it exists, another creator
@@ -292,7 +299,9 @@ the directory; from then on its view is complete and stable. Its mark set
 covers every active segment it can see, not only its own. The sweep seals the
 collector's own active segment and every one it can adopt, so that a small
 store, whose segments never fill, still gets collected; a segment a live
-writer holds is left alone, and an active segment is never a victim.
+writer holds is left alone, and is no victim. (A crashed seal is a sealed
+segment under its active name, and can be one, whoever holds it: its holder
+has failed, and writes nothing more to it.)
 
 Objects written by another process and not yet named by a reference when a
 cycle starts are protected by the grace period alone. (git has a second
@@ -327,8 +336,13 @@ above:
   the first span, as [above](#the-gate-writers-against-a-sweep).
 - **Survivors are durable before victims are unlinked**: a compaction syncs
   the segment it copied into, then removes the old ones, then syncs the
-  directory.
-- **Rely only on durable copies** when skipping a write or a survivor's copy.
+  directory. A copy stands in for a victim's only if it verifies, or the pass copied
+  it itself, which is why a pass takes over no segment while it copies: one somebody
+  left in the meantime holds what nobody verified, and may be a crashed seal the pass
+  is reading, which finishing would unmap.
+- **Rely only on durable copies** when skipping a write or a survivor's copy. That
+  covers what a segment's own writer holds in its index: fsync an adopted segment's
+  unsynced tail before acknowledging anything against it.
 - **Refuse a segment of a format version other than 2, 3 and 4** and leave it as
   it is; only a header that is missing or not this format's magic at all may
   be reset.

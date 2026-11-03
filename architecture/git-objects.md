@@ -67,16 +67,18 @@ copies of a compaction, a scrub), a git object is held to more than a hash:
 
 The content is left alone. Reading it is the business of whoever has to, and that
 comes down to the [walks](#links): an interior object that cannot be read is
-refused by `CheckComplete` before a reference to it is accepted, so no accepted
-reference can stop a mark. An object only ever named as a file is never parsed,
+refused by `CheckComplete` before a reference to it is accepted, so an accepted
+reference stops a mark only if what it reaches was damaged since. An object only
+ever named as a file is never parsed,
 by git or by the store, and a repository may hold one that would not parse. If
 verification parsed it, it could not be pushed, and written any other way, every
-sweep that had to copy it would be refused, for the whole store.
+sweep that had to copy it would leave its pack behind.
 
 `packstore.Put` verifies nothing, for this type as for any other. An unframed
 payload written that way, under its SHA-1 and named as a file, passes
-`CheckComplete`, and then fails the sweeps, as a wrong payload under a `Blob` key
-does. Whoever takes objects from others uses a verifying write.
+`CheckComplete`, and then keeps its pack and fails each cycle that has to copy it
+([a bad live record](mark-sweep-gc.md#the-cycle)), as a wrong payload under a `Blob`
+key does. Whoever takes objects from others uses a verifying write.
 
 ## Links
 

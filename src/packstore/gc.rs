@@ -99,7 +99,7 @@ impl Store {
         }
         let mut out = Vec::with_capacity(sh.sealed.len());
         for g in &sh.sealed {
-            let sealed = fs::metadata(&g.path)?.modified()?;
+            let sealed = g.stat()?.modified()?;
             out.push(SegmentInfo {
                 id: g.id,
                 sealed,
@@ -185,7 +185,7 @@ impl Store {
             if g.id == id {
                 continue;
             }
-            if g.has(k) {
+            if self.reliable_sealed(g, k) {
                 return Ok(true);
             }
         }
@@ -253,7 +253,7 @@ impl Store {
         }
         if self.cfg.sync
             && let Some(dir_f) = ap.dir_f.as_ref()
-            && let Err(e) = dir_f.sync_all()
+            && let Err(e) = self.fsync(dir_f, &self.dir)
         {
             first_err.get_or_insert(e.into());
         }

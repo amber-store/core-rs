@@ -15,7 +15,7 @@ use crate::packstore;
 use crate::reference::Reference;
 use crate::refstore;
 
-use super::{Collector, Options, free_below, lock, throttle_owed};
+use super::{Collector, Error, Options, free_below, lock, throttle_owed};
 
 pub(super) const HOUR: Duration = Duration::from_secs(60 * 60);
 
@@ -844,4 +844,418 @@ fn unreachable_from_takes_no_references_into_account() {
     // the caller passed, so it does not enter this answer.
     let dead = c.unreachable_from(&[], &keys).unwrap();
     assert_eq!(dead, keys, "a reference must not act as a root here");
+}
+
+// ---------------------------------------------------------------------------
+// A bad record (Go: cycle_test.go).
+
+fn dir_entry(name: &str, k: Key) -> crate::fstree::Entry {
+    crate::fstree::Entry {
+        name: name.as_bytes().to_vec(),
+        mode: 0o100644,
+        content_key: k.as_bytes().to_vec(),
+        ..Default::default()
+    }
+}
+
+/// #29. One live record that fails verification costs its own pack and nothing else:
+/// the cycle frees what it can, says what it left, and a repair clears it.
+#[test]
+fn one_bad_live_record_does_not_stop_collection() {
+    for bit_rot in [false, true] {
+        let ts = new_test_store(2 << 10);
+        let c = open_collector(
+            &ts,
+            Options {
+                grace: HOUR,
+                ..Options::default()
+            },
+        );
+        let good = encode_blob(b"what the key says");
+        let data: &[u8] = if bit_rot {
+            &good.bytes
+        } else {
+            b"something else"
+        };
+        ts.objects.put(good.key, data).unwrap();
+        let root = encode_file_node(&[good.key]);
+        ts.objects.put(root.key, &root.bytes).unwrap();
+        let dead: Vec<Key> = (0..40)
+            .map(|i| {
+                let o = encode_blob(format!("{i:0400}").as_bytes());
+                ts.objects.put(o.key, &o.bytes).unwrap();
+                o.key
+            })
+            .collect();
+        put_test_ref(&c, &ts.refs, "main", root.key);
+        if bit_rot {
+            // The blob is the first record of the first pack.
+            let p = ts.dir.join("packstore/0000000000000001.seg");
+            let mut b = fs::read(&p).unwrap();
+            b[8 + crate::amberpack::REC_HEADER_SIZE] ^= 0x40;
+            fs::write(&p, b).unwrap();
+        }
+
+        backdate_packs(&ts);
+        let err = c.run(0.0).expect_err("a bad record must stay loud");
+        let Error::Skipped { stats, .. } = &err else {
+            panic!("not a skip: {err}");
+        };
+        assert_eq!(stats.skipped.len(), 1, "bit rot {bit_rot}");
+        assert_eq!((stats.skipped[0].key, stats.skipped[0].id), (good.key, 1));
+        assert!(!stats.reaped.contains(&1), "it lists the pack it kept");
+        assert!(
+            !stats.reaped.is_empty() && stats.freed_bytes > 0,
+            "{stats:?}"
+        );
+        assert!(count_gone(&ts.objects, &dead) > 0, "collection stopped");
+        let st = c.status().unwrap();
+        assert!(
+            st.last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains(&good.key.to_string()),
+            "{:?}",
+            st.last_error
+        );
+
+        // The repair clears it: what the kept pack held of the garbage goes too.
+        ts.objects.put_verified(good.key, &good.bytes).unwrap();
+        backdate_packs(&ts);
+        let stats = c.run(0.0).expect("after the repair");
+        assert!(stats.skipped.is_empty());
+        assert!(stats.reaped.contains(&1), "{stats:?}");
+        assert_eq!(count_gone(&ts.objects, &dead), dead.len());
+        assert_eq!(ts.objects.get(good.key).unwrap(), good.bytes);
+    }
+}
+
+/// An interior object has to be read to know what it reaches. A bad one stops the mark
+/// even if it still decodes: it walks as a smaller directory, and whatever it no longer
+/// names would be swept. Nothing can be freed without knowing what is live.
+#[test]
+fn a_mark_verifies_what_it_reads() {
+    for dead_in_first_pack in [true, false] {
+        let ts = new_test_store(2 << 10);
+        let c = open_collector(
+            &ts,
+            Options {
+                grace: HOUR,
+                ..Options::default()
+            },
+        );
+        let put = |k: Key, d: &[u8]| ts.objects.put(k, d).unwrap();
+        let fill = |tag: &str, packs: usize| {
+            for i in 0.. {
+                let o = encode_blob(format!("{tag}-{i:0400}").as_bytes());
+                put(o.key, &o.bytes);
+                if ts.objects.segments().unwrap().len() >= packs {
+                    return;
+                }
+            }
+        };
+        let (a, b) = (encode_blob(b"file a"), encode_blob(b"file b"));
+        let mut entries = vec![dir_entry("a", a.key), dir_entry("b", b.key)];
+        let mut filler = Vec::new();
+        if !dead_in_first_pack {
+            for i in 0..8 {
+                // live, to fill the pack with nothing dead
+                let o = encode_blob(format!("live-{i:0400}").as_bytes());
+                entries.push(dir_entry(&format!("z{i}"), o.key));
+                filler.push(o);
+            }
+        }
+        let root = crate::fstree::encode_dir_leaf(&entries).unwrap();
+        put(root.key, &root.bytes);
+        put(a.key, &a.bytes);
+        for o in &filler {
+            put(o.key, &o.bytes);
+        }
+        if dead_in_first_pack {
+            fill("one", 1);
+        }
+        put(b.key, &b.bytes);
+        fill("two", 2);
+        put_test_ref(&c, &ts.refs, "main", root.key);
+
+        // One bit: map key 5 (content_key) becomes 13, which the decoder ignores, and
+        // entry "b" links nothing.
+        let p = ts.dir.join("packstore/0000000000000001.seg");
+        let mut f = fs::read(&p).unwrap();
+        let mut needle = vec![0x05, 0x58, 0x20];
+        needle.extend_from_slice(b.key.as_bytes());
+        let at = f
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("content key not found");
+        f[at] ^= 0x08;
+        fs::write(&p, f).unwrap();
+
+        backdate_packs(&ts);
+        let packs = ts.objects.segments().unwrap().len();
+        let err = c.run(0.0).expect_err("the mark trusted a bad directory");
+        assert!(
+            err.to_string().contains("object verification failed"),
+            "{err}"
+        );
+        assert!(!matches!(err, Error::Skipped { .. }), "it went on: {err}");
+        assert_eq!(
+            ts.objects.segments().unwrap().len(),
+            packs,
+            "a failed mark removed a pack"
+        );
+        // What the error says to do: the reference is whole.
+        ts.objects.put_verified(root.key, &root.bytes).unwrap();
+        let check = || {
+            crate::fstree::check_complete(
+                root.key,
+                |k| ts.objects.get_verified(k),
+                |k| ts.objects.has(k),
+                1,
+            )
+        };
+        check().expect("the accepted reference dangles");
+        backdate_packs(&ts);
+        c.run(0.0).expect("after the repair");
+        check().expect("after a cycle, the accepted reference dangles");
+    }
+}
+
+/// One that does not decode at all stops it the same way.
+#[test]
+fn a_bad_interior_object_stops_the_mark() {
+    let ts = new_test_store(2 << 10);
+    let c = open_collector(
+        &ts,
+        Options {
+            grace: HOUR,
+            ..Options::default()
+        },
+    );
+    let blob = encode_blob(b"a file");
+    ts.objects.put(blob.key, &blob.bytes).unwrap();
+    let root = encode_file_node(&[blob.key]);
+    ts.objects.put(root.key, &root.bytes).unwrap();
+    put_test_ref(&c, &ts.refs, "main", root.key);
+    let dead: Vec<Key> = (0..40)
+        .map(|i| {
+            let o = encode_blob(format!("{i:0400}").as_bytes());
+            ts.objects.put(o.key, &o.bytes).unwrap();
+            o.key
+        })
+        .collect();
+    // The root's record, the second of the first pack: its payload no longer decodes.
+    let p = ts.dir.join("packstore/0000000000000001.seg");
+    let mut b = fs::read(&p).unwrap();
+    let hdr = crate::amberpack::REC_HEADER_SIZE;
+    b[8 + hdr + blob.bytes.len() + hdr] = 0xff;
+    fs::write(&p, b).unwrap();
+    backdate_packs(&ts);
+    c.run(0.0).expect_err("it passed a tree it could not read");
+    assert_eq!(
+        count_gone(&ts.objects, &dead),
+        0,
+        "freed without knowing what is live"
+    );
+}
+
+/// A reference is accepted on what verified: a directory whose bytes are not what its
+/// key says may name less than it should, and the reference would dangle from the start.
+#[test]
+fn prepare_ref_refuses_a_bad_interior_object() {
+    let ts = new_test_store(1 << 20);
+    let c = open_collector(&ts, Options::default());
+    let a = encode_blob(b"file a");
+    let b = encode_blob(b"file b, never stored");
+    let root =
+        crate::fstree::encode_dir_leaf(&[dir_entry("a", a.key), dir_entry("b", b.key)]).unwrap();
+    let wrong = crate::fstree::encode_dir_leaf(&[dir_entry("a", a.key)]).unwrap();
+    ts.objects.put(a.key, &a.bytes).unwrap();
+    ts.objects.put(root.key, &wrong.bytes).unwrap(); // plain put verifies nothing
+    let Err(err) = c.prepare_ref(root.key) else {
+        panic!("a reference was accepted on a bad directory");
+    };
+    assert!(
+        err.to_string().contains("object verification failed"),
+        "{err}"
+    );
+}
+
+/// Two bad records in one pack, as a damaged region of a disk leaves. If a bad blob found
+/// first made a pass give up on the pack, the bad directory beside it would never be
+/// looked at, the pass would go on, and what the directory no longer names would be swept.
+#[test]
+fn a_bad_blob_does_not_hide_a_bad_directory_from_an_unverified_pass() {
+    let child = encode_blob(b"the child, in another pack");
+    let (mut file, mut root);
+    let mut i = 0;
+    loop {
+        // The blob sorts before the directory in the index.
+        file = encode_blob(format!("a file in the first pack {i}").as_bytes());
+        root =
+            crate::fstree::encode_dir_leaf(&[dir_entry("a", file.key), dir_entry("c", child.key)])
+                .unwrap();
+        if file.key < root.key {
+            break;
+        }
+        i += 1;
+    }
+    let ts = new_test_store(2 << 10);
+    let put = |k: Key, d: &[u8]| ts.objects.put(k, d).unwrap();
+    let fill = |tag: &str, packs: usize| {
+        for i in 0.. {
+            let o = encode_blob(format!("{tag}-{i:0400}").as_bytes());
+            put(o.key, &o.bytes);
+            if ts.objects.segments().unwrap().len() >= packs {
+                return;
+            }
+        }
+    };
+    put(root.key, &root.bytes);
+    put(file.key, &file.bytes);
+    fill("one", 1);
+    put(child.key, &child.bytes);
+    fill("two", 2);
+
+    let p = ts.dir.join("packstore/0000000000000001.seg");
+    let mut f = fs::read(&p).unwrap();
+    // One bit: map key 5 (content_key) becomes 13, which the decoder ignores.
+    let mut needle = vec![0x05, 0x58, 0x20];
+    needle.extend_from_slice(child.key.as_bytes());
+    let at = f
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("content key not found");
+    f[at] ^= 0x08;
+    let at = f
+        .windows(file.bytes.len())
+        .position(|w| w == file.bytes)
+        .expect("the blob not found");
+    f[at] ^= 0xff;
+    fs::write(&p, f).unwrap();
+    ts.objects.refresh().unwrap();
+
+    // A caller without mark_verified: a walk that reads with get.
+    let mut live = std::collections::HashSet::new();
+    let mut stack = vec![root.key];
+    while let Some(k) = stack.pop() {
+        if live.insert(k) {
+            let data = ts.objects.get(k).unwrap();
+            stack.extend(crate::fstree::child_keys(k, &data).unwrap());
+        }
+    }
+    let err = ts
+        .objects
+        .compact(
+            move |k| live.contains(&k),
+            packstore::CompactOpts::default(),
+        )
+        .expect_err("the pass went on");
+    assert!(err.is_corrupt() && err.compact_stats().is_none(), "{err}");
+    assert!(
+        ts.objects.has(child.key).unwrap(),
+        "the child of a live directory is gone"
+    );
+}
+
+/// What the error says to do clears it, also for a copy in a segment nobody holds, which
+/// lookups read before the good sealed one.
+#[test]
+fn the_repair_the_error_names_clears_it() {
+    let ts = new_test_store(2 << 10);
+    let c = open_collector(
+        &ts,
+        Options {
+            grace: HOUR,
+            ..Options::default()
+        },
+    );
+    let blob = encode_blob(b"a file");
+    let root = encode_file_node(&[blob.key]);
+    ts.objects.put(blob.key, &blob.bytes).unwrap();
+    ts.objects.put(root.key, &root.bytes).unwrap();
+    put_test_ref(&c, &ts.refs, "main", root.key);
+    for i in 0.. {
+        let o = encode_blob(format!("g-{i:0400}").as_bytes());
+        ts.objects.put(o.key, &o.bytes).unwrap();
+        if !ts.objects.segments().unwrap().is_empty() {
+            break;
+        }
+    }
+    // A duplicate in another process's idle segment, gone bad.
+    let pdir = ts.dir.join("packstore");
+    let w = packstore::Store::open(&pdir).unwrap();
+    let rec = crate::amberpack::encode_record(root.key, &root.bytes).unwrap();
+    w.append_record(root.key, &rec).unwrap();
+    w.sync().unwrap();
+    w.close().unwrap();
+    let mut active: Vec<PathBuf> = fs::read_dir(&pdir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".seg.active"))
+        .collect();
+    active.sort();
+    let last = active.last().unwrap();
+    let mut f = fs::read(last).unwrap();
+    f[8 + crate::amberpack::REC_HEADER_SIZE] ^= 0xff;
+    fs::write(last, f).unwrap();
+
+    backdate_packs(&ts);
+    let err = c.run(0.0).expect_err("the mark read past the bad copy");
+    assert!(
+        err.to_string().contains("object verification failed"),
+        "{err}"
+    );
+    ts.objects.put_verified(root.key, &root.bytes).unwrap();
+    c.run(0.0).unwrap();
+    assert_eq!(ts.objects.get_verified(root.key).unwrap(), root.bytes);
+}
+
+/// A reference names a tree a repair next door has just made whole: a store that has been
+/// open all along must not refuse it for the old copy it still has mapped.
+#[test]
+fn a_reference_sees_a_repair_another_store_made() {
+    let ts = new_test_store(2 << 10);
+    let blob = encode_blob(b"a file");
+    let root = encode_file_node(&[blob.key]);
+    ts.objects.put(blob.key, &blob.bytes).unwrap();
+    ts.objects.put(root.key, &root.bytes).unwrap();
+    for i in 0.. {
+        let o = encode_blob(format!("g-{i:0400}").as_bytes());
+        ts.objects.put(o.key, &o.bytes).unwrap();
+        if !ts.objects.segments().unwrap().is_empty() {
+            break;
+        }
+    }
+    let daemon = Arc::new(
+        packstore::Store::open_with(
+            ts.dir.join("packstore"),
+            packstore::Options::new().segment_size(2 << 10),
+        )
+        .unwrap(),
+    );
+    let c = Collector::open(
+        ts.dir.join("closures"),
+        Arc::clone(&daemon),
+        Arc::clone(&ts.refs),
+        Options {
+            grace: HOUR,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    drop(daemon.begin_write().unwrap()); // its first span, which looks; the next ones will not
+    assert!(daemon.has(root.key).unwrap());
+    let pack = ts.dir.join("packstore").join("0000000000000001.seg");
+    let mut f = fs::read(&pack).unwrap();
+    let i = f
+        .windows(root.bytes.len())
+        .position(|w| w == &root.bytes[..])
+        .expect("root not in the pack");
+    f[i] ^= 0xff;
+    fs::write(&pack, f).unwrap();
+    ts.objects.put_verified(root.key, &root.bytes).unwrap();
+    c.prepare_ref(root.key)
+        .expect("repaired and acknowledged, and the reference is refused")
+        .abort();
 }
